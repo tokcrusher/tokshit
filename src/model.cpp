@@ -1160,8 +1160,16 @@ std::size_t Model::router_topk() const noexcept {
 // warm-up after the prompt: top-k by frequency history per layer. these are
 // real reads into our cache now, not madvise into page cache
 void Model::prefill_bulk_layer(std::size_t layer) {
+  if (!ws_) return;
+  prefill_bulk_layer(
+      layer, std::span<const std::size_t>(ws_->top.data(), ws_->top.size()));
+}
+
+void Model::prefill_bulk_layer(std::size_t layer,
+                               std::span<const std::size_t> experts) {
   const Layer& lt = layers_[layer];
   if (!lt.gate_exps || !lt.up_exps || !lt.down_exps) return;
+  if (experts.empty()) return;
 
   // sequential pread на весь регион экспертов слоя (gate+up+down = ~252MB)
   // gguf-конвенция: три тензора идут подряд, gap минимален
@@ -1200,11 +1208,15 @@ void Model::prefill_bulk_layer(std::size_t layer) {
     return;
   }
 
-  // memcpy в AHB и resident_->put. ws.top уже посчитан в layer() ДО этого
-  // вызова, значит можем использовать его
-  const std::size_t n_used = ws_->top.size();
+  // memcpy в AHB и resident_->put. при prefill бюджет слоя — общий, иначе
+  // union экспертов батча вытесняется до take_expert
+  // memcpy into AHB and resident_->put. during prefill the layer budget is
+  // the total one, otherwise the batch's expert union is evicted before take
+  const std::size_t n_used = experts.size();
+  const uint64_t put_budget = prefilling_ ? total_budget_ : resident_budget_;
+  std::size_t copied = 0;
   for (std::size_t j = 0; j < n_used; ++j) {
-    const std::size_t e = ws_->top[j];
+    const std::size_t e = experts[j];
     for (int pi = 0; pi < 3; ++pi) {
       const uint8_t* src = big.data() + (regions[pi].off - min_off) +
                            ems[pi]->size * e;
@@ -1213,8 +1225,19 @@ void Model::prefill_bulk_layer(std::size_t layer) {
       std::memcpy(cb->data(), src, ems[pi]->size);
       const uint64_t key =
           (static_cast<uint64_t>(pi) << 32) | static_cast<uint32_t>(e);
-      (void)resident_->put(layer, key, std::move(cb), resident_budget_);
+      (void)resident_->put(layer, key, std::move(cb), put_budget);
+      copied += ems[pi]->size;
     }
+  }
+  static std::atomic<uint64_t> bulk_n{0};
+  const uint64_t n = bulk_n.fetch_add(1, std::memory_order_relaxed);
+  if (n < 8 || n % 8 == 0) {
+    std::fprintf(stderr,
+                 "[prefill-bulk] layer=%zu experts=%zu read=%.0f MB copied=%.0f "
+                 "MB budget=%.0f MB\n",
+                 layer, n_used, static_cast<double>(total) / 1e6,
+                 static_cast<double>(copied) / 1e6,
+                 static_cast<double>(put_budget) / 1e6);
   }
   (void)::posix_fadvise(rfd, static_cast<off_t>(min_off),
                         static_cast<off_t>(total), POSIX_FADV_DONTNEED);

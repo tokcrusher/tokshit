@@ -194,8 +194,13 @@ class Model {
   [[nodiscard]] bool save_freq_profile(const std::string& path) const;
   [[nodiscard]] bool load_freq_profile(const std::string& path);
 
-  // bulk prefill: прочитать весь слой sequential, посчитать, выбросить
+  // bulk prefill: прочитать весь слой sequential, посчитать, выбросить.
+  // overload берёт union экспертов батча, а не top одного токена
+  // bulk prefill: read the whole layer sequentially. the overload takes the
+  // batch's expert union instead of a single token's top-k
   void prefill_bulk_layer(std::size_t layer);
+  void prefill_bulk_layer(std::size_t layer,
+                          std::span<const std::size_t> experts);
   void pin_hot_experts(std::size_t k);
 
   // draft-режим: роутер отбирает меньше экспертов, чем n_used. черновик

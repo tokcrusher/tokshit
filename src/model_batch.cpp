@@ -295,6 +295,26 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
   metrics().c_expert_union.fetch_add(nu, std::memory_order_relaxed);
   metrics().c_expert_passes.fetch_add(1, std::memory_order_relaxed);
 
+  // TOKSHIT_PREFILL_BULK: для длинного чанка union близок ко всем 256
+  // экспертам, и случайные чтения по слою дешевле заменить одним
+  // sequential-чтением региона. Мелкие чанки оставляем на demand-путь:
+  // читать 252 МБ ради 40 экспертов бессмысленно.
+  // TOKSHIT_PREFILL_BULK: for a long chunk the union is close to all 256
+  // experts, so one sequential region read beats random per-expert reads.
+  // Small chunks stay on the demand path: reading 252 MB for 40 experts is
+  // pointless.
+  if (prefilling_ && io_ != nullptr && resident_budget_ != 0 && b >= 16 &&
+      nu >= 96) {
+    static const bool bulk = [] {
+      const char* v = std::getenv("TOKSHIT_PREFILL_BULK");
+      return v != nullptr && *v != '\0' && v[0] != '0';
+    }();
+    if (bulk) {
+      prefill_bulk_layer(layer,
+                         std::span<const std::size_t>(bf.utop.data(), nu));
+    }
+  }
+
   // считаем размеры групп, потом раскладываем плоские пары (эксперт, строка)
   // count group sizes, then flatten the (expert, row) pairs
   std::fill(bf.moff.begin(), bf.moff.begin() + static_cast<std::ptrdiff_t>(nu),
