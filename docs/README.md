@@ -31,8 +31,10 @@ MoE-модели, которые больше оперативной памят�
 
 11. [PERFORMANCE.ru.md](PERFORMANCE.ru.md) — методика, декод, спекуляция,
     микробенчмарки, исторические прогоны.
-12. [ROADMAP.md](ROADMAP.md) — этапы, карта компонентов, риски, идеи.
-13. [CONTRIBUTING.md](CONTRIBUTING.md) — правила, гигиена модели, коммиты.
+12. [BENCH.ru.md](BENCH.ru.md) — воспроизводимый харнесс decode/prefill/A/B,
+    JSON/CSV, regression gate.
+13. [ROADMAP.md](ROADMAP.md) — этапы, карта компонентов, риски, идеи.
+14. [CONTRIBUTING.md](CONTRIBUTING.md) — правила, гигиена модели, коммиты.
 
 ## English
 
@@ -54,6 +56,6 @@ MoE-модели, которые больше оперативной памят�
 
 - Все замеры — целевой телефон 8 ядер, 15.2 ГБ RAM, Android/Termux.
 - Телефон троттлит: одиночные прогоны шумные, сравнение — через
-  `scripts/ab.sh`.
+  `scripts/bench_matrix.sh` (см. [BENCH.ru.md](BENCH.ru.md)).
 - Микробенчмарки не предсказывают tok/s полного декода.
 - Идеи и незавершённые эксперименты помечены в [ROADMAP.md](ROADMAP.md).
