@@ -1422,6 +1422,14 @@ void Model::layer(std::size_t layer, Workspace& ws, KVCache& kv,
   const auto t_attn = Clock::now();
   const Layer& lt = layers_[layer];
   const std::size_t kv_dim = n_kv_ * head_dim_;
+  // один Seg на матрицу: fused-вызовы ниже собирают несколько независимых
+  // matvec в один пул-барьер, чтобы не платить per-op overhead дважды
+  // one Seg per matrix: fused calls below put independent matvecs behind a
+  // single pool barrier instead of paying the per-op overhead twice
+  auto make_seg = [this](const Meta& m, const float* x,
+                         const kernels::ActQ8& act, float* y) {
+    return Seg{meta_bytes(m), m.rb, m.quant, m.in_dim, x, &act, y, m.out_dim};
+  };
 
   std::copy(ws.x.begin(), ws.x.end(), ws.hn.begin());
   rmsnorm(ws.hn, lt.attn_norm, eps_);
@@ -1535,10 +1543,21 @@ void Model::layer(std::size_t layer, Workspace& ws, KVCache& kv,
     std::fill(ws.u.begin(), ws.u.end(), 0.0F);
     std::fill(ws.dd.begin(), ws.dd.end(), 0.0F);
     kernels::quantize_into(ws.hf, ws.act);
-    matvec_preact(*lt.ffn_gate, ws.hf,
-                  std::span<float>(ws.g.data(), dense_ffn_), ws.act);
-    matvec_preact(*lt.ffn_up, ws.hf,
-                  std::span<float>(ws.u.data(), dense_ffn_), ws.act);
+    {
+      const auto t_gu = Clock::now();
+      const Seg gu[2] = {
+          make_seg(*lt.ffn_gate, ws.hf.data(), ws.act, ws.g.data()),
+          make_seg(*lt.ffn_up, ws.hf.data(), ws.act, ws.u.data()),
+      };
+      run_segs(std::span<const Seg>(gu, 2), 32);
+      if (timing_enabled()) {
+        tick(metrics().t_mm, t_gu);
+        metrics().c_mm_bytes.fetch_add(
+            static_cast<uint64_t>(lt.ffn_gate->out_dim * lt.ffn_gate->rb +
+                                  lt.ffn_up->out_dim * lt.ffn_up->rb),
+            std::memory_order_relaxed);
+      }
+    }
     swiglu(std::span<float>(ws.g.data(), dense_ffn_),
            std::span<const float>(ws.u.data(), dense_ffn_));
     kernels::quantize_into(std::span<float>(ws.g.data(), dense_ffn_), ws.act);
@@ -1550,9 +1569,32 @@ void Model::layer(std::size_t layer, Workspace& ws, KVCache& kv,
     // роутер: считаем логиты по экспертам, берём top-k, нормируем веса
     // router: score the experts, take top-k, normalize the weights
     std::fill(ws.logits.begin(), ws.logits.end(), 0.0F);
+    std::fill(ws.g.begin(), ws.g.end(), 0.0F);
+    std::fill(ws.u.begin(), ws.u.end(), 0.0F);
     std::span<float> router(ws.logits.data(), n_experts_);
     kernels::quantize_into(ws.hf, ws.act);
-    matvec_preact(*lt.gate_inp, ws.hf, router, ws.act);
+    {
+      // router и gate/up shared expert читают один и тот же hf и ws.act:
+      // три независимых matvec уходят в один барьер
+      // router and the shared expert's gate/up read the same hf and ws.act:
+      // three independent matvecs go behind one barrier
+      const Seg pre[3] = {
+          make_seg(*lt.gate_inp, ws.hf.data(), ws.act, router.data()),
+          make_seg(*lt.gate_shexp, ws.hf.data(), ws.act, ws.g.data()),
+          make_seg(*lt.up_shexp, ws.hf.data(), ws.act, ws.u.data()),
+      };
+      const auto t_pre = Clock::now();
+      run_segs(std::span<const Seg>(pre, 3), 32);
+      if (timing_enabled()) {
+        tick(metrics().t_mm, t_pre);
+        metrics().c_mm_bytes.fetch_add(
+            static_cast<uint64_t>(
+                lt.gate_inp->out_dim * lt.gate_inp->rb +
+                lt.gate_shexp->out_dim * lt.gate_shexp->rb +
+                lt.up_shexp->out_dim * lt.up_shexp->rb),
+            std::memory_order_relaxed);
+      }
+    }
 
     const std::size_t k_used =
         router_topk_ != 0 && router_topk_ < n_used_ ? router_topk_ : n_used_;
@@ -1848,15 +1890,10 @@ void Model::layer(std::size_t layer, Workspace& ws, KVCache& kv,
     tick(metrics().t_expert, t_expert);
 
     const auto t_shexp = Clock::now();
-    // shared expert, обычный плотный mlp, добавляем к moe выходу
-    // shared expert, a plain dense mlp, added to the moe output
-    std::fill(ws.g.begin(), ws.g.end(), 0.0F);
-    std::fill(ws.u.begin(), ws.u.end(), 0.0F);
-    kernels::quantize_into(ws.hf, ws.act);
-    matvec_preact(*lt.gate_shexp, ws.hf,
-                  std::span<float>(ws.g.data(), shared_dim_), ws.act);
-    matvec_preact(*lt.up_shexp, ws.hf,
-                  std::span<float>(ws.u.data(), shared_dim_), ws.act);
+    // shared expert, обычный плотный mlp, добавляем к moe выходу.
+    // gate/up уже посчитаны fused-вызовом вместе с router выше
+    // shared expert, a plain dense mlp, added to the moe output.
+    // gate/up were already computed in the fused router call above
     swiglu(std::span<float>(ws.g.data(), shared_dim_),
            std::span<const float>(ws.u.data(), shared_dim_));
     std::fill(ws.dd.begin(), ws.dd.end(), 0.0F);
