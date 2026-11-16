@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check shell syntax
+        run: bash -n install.sh bench.sh scripts/*.sh
+
+      - name: Check docs links
+        run: scripts/check_links.sh
+
+      - name: Configure
+        run: cmake --preset release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # unit tests live outside the public repository; run them only when
+      # present in the checkout
+      - name: Test
+        run: |
+          if [ -f build/tokshit_tests ]; then
+            ctest --test-dir build --output-on-failure
+          else
+            echo "tests are not part of this checkout; skipping"
+          fi

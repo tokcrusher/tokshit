@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Local safety hook. Rejects commits that contain model weights, the local
+# AGENTS.md, huge files, or obvious private keys.
+set -euo pipefail
+
+blocked=()
+while IFS= read -r -d '' f; do
+  case "$f" in
+    AGENTS.md|Agents.md|agents.md|*/AGENTS.md|*/Agents.md)
+      blocked+=("$f (local-only agent file)") ;;
+    *.gguf|*.GGUF)
+      blocked+=("$f (model weights are read-only, never commit)") ;;
+  esac
+  size="$(git cat-file -s ":$f" 2>/dev/null || echo 0)"
+  if [[ "$size" =~ ^[0-9]+$ ]] && ((size > 5 * 1024 * 1024)); then
+    blocked+=("$f ($size bytes; files over 5 MiB are not allowed)")
+  fi
+done < <(git diff --cached --name-only -z --diff-filter=ACMR)
+
+if ((${#blocked[@]})); then
+  printf 'pre-commit: refusing to commit:\n' >&2
+  printf '  - %s\n' "${blocked[@]}" >&2
+  exit 1
+fi
+
+if git diff --cached -U0 | grep -Eq \
+  'BEGIN (OPENSSH|RSA|EC|DSA|PGP) PRIVATE KEY|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}'; then
+  echo 'pre-commit: refusing to commit what looks like a private key or token' >&2
+  exit 1
+fi

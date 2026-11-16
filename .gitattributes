@@ -1,0 +1,16 @@
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.py    text eol=lf
+
+# model weights and binaries never belong in git
+*.gguf        binary
+*.bin         binary
+*.safetensors binary
+
+# cmake/ninja/build artifacts if someone forces them in
+*.o    binary
+*.a    binary
+*.so   binary

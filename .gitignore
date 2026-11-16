@@ -1,0 +1,63 @@
+build/
+build-*/
+cmake-build-*/
+compile_commands.json
+.cache/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# in-source cmake/ninja leftovers
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+Makefile
+
+# binaries built into the repo root
+/tokshit
+/tokshit_tests
+/qstat
+/kbench
+/vcheck
+/bwbench
+/pbench
+/ahbtest
+
+# old agent scratch dirs and local logs
+.code*/
+.code2_*/
+.code3_*/
+.fixbak*/
+freq.log
+*.log
+
+# symlinks to shared storage, not part of the source tree
+/documents
+/downloads
+
+# local-only agent notes (may contain SSH details) — never commit
+/AGENTS.md
+/Agents.md
+/agents.md
+
+# model weights are read-only and never part of the repo
+*.gguf
+*.GGUF
+/models/
+
+# external bugfix agent journal (local-only)
+/fixes.md
+/fixses.md
+
+# unit tests and agent-facing docs live outside the public repository
+/tests/
+docs/TESTING.md
+docs/GIT_WORKTREES.md
+CTestTestfile.cmake
+docs/PERF_SESSION.md
