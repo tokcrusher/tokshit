@@ -466,15 +466,25 @@ COMMON_FLAGS=(--temperature 0 --cache-mb "$CACHE_MB" --io-threads "$IO_THREADS" 
 run_model() { # suite target label logfile extra-args...
   local suite="$1" target="$2" label="$3" log="$4"
   shift 4
-  local t_before t_after m_before m_after start end rc out
+  local t_before t_after m_before m_after start end rc out stdout_file
   t_before="$(read_temp_c)"
   m_before="$(mem_avail_mb)"
   start="$(date +%s)"
 
+  if (( SAVE_LOGS )); then
+    stdout_file="$log.stdout"
+  else
+    stdout_file="$OUT_DIR/.stdout-$$-${run_no}.tmp"
+  fi
+
   echo "--- [$suite] cfg=$label round=${ROUND:-?} target=${target:-} temp=${t_before:-?}C mem=${m_before}MB"
+  # stderr (metrics, guard) уходит в переменную, stdout (текст модели) — в файл:
+  # иначе "Okay, the[prefill: ...]" ломает парсинг строки prefill.
+  # stderr (metrics, guard) goes to the variable, stdout (model text) to a file:
+  # otherwise "Okay, the[prefill: ...]" breaks prefill parsing.
   if out="$(env GGUF_TIME=1 TOKSHIT_PROF=1 TOKSHIT_EXPERT_STATS=1 \
       TOKSHIT_MIN_AVAIL_MB="$MIN_AVAIL_MB" \
-      timeout -k 15 "$RUN_TIMEOUT" "$SAFE_RUN" "$BIN" "$@" 2>&1 </dev/null)"; then
+      timeout -k 15 "$RUN_TIMEOUT" "$SAFE_RUN" "$BIN" "$@" 2>&1 >"$stdout_file" </dev/null)"; then
     rc=0
   else
     rc=$?
@@ -483,13 +493,45 @@ run_model() { # suite target label logfile extra-args...
   t_after="$(read_temp_c)"
   m_after="$(mem_avail_mb)"
 
+  # timeout убивает safe_run.sh, а не обязательно его child. Если модель
+  # пережила прогон, добиваем её: device-lock и проверка pgrep гарантируют,
+  # что это наш процесс.
+  # timeout kills safe_run.sh, not necessarily its child. If the model
+  # survived, kill it: the device lock and the pgrep check guarantee it is ours.
+  local stragglers
+  stragglers="$(pgrep -x tokshit 2>/dev/null || true)"
+  if [[ -n "$stragglers" ]]; then
+    echo "[guard] model survived the run; terminating: $stragglers" >&2
+    kill -TERM $stragglers 2>/dev/null || true
+    sleep 1
+    stragglers="$(pgrep -x tokshit 2>/dev/null || true)"
+    if [[ -n "$stragglers" ]]; then
+      kill -KILL $stragglers 2>/dev/null || true
+    fi
+  fi
+
   if (( SAVE_LOGS )); then
-    printf '%s\n' "$out" > "$log"
+    {
+      printf -- '--- stdout ---\n'
+      cat "$stdout_file" 2>/dev/null || true
+      printf '\n--- stderr ---\n'
+      printf '%s\n' "$out"
+    } > "$log"
   else
     log=""
   fi
+  rm -f "$stdout_file"
 
   parse_run "$out"
+  # у prefill-прогона max_new=1: его «decode» — это один сэмпл без forward,
+  # такие цифры только путают таблицу.
+  # a prefill run uses max_new=1: its "decode" is one sample without a forward,
+  # those numbers only confuse the table.
+  if [[ "$suite" == "prefill" ]]; then
+    P_DECODE=""
+    P_HIT=""
+    P_DENSE=""
+  fi
   local dur=$((end - start))
   if (( rc == 124 )); then
     echo "    timeout after ${dur}s" >&2
@@ -769,7 +811,8 @@ hdr = (f"{'config':<14}{'n':>3}  {'decode tok/s':<24}{'prefill tok/s':<24}"
 print(hdr)
 for cfg in order:
     s = summary[cfg]
-    n = s["runs"]
+    primary = s["decode_tps"] or s["prefill_tps"]
+    n = primary["n"] if primary else s["runs"]
     print(f"{cfg[:13]:<14}{n:>3}  {fmt(s['decode_tps']):<24}{fmt(s['prefill_tps']):<24}"
           f"{fmt(s['hit_rate'], 1):<18}{fmt(s['dense_gbps']):<22}"
           f"{fmt(s['temp_after_c'], 1):<16}{fmt(s['mem_after_mb'], 0):<16}")
