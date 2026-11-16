@@ -641,8 +641,16 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
 
   const auto& m = tokshit::metrics();
   {
-    const uint64_t gh = m.c_expert_hit.load() - prefill_hit;
-    const uint64_t gm = m.c_expert_miss.load() - prefill_miss;
+    // TOKSHIT_PROF обнуляет счётчики после prefill, поэтому вычитать
+    // prefill_hit/miss здесь нельзя: получится underflow и hit-rate > 100%.
+    // TOKSHIT_PROF zeroes the counters after prefill, so subtracting
+    // prefill_hit/miss here underflows and reports a hit-rate above 100%.
+    const uint64_t gh = prof_gen_only
+                            ? m.c_expert_hit.load()
+                            : m.c_expert_hit.load() - prefill_hit;
+    const uint64_t gm = prof_gen_only
+                            ? m.c_expert_miss.load()
+                            : m.c_expert_miss.load() - prefill_miss;
     std::fprintf(stderr,
                  "[gen-only] hit=%llu miss=%llu rate=%.1f%% (prefill was %llu/%llu)\n",
                  static_cast<unsigned long long>(gh),

@@ -14,6 +14,19 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
+# timeout обычно убивает сам safe_run.sh, а child остаётся сиротой и держит
+# модель/AHB. Ловим TERM/INT и гасим child до выхода.
+# timeout usually kills safe_run.sh itself and leaves the child orphaned with
+# the model/AHB. Catch TERM/INT and kill the child before exiting.
+child_pid=""
+cleanup_child() {
+  if [ -n "${child_pid:-}" ] && kill -0 "$child_pid" 2>/dev/null; then
+    kill -TERM "$child_pid" 2>/dev/null
+    kill -KILL "$child_pid" 2>/dev/null
+  fi
+}
+trap 'cleanup_child; exit 143' TERM INT
+
 # Only one model process at a time. The lock is inherited by the child and is
 # released when the model exits, so parallel agents cannot fight over RAM or
 # corrupt each other's benchmarks.
@@ -37,6 +50,7 @@ fi
 # non-interactive runs, where stdin is already a pipe or /dev/null).
 "$@" <&0 &
 pid=$!
+child_pid=$pid
 min_avail=9999999
 peak_rss=0
 killed=0
