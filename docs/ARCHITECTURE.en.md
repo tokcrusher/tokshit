@@ -236,8 +236,8 @@ Known issues:
   tokens (`--spec --spec-k 3` runs at 0.93–1.00 tok/s), and the ids match
   plain greedy byte for byte; `--spec-verify-topk 2` gives ~50% and ~1.5
   tok/s, `--spec-fast` gives 83% and 2.09 tok/s (both **lossy**). All of
-  these are slower than normal top-6 with a 512 MB cache (2.0–2.7 tok/s)
-  on short prompts.
+  these are slower than normal top-6 with a 512 MB cache: the current
+  session gives 1.1–1.9 tok/s, the historical long run 2.0–2.7 tok/s.
 
 ## errors
 
@@ -248,8 +248,9 @@ and tokenizer do.
 ## tests
 
 doctest, one file per area: quants, dequant, GGUF, mmap, cache, expert I/O,
-pool, sampling, tokenizer, KV, attention, batched kernels. The baseline is
-Kernel and layer code is checked against the scalar reference in `compute/kernels_scalar.cpp`.
+pool, sampling, tokenizer, KV, attention, batched kernels. The current line
+is 161 cases / 7716 assertions. Kernel and layer code is checked against the
+scalar reference in `compute/kernels_scalar.cpp`.
 
 ## invariants
 

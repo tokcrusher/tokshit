@@ -115,14 +115,14 @@ is not lossless speculation. Env knobs: `TOKSHIT_SPEC`, `TOKSHIT_SPEC_K`,
 
 ## 6. Что проверено / What is verified
 
-  capacity, high-water, rollback, f16/f32 roundtrip;
-  f16/f32 vs the scalar reference, sink and SWA;
-  Q8_0, плюс `dot_row_multi` на нескольких активациях;
-  batched matvec vs `dot_row` for F32 and Q8_0, plus `dot_row_multi` over
+- KV: capacity, high-water, rollback, f16/f32 roundtrip;
+- attention: f16/f32 vs the scalar reference, sink and SWA;
+- деквант Q8_0 плюс `dot_row_multi` на нескольких активациях;
+- batched matvec vs `dot_row` for F32 and Q8_0, plus `dot_row_multi` over
   several activations;
-- полный набор 136 кейсов / 7024 проверок зелёный локально; на устройстве
+- полный набор 161 кейс / 7716 проверок зелёный локально; на устройстве
   проверяется при следующем деплое.
-  the full 136 cases / 7024 assertions are green locally; the device run
+  the full 161 cases / 7716 assertions are green locally; the device run
   happens on the next deploy.
 - паритет на устройстве: greedy-иды `--spec` и обычного декода совпали
   байт в байт (`[ids: 150006 27177 11 269 1464 950]`).
@@ -176,7 +176,7 @@ of reach without lossy steps: 4 layers run at 28 tok/s while all 49 run at
 путь корректен. Баг в батчевой обработке SWA-слоёв — до локализации
 длинные спекулятивные прогоны нельзя считать валидными.
 
-  Подробные таблицы и методика — в [PERFORMANCE.ru.md](PERFORMANCE.ru.md).
+Подробные таблицы и методика — в [PERFORMANCE.ru.md](PERFORMANCE.ru.md).
 Архитектура KV и батч-матвека — в [RUNTIME.md](RUNTIME.md).
 
 ## 7. Известные ограничения / Known limits

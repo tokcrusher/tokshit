@@ -15,22 +15,24 @@ MoE-модели, которые больше оперативной памят�
 
 ## Архитектура
 
-4. [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md) — модули, загрузка, инварианты.
-5. [RUNTIME.md](RUNTIME.md) — сквозной путь токена, MoE, кэш, I/O, AHB, пул.
-6. [SPEC_KV.md](SPEC_KV.md) — KV-кеш, батч-матвек, спекулятивный цикл.
+3. [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md) — модули, загрузка, инварианты.
+4. [RUNTIME.md](RUNTIME.md) — сквозной путь токена, MoE, кэш, I/O, AHB, пул.
+5. [SPEC_KV.md](SPEC_KV.md) — KV-кеш, батч-матвек, спекулятивный цикл.
 
 ## Кванты и ядра
 
-7. [QUANTIZATION.md](QUANTIZATION.md) — Q8_0, Q4_0, K-кванты, IQ, деквант.
-8. [KERNELS.md](KERNELS.md) — NEON dotprod, fallback, диспетчеризация,
+6. [QUANTIZATION.md](QUANTIZATION.md) — Q8_0, Q4_0, K-кванты, IQ, деквант.
+7. [KERNELS.md](KERNELS.md) — NEON dotprod, fallback, диспетчеризация,
    замеры полосы.
-9. [GGUF.md](GGUF.md) — формат, метаданные, смещения, mmap/pread, ошибки.
-10. [TOKENIZER.md](TOKENIZER.md) — BPE, байтовый fallback, сэмплинг.
+8. [GGUF.md](GGUF.md) — формат, метаданные, смещения, mmap/pread, ошибки.
+9. [TOKENIZER.md](TOKENIZER.md) — BPE, байтовый fallback, сэмплинг.
 
 ## Результаты и планы
 
-11. [PERFORMANCE.ru.md](PERFORMANCE.ru.md) — методика, декод, спекуляция,
+10. [PERFORMANCE.ru.md](PERFORMANCE.ru.md) — методика, декод, спекуляция,
     микробенчмарки, исторические прогоны.
+11. [PERF_SESSION2.md](PERF_SESSION2.md) — baseline сессии 16.11.2026,
+    отрицательные результаты, план.
 12. [ROADMAP.md](ROADMAP.md) — этапы, карта компонентов, риски, идеи.
 13. [CONTRIBUTING.md](CONTRIBUTING.md) — правила, гигиена модели, коммиты.
 
