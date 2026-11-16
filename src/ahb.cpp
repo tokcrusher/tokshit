@@ -223,6 +223,23 @@ void release_ahb(std::size_t bytes) {
   }
 }
 
+// Размер сегмента hot-весов. 0 — старый режим: отдельный буфер на тензор.
+// Anything above 16 GiB is clamped: the phone has 15.2 GiB of RAM, and a huge
+// value must not overflow `mb * 1 MiB`.
+std::size_t hot_seg_target_bytes() {
+  std::size_t mb = 32;
+  if (const char* v = std::getenv("TOKSHIT_HOT_SEG_MB");
+      v != nullptr && *v != '\0') {
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(v, &end, 10);
+    if (end != v) {
+      mb = static_cast<std::size_t>(
+          std::min<unsigned long long>(parsed, 16ULL * 1024ULL));
+    }
+  }
+  return mb * 1024 * 1024;
+}
+
 }  // namespace
 
 struct Slab {
@@ -374,20 +391,25 @@ Pool& Pool::instance() {
 Pool::Pool() : impl_(std::make_unique<Impl>()) {}
 Pool::~Pool() = default;
 
-Buffer::Buffer(std::size_t bytes) {
+Buffer::Buffer(std::size_t bytes, BufferMode mode) {
   if (bytes == 0) return;
-  if (!ahb_disabled()) {
+  const bool ahb_only = mode == BufferMode::AhbOnly;
+  if (mode != BufferMode::MallocOnly && !ahb_disabled()) {
     const AhbApi& api = ahb_api();
     // width у BLOB-дескриптора 32-битный: больше 4 ГиБ одним буфером не выйдет
     if (api.ok && bytes <= 0xFFFF'FFFFULL) {
       if (!reserve_ahb(bytes)) {
-        std::fprintf(stderr,
-                     "[ahb] hot: %zu MB does not fit global AHB budget (%zu MB "
-                     "used of %zu MB), using malloc\n",
-                     bytes / (1024 * 1024),
-                     g_ahb_used.load(std::memory_order_relaxed) /
-                         (1024 * 1024),
-                     ahb_limit_bytes() / (1024 * 1024));
+        // AhbOnly — это пробный запрос: вызывающий сам решит, дробить ли
+        // сегмент. Не шумим на каждый неудачный размер.
+        if (!ahb_only) {
+          std::fprintf(stderr,
+                       "[ahb] hot: %zu MB does not fit global AHB budget (%zu MB "
+                       "used of %zu MB), using malloc\n",
+                       bytes / (1024 * 1024),
+                       g_ahb_used.load(std::memory_order_relaxed) /
+                           (1024 * 1024),
+                       ahb_limit_bytes() / (1024 * 1024));
+        }
       } else {
         AhbDesc desc{};
         desc.width  = static_cast<uint32_t>(bytes);
@@ -416,8 +438,10 @@ Buffer::Buffer(std::size_t bytes) {
             return;
           }
           api.release(buf);
-          std::fprintf(stderr, "[ahb] hot lock failed, using malloc\n");
-        } else {
+          if (!ahb_only) {
+            std::fprintf(stderr, "[ahb] hot lock failed, using malloc\n");
+          }
+        } else if (!ahb_only) {
           std::fprintf(stderr,
                        "[ahb] hot allocate %zu MB failed rc=%d, using malloc\n",
                        bytes / (1024 * 1024), rc);
@@ -426,6 +450,7 @@ Buffer::Buffer(std::size_t bytes) {
       }
     }
   }
+  if (ahb_only) return;  // вызывающий сам раздробит сегмент
   void* p = std::malloc(bytes);
   if (p != nullptr) {
     data_ = static_cast<uint8_t*>(p);
@@ -479,13 +504,23 @@ void Buffer::release() noexcept {
 
 bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
   clear();
+  // offsets[i] — логическое смещение тензора i; offsets[n] — полный размер.
+  // Сегменты режутся только по этим границам, поэтому тензор никогда не
+  // пересекает mapping.
+  // offsets[i] is tensor i's logical offset; offsets[n] is the total. Segments
+  // are cut only at these boundaries, so a tensor never crosses a mapping.
+  std::vector<std::size_t> offsets(sizes.size() + 1, 0);
   std::size_t total = 0;
-  for (std::size_t s : sizes) {
+  for (std::size_t i = 0; i < sizes.size(); ++i) {
     // A wrapped total used to make the MemAvailable check nonsensical and let
     // the loader start allocating an impossible layout.
-    if (s > std::numeric_limits<std::size_t>::max() - total) return false;
-    total += s;
+    if (sizes[i] > std::numeric_limits<std::size_t>::max() - total) {
+      return false;
+    }
+    offsets[i] = total;
+    total += sizes[i];
   }
+  offsets[sizes.size()] = total;
   if (total == 0) return false;
 
   // Жёсткий предохранитель: не занимаем последний 1 ГиБ. Лучше остаться на
@@ -503,29 +538,153 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
     return false;
   }
 
-  segs_.reserve(sizes.size());
-  std::size_t off = 0;
-  for (std::size_t s : sizes) {
-    if (s == 0) {
-      off += s;
-      continue;
+  const std::size_t seg_target = hot_seg_target_bytes();
+
+  // Группируем подряд идущие тензоры в сегмент не больше seg_target. Если
+  // следующий тензор не влезает — начинаем новый сегмент. Тензор больше
+  // seg_target получает собственный сегмент.
+  // Pack consecutive tensors into a segment of at most seg_target bytes. The
+  // next tensor starts a new segment when it does not fit; a tensor larger than
+  // seg_target gets a segment of its own.
+  struct Run {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+    std::size_t bytes = 0;
+  };
+  std::vector<Run> runs;
+  if (seg_target == 0) {
+    runs.reserve(sizes.size());
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+      if (sizes[i] != 0) runs.push_back(Run{i, i + 1, sizes[i]});
     }
-    Buffer b(s);
-    if (!b.valid()) {
-      clear();
-      return false;
+  } else {
+    std::size_t begin = 0;
+    std::size_t bytes = 0;
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+      const std::size_t s = sizes[i];
+      if (s == 0) {
+        if (bytes == 0) begin = i + 1;
+        continue;
+      }
+      // `bytes <= seg_target`, so the subtraction cannot underflow.
+      if (bytes != 0 && s > seg_target - bytes) {
+        runs.push_back(Run{begin, i, bytes});
+        begin = i;
+        bytes = 0;
+      }
+      if (bytes == 0) begin = i;
+      bytes += s;
     }
-    if (b.on_ahb()) ahb_bytes_ += s;
-    segs_.push_back(Seg{off, s, std::move(b)});
-    off += s;
+    if (bytes != 0) runs.push_back(Run{begin, sizes.size(), bytes});
   }
-  size_ = off;
+
+  const bool ahb_ok = !ahb_disabled() && ahb_api().ok;
+  // Не дробим меньше мегабайта: на такой гранулярности per-buffer overhead
+  // уже не окупается, а бюджет AHB всё равно не спасёт.
+  // Do not split below 1 MiB: at that granularity per-buffer overhead wins
+  // nothing and an exhausted AHB budget will not recover.
+  constexpr std::size_t kMinSplit = 1ULL << 20;
+  // Если свободного AHB-бюджета меньше этого, дробить бессмысленно: получим
+  // сотни malloc-сегментов. Лучше отдать остаток сегментов в malloc целиком.
+  // Below this much free AHB budget splitting is pointless: it only produces
+  // hundreds of malloc segments, so the remaining runs go straight to malloc.
+  constexpr std::size_t kMinUsefulAhb = 8ULL << 20;
+  const std::size_t ahb_limit = ahb_limit_bytes();
+  auto ahb_room = [&]() -> std::size_t {
+    const std::size_t used = g_ahb_used.load(std::memory_order_relaxed);
+    return used >= ahb_limit ? 0 : ahb_limit - used;
+  };
+
+  bool ok = true;
+  auto alloc_run = [&](auto&& self, std::size_t begin, std::size_t end,
+                       std::size_t bytes) -> bool {
+    Buffer buf;
+    bool budget_blocked = false;
+    if (ahb_ok) {
+      const std::size_t room = ahb_room();
+      if (bytes > room && room < kMinUsefulAhb) {
+        budget_blocked = true;
+        buf = Buffer(bytes, BufferMode::MallocOnly);
+      } else {
+        buf = Buffer(bytes, BufferMode::AhbOnly);
+      }
+    } else {
+      buf = Buffer(bytes);
+    }
+    if (!buf.valid() && ahb_ok && !budget_blocked) {
+      // gralloc не дал сегмент целиком — режем по границе тензора и пробуем
+      // меньшие буферы. Это лучше, чем молча уйти в malloc на весь сегмент.
+      // gralloc refused the whole segment: split at a tensor boundary and try
+      // smaller buffers instead of silently dropping the whole run to malloc.
+      if (end - begin > 1 && bytes > kMinSplit) {
+        const std::size_t half = bytes / 2;
+        std::size_t mid = begin + 1;
+        std::size_t left = sizes[begin];
+        std::size_t best_mid = mid;
+        std::size_t best_diff =
+            left > half ? left - half : half - left;
+        while (mid < end) {
+          left += sizes[mid];
+          ++mid;
+          if (mid >= end) break;
+          const std::size_t diff = left > half ? left - half : half - left;
+          if (diff < best_diff) {
+            best_diff = diff;
+            best_mid = mid;
+          }
+        }
+        if (best_mid > begin && best_mid < end) {
+          return self(self, begin, best_mid, offsets[best_mid] - offsets[begin]) &&
+                 self(self, best_mid, end, offsets[end] - offsets[best_mid]);
+        }
+      }
+      // Один тензор или уже слишком мелко: последняя попытка через Auto
+      // (AHB ещё раз, затем malloc).
+      // Single tensor or already tiny: one Auto attempt (AHB again, then
+      // malloc).
+      buf = Buffer(bytes);
+    }
+    if (!buf.valid()) return false;
+    if (buf.on_ahb()) ahb_bytes_ += bytes;
+    segs_.push_back(Seg{offsets[begin], bytes, std::move(buf)});
+    return true;
+  };
+
+  segs_.reserve(runs.size());
+  for (const Run& run : runs) {
+    if (!alloc_run(alloc_run, run.begin, run.end, run.bytes)) {
+      ok = false;
+      break;
+    }
+  }
+  if (!ok) {
+    clear();
+    return false;
+  }
+  size_ = total;
+
+  std::size_t ahb_segs = 0;
+  std::size_t malloc_segs = 0;
+  std::size_t min_seg = 0;
+  std::size_t max_seg = 0;
+  for (const Seg& seg : segs_) {
+    if (seg.buf.on_ahb()) {
+      ++ahb_segs;
+    } else {
+      ++malloc_segs;
+    }
+    min_seg = min_seg == 0 ? seg.len : std::min(min_seg, seg.len);
+    max_seg = std::max(max_seg, seg.len);
+  }
   std::fprintf(stderr,
-               "[ahb] hot: %zu tensor(s), %zu MB total, %zu MB pinned, %zu MB "
-               "malloc\n",
-               segs_.size(), size_ / (1024 * 1024),
-               ahb_bytes_ / (1024 * 1024),
-               (size_ - ahb_bytes_) / (1024 * 1024));
+               "[ahb] hot: %zu tensor(s) -> %zu segment(s) (target %zu MB, "
+               "min %.1f MB, max %.1f MB): %zu AHB, %zu malloc, %zu MB total, "
+               "%zu MB pinned\n",
+               sizes.size(), segs_.size(), seg_target / (1024 * 1024),
+               static_cast<double>(min_seg) / (1024.0 * 1024.0),
+               static_cast<double>(max_seg) / (1024.0 * 1024.0), ahb_segs,
+               malloc_segs, size_ / (1024 * 1024),
+               ahb_bytes_ / (1024 * 1024));
   return true;
 }
 
