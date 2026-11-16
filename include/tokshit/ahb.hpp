@@ -34,10 +34,15 @@ struct Config {
 // Если это анонимная память, Android под давлением кладёт её в ZRAM, и каждое
 // чтение превращается в распаковку. dma-buf не свопится: страница остаётся
 // страницей. Поэтому hot-веса живут здесь, а не в std::vector<uint8_t>.
+enum class BufferMode {
+    Auto,     // AHB, при отказе — malloc
+    AhbOnly,  // только AHB; при отказе буфер остаётся невалидным
+};
+
 class Buffer {
 public:
     Buffer() = default;
-    explicit Buffer(std::size_t bytes);  // AHB, при отказе — malloc
+    explicit Buffer(std::size_t bytes, BufferMode mode = BufferMode::Auto);
     ~Buffer();
 
     Buffer(Buffer&& other) noexcept;
@@ -60,11 +65,13 @@ private:
     bool        on_ahb_ = false;
 };
 
-// Плотные веса по тензорам. Один общий AHB на 1.5 ГБ gralloc часто
-// отвергает, поэтому каждый тензор получает свой буфер, а логические
-// смещения (Meta::base) отображаются на буферы через data_at(). Тензор
-// никогда не пересекает границу mapping, так что matvec читает непрерывный
-// диапазон.
+// Плотные веса по тензорам. Тензоры пакуются в крупные сегменты
+// (TOKSHIT_HOT_SEG_MB, по умолчанию 32 МБ), но ни один тензор не пересекает
+// границу сегмента. Один общий AHB на 1.5 ГБ gralloc часто отвергает, поэтому
+// сегмент — компромисс: десятки буферов вместо сотен, меньше TLB-промахов и
+// per-buffer overhead. Если большой сегмент не аллоцируется, он рекурсивно
+// дробится по границам тензоров; логические смещения (Meta::base) отображаются
+// на буферы через data_at().
 class HotWeights {
 public:
     HotWeights() = default;
