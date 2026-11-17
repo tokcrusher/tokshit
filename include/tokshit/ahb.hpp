@@ -35,8 +35,9 @@ struct Config {
 // чтение превращается в распаковку. dma-buf не свопится: страница остаётся
 // страницей. Поэтому hot-веса живут здесь, а не в std::vector<uint8_t>.
 enum class BufferMode {
-    Auto,     // AHB, при отказе — malloc
-    AhbOnly,  // только AHB; при отказе буфер остаётся невалидным
+    Auto,      // AHB, при отказе — malloc
+    AhbOnly,   // только AHB; при отказе буфер остаётся невалидным
+    MallocOnly // сразу malloc, без проб AHB и без логов
 };
 
 class Buffer {

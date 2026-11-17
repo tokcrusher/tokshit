@@ -394,7 +394,7 @@ Pool::~Pool() = default;
 Buffer::Buffer(std::size_t bytes, BufferMode mode) {
   if (bytes == 0) return;
   const bool ahb_only = mode == BufferMode::AhbOnly;
-  if (!ahb_disabled()) {
+  if (mode != BufferMode::MallocOnly && !ahb_disabled()) {
     const AhbApi& api = ahb_api();
     // width у BLOB-дескриптора 32-битный: больше 4 ГиБ одним буфером не выйдет
     if (api.ok && bytes <= 0xFFFF'FFFFULL) {
@@ -584,12 +584,34 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
   // Do not split below 1 MiB: at that granularity per-buffer overhead wins
   // nothing and an exhausted AHB budget will not recover.
   constexpr std::size_t kMinSplit = 1ULL << 20;
+  // Если свободного AHB-бюджета меньше этого, дробить бессмысленно: получим
+  // сотни malloc-сегментов. Лучше отдать остаток сегментов в malloc целиком.
+  // Below this much free AHB budget splitting is pointless: it only produces
+  // hundreds of malloc segments, so the remaining runs go straight to malloc.
+  constexpr std::size_t kMinUsefulAhb = 8ULL << 20;
+  const std::size_t ahb_limit = ahb_limit_bytes();
+  auto ahb_room = [&]() -> std::size_t {
+    const std::size_t used = g_ahb_used.load(std::memory_order_relaxed);
+    return used >= ahb_limit ? 0 : ahb_limit - used;
+  };
 
   bool ok = true;
   auto alloc_run = [&](auto&& self, std::size_t begin, std::size_t end,
                        std::size_t bytes) -> bool {
-    Buffer buf = ahb_ok ? Buffer(bytes, BufferMode::AhbOnly) : Buffer(bytes);
-    if (!buf.valid() && ahb_ok) {
+    Buffer buf;
+    bool budget_blocked = false;
+    if (ahb_ok) {
+      const std::size_t room = ahb_room();
+      if (bytes > room && room < kMinUsefulAhb) {
+        budget_blocked = true;
+        buf = Buffer(bytes, BufferMode::MallocOnly);
+      } else {
+        buf = Buffer(bytes, BufferMode::AhbOnly);
+      }
+    } else {
+      buf = Buffer(bytes);
+    }
+    if (!buf.valid() && ahb_ok && !budget_blocked) {
       // gralloc не дал сегмент целиком — режем по границе тензора и пробуем
       // меньшие буферы. Это лучше, чем молча уйти в malloc на весь сегмент.
       // gralloc refused the whole segment: split at a tensor boundary and try
