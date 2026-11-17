@@ -21,7 +21,7 @@ English version: [README.md](README.md).
   SMMLA-путь для Q8_0 (`TOKSHIT_I8MM=1`), батчевые матвеки и
   GEMM-конвейер префилла.
 - **Спекулятивный декод.** Черновик на урезанном роутере, батч-verify,
-  lossless-жадный режим; acceptance до ~75 % на коротких раундах.
+  lossless-жадный режим; acceptance 50–78 % на коротких раундах.
 - **Частотный профиль роутинга.** Профиль сохраняется между запусками и
   прогревает кэш экспертов до первого токена.
 - **Батчевый префилл.** Веса читаются один раз на чанк токенов, эксперты —
@@ -41,26 +41,25 @@ English version: [README.md](README.md).
 
 | режим | tok/s |
 |---|---:|
-| декод top-6, кэш 512 МБ, `O_DIRECT` | 2.0–2.7 |
-| декод top-6, кэш 1024 МБ, io 8 | 2.43 (hit 60 % на длинных прогонах) |
+| декод top-6, кэш 512 МБ, `O_DIRECT` (эта сессия) | 1.1–1.9 |
+| декод top-6, кэш 512 МБ (ранние длинные прогоны, исторический) | 2.0–2.7 |
 | префилл батчами (`TOKSHIT_PREFILL_BATCH=32`) | 4–5.3 |
 | `--fast` (top-2, **LOSSY**) | ~4.5 |
-| спекуляция, lossless verify | acceptance до 75 % |
+| спекуляция, полный verify (lossless) | 0.93–1.0, acceptance 50–78 % |
 
-Микробенчмарки:
+Строка 2.0–2.7 — лучший длинный прогон прошлых сессий. Это исторический
+ориентир, а не текущий baseline: точечные прогоны этой сессии на том же
+обычном top-6 дают 1.1–1.9 tok/s.
 
-| что | результат |
-|---|---:|
-| Q8_0 matvec, отдельные сегменты | 25–35 ГБ/с |
-| hot-область из page cache (`bwbench`) | 39.5 ГБ/с |
-| AHB против malloc, блоки 328 КБ | 25.7 против 21.7 ГБ/с |
-| поток всех hot-весов 1.74 ГБ через AHB | 5.2 ГБ/с |
-| сырое чтение с флеша (`dd iflag=direct`) | ~1.4 ГБ/с |
+Микробенчмарки: Q8_0 matvec на отдельных сегментах — 25–35 ГБ/с; полный
+поток hot-весов 1.74 ГБ через AHB — 5.2 ГБ/с; сырое последовательное
+чтение с флеша — ~1.4 ГБ/с. Разрыв между сегментами и полным потоком —
+это и есть узкое место декода.
 
 Бюджет токена: плотные веса ~1.74 ГБ (переквантованные в Q8_0), эксперты
 при полном промахе ~0.37 ГБ (6 из 256 × 3 проекции × 47 слоёв). Методика,
-фазы и подробные прогоны — в
-[docs/PERFORMANCE.ru.md](docs/PERFORMANCE.ru.md).
+фазы и подробные прогоны — в [docs/PERFORMANCE.ru.md](docs/PERFORMANCE.ru.md).
+Текущий baseline и план — в [docs/PERF_SESSION2.md](docs/PERF_SESSION2.md).
 
 ## Модель
 
@@ -169,7 +168,7 @@ include/tokshit/   публичные заголовки
 src/               рантайм
 src/compute/       скалярные, NEON и батчевые ядра
 src/tools/         qstat, kbench, vcheck, bwbench, pbench, ahbtest
-scripts/           safe_run.sh, ab.sh, sweep.sh, deploy.sh
+scripts/           safe_run.sh, device_lock.sh, ab.sh, sweep.sh, deploy.sh
 docs/              тематическая документация
 install.sh         установщик Termux/Linux
 CMakePresets.json  пресеты release/debug
@@ -190,6 +189,7 @@ LICENSE            кастомная WTF 1.2
 | [docs/GGUF.md](docs/GGUF.md) | парсинг, метаданные, mmap/pread |
 | [docs/TOKENIZER.md](docs/TOKENIZER.md) | BPE и сэмплинг |
 | [docs/PERFORMANCE.ru.md](docs/PERFORMANCE.ru.md) | замеры и методика |
+| [docs/PERF_SESSION2.md](docs/PERF_SESSION2.md) | baseline сессии, ограничения и план |
 | [docs/SPEC_KV.md](docs/SPEC_KV.md) | KV, батч-матвек, спекуляция |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | этапы, риски, идеи |
 | [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) | сборка и правила разработки |

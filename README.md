@@ -22,7 +22,7 @@ prefill pipeline.
   SMMLA path for Q8_0 (`TOKSHIT_I8MM=1`), batched matvecs and a batched
   prefill GEMM pipeline.
 - **Speculative decode.** A draft pass with a reduced router, batched
-  verification, lossless greedy mode; up to ~75% draft acceptance in short
+  verification, lossless greedy mode; 50–78% draft acceptance in short
   rounds.
 - **Routing frequency profile.** The profile is saved between runs and
   warms the expert cache before the first token.
@@ -43,25 +43,25 @@ runs are noisy.
 
 | mode | tok/s |
 |---|---:|
-| top-6 decode, 512 MB cache, `O_DIRECT` | 2.0–2.7 |
-| top-6 decode, 1024 MB cache, io 8 | 2.43 (60% hit on long runs) |
+| top-6 decode, 512 MB cache, `O_DIRECT` (this session) | 1.1–1.9 |
+| top-6 decode, 512 MB cache (earlier long runs, historical) | 2.0–2.7 |
 | batched prefill (`TOKSHIT_PREFILL_BATCH=32`) | 4–5.3 |
 | `--fast` (top-2, **LOSSY**) | ~4.5 |
-| speculation, lossless verify | up to 75% acceptance |
+| speculation, full verify (lossless) | 0.93–1.0, 50–78% acceptance |
 
-Microbenchmarks:
+The 2.0–2.7 row is the best long-run result from earlier sessions. It is a
+historical reference, not the current baseline: spot runs in the current
+session land at 1.1–1.9 tok/s with the same normal top-6 path.
 
-| what | result |
-|---|---:|
-| Q8_0 matvec, individual segments | 25–35 GB/s |
-| hot region from page cache (`bwbench`) | 39.5 GB/s |
-| AHB vs malloc, 328 KB blocks | 25.7 vs 21.7 GB/s |
-| full 1.74 GB hot stream over AHB | 5.2 GB/s |
-| raw sequential flash read (`dd iflag=direct`) | ~1.4 GB/s |
+Microbenchmarks: Q8_0 matvec on individual segments 25–35 GB/s; the full
+1.74 GB hot stream over AHB 5.2 GB/s; raw sequential flash read ~1.4 GB/s.
+The gap between the segment and full-stream numbers is the decode
+bottleneck.
 
 Token budget: dense weights ~1.74 GB (requantized to Q8_0), experts ~0.37 GB
 on a full miss (6 of 256 × 3 projections × 47 layers). Methodology, phase
 breakdowns and detailed runs: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Current session baseline and plan: [docs/PERF_SESSION2.md](docs/PERF_SESSION2.md).
 
 ## Model
 
@@ -171,7 +171,7 @@ include/tokshit/   public headers
 src/               runtime
 src/compute/       scalar, NEON and batched kernels
 src/tools/         qstat, kbench, vcheck, bwbench, pbench, ahbtest
-scripts/           safe_run.sh, ab.sh, sweep.sh, deploy.sh
+scripts/           safe_run.sh, device_lock.sh, ab.sh, sweep.sh, deploy.sh
 docs/              thematic documentation
 install.sh         Termux/Linux installer
 CMakePresets.json  release/debug presets
@@ -192,6 +192,7 @@ Full index and reading order: [docs/README.md](docs/README.md).
 | [docs/GGUF.md](docs/GGUF.md) | parsing, metadata, mmap/pread (RU) |
 | [docs/TOKENIZER.md](docs/TOKENIZER.md) | BPE and sampling (RU) |
 | [docs/PERFORMANCE.md](docs/PERFORMANCE.md) | measurements and methodology |
+| [docs/PERF_SESSION2.md](docs/PERF_SESSION2.md) | current session baseline, limits and plan (RU) |
 | [docs/SPEC_KV.md](docs/SPEC_KV.md) | KV, batched matvec, speculation |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | stages, risks, ideas (RU) |
 | [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) | build and development rules (RU) |

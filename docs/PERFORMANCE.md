@@ -6,17 +6,19 @@ Measured numbers and engineering conclusions. All runs are on one phone
 background load moves results by tens of percent.
 
 Full Russian version with more detail:
-[PERFORMANCE.ru.md](PERFORMANCE.ru.md).
+[PERFORMANCE.ru.md](PERFORMANCE.ru.md). Current session baseline and plan:
+[PERF_SESSION2.md](PERF_SESSION2.md).
 
 ## summary
 
 | question | answer |
 |---|---|
-| normal top-6 decode | **2.0–2.7 tok/s** with a 512 MB cache |
-| no cache, mmap | 1.24–1.37 tok/s |
-| 2–3 GB cache | ~2.05 tok/s, no gain |
-| `--fast` | 4.52 tok/s, but **lossy top-2** |
-| speculation | 50–78% acceptance on short rounds, lossless verify |
+| normal top-6 decode, 512 MB cache (current session) | **1.1–1.9 tok/s** |
+| same config, earlier long runs | 2.0–2.7 tok/s (historical) |
+| no cache, mmap (historical) | 1.24–1.37 tok/s |
+| 2–3 GB cache (historical) | ~2.05 tok/s, no gain |
+| `--fast` (historical) | 4.52 tok/s, but **lossy top-2** |
+| speculation, full verify | 0.93–1.00 tok/s, 50–78% acceptance |
 | batched prefill | 4–5.3 tok/s (`TOKSHIT_PREFILL_BATCH=32`) |
 | AHB | 5.2 GB/s on the hot stream; removes ZRAM/swap |
 
@@ -80,16 +82,23 @@ GGUF_TIME=1 scripts/safe_run.sh build/tokshit --bench-mm \
 
 | mode | cache | I/O | tok/s | hit rate | status |
 |---|---:|---|---:|---:|---|
-| top-6 | 0 | mmap | 1.24–1.37 | — | normal decode |
-| top-6 | 512 MB | `O_DIRECT` | 2.0–2.7 | ~32% | normal decode, default |
-| top-6 | 2048 MB | `O_DIRECT` | ~2.05 | ~40% | normal decode |
-| top-6 | 3072 MB | `O_DIRECT` | ~2.05 | ~40% | normal decode |
-| top-2 | 0 | buffered | 4.52 | — | **lossy** (`--fast`) |
+| top-6 | 512 MB | `O_DIRECT` | 1.1–1.9 | — | current session |
+| top-6 | 0 | mmap | 1.24–1.37 | — | historical |
+| top-6 | 512 MB | `O_DIRECT` | 2.0–2.7 | ~32% | historical long runs |
+| top-6 | 2048 MB | `O_DIRECT` | ~2.05 | ~40% | historical |
+| top-6 | 3072 MB | `O_DIRECT` | ~2.05 | ~40% | historical |
+| top-2 | 0 | buffered | 4.52 | — | **lossy** (`--fast`), historical |
 
-The 512 MB cache is a real win over mmap. 2–3 GB adds ~8 points of hit rate
-but no tok/s: dense weights and reclaim eat the gain, and 3–4 GB on a 15 GB
-phone easily ends in OOM. The 4.52 tok/s result is top-2 of 6, a different
-mode.
+The current session baseline is 1.1–1.9 tok/s on the normal top-6 path with a
+512 MB cache. The 2.0–2.7 range is the best long-run result from earlier
+sessions and is kept as a historical reference; it is not the current
+baseline. Thermal state, background load and code revision differ, so do not
+mix the two ranges.
+
+In the historical long runs, the 512 MB cache was a real win over mmap. 2–3 GB
+adds ~8 points of hit rate but no tok/s: dense weights and reclaim eat the
+gain, and 3–4 GB on a 15 GB phone easily ends in OOM. The 4.52 tok/s result
+is top-2 of 6, a different mode.
 
 ## speculation results
 
@@ -139,8 +148,10 @@ Experts on a full miss:
 ```
 
 At a 32% hit rate this drops to ~0.252 GB; at 40% to ~0.222 GB. With a 512 MB
-cache the token needs `1.551 + 0.252 ≈ 1.80 GB`. At 2.35 tok/s that is ~0.43 s
-per token and ~4.2 GB/s aggregate.
+cache the token needs `1.551 + 0.252 ≈ 1.80 GB`. For the historical 2.35 tok/s
+run that is ~0.43 s per token and ~4.2 GB/s aggregate. The current session's
+1.1–1.9 tok/s is below that historical range and gives roughly 2.0–3.4 GB/s
+aggregate; the difference is not yet attributed to a single cause.
 
 ## where the time goes
 
@@ -149,7 +160,8 @@ per token and ~4.2 GB/s aggregate.
 Dense weights are 1.55 GB per token, the largest item. Segments hit 25–35 GB/s,
 but the full stream over 391 buffers gives 5.21 GB/s (`rare`). At 5.21 GB/s the
 dense part alone costs ~0.30 s/token, a ceiling of ~3.3 tok/s before any expert
-read.
+read. The current 1.1–1.9 tok/s is below that ceiling: expert I/O, attention
+and scheduling add the rest.
 
 Why 391 buffers: gralloc rejects one 1.55 GB buffer (`rc=-129`). Splitting by
 tensor avoids the rejection but costs TLB/contiguity. `often` returns an
@@ -159,19 +171,21 @@ latency grows.
 
 Requantizing dense tensors without a NEON kernel to `Q8_0`
 (`TOKSHIT_HOT_CONV=1`, default) raises matvec from 5.47 to 9.15 GB/s and full
-decode from 1.90 to 2.28 tok/s; hot weights grow from 1626 to 1740 MB. These
-are single noisy runs; see [QUANTIZATION.md](QUANTIZATION.md) for the table and
-caveats.
+decode from 1.90 to 2.28 tok/s; hot weights grow from 1626 to 1740 MB. This is
+a historical A/B on one code revision: the current baseline is lower, so use
+the table for the conversion effect, not absolute speed. See
+[QUANTIZATION.md](QUANTIZATION.md) for the table and caveats.
 
 ### experts and flash
 
 Raw flash read is ~1.4 GB/s. At a 32% hit rate the runtime reads ~0.25 GB,
 about 180 ms. The expert matvec is fault-latency bound: at cache 0, 12 passes
-take 7–9 s, i.e. 0.6–0.75 s/token. That is the 1.24–1.37 tok/s result.
+take 7–9 s, i.e. 0.6–0.75 s/token. That is the historical 1.24–1.37 tok/s
+result.
 
 `O_DIRECT` does not make the drive faster; it keeps experts from evicting the
-dense weights from page cache. That is why a 512 MB cache gives 2.0–2.7 tok/s
-instead of 1.3.
+dense weights from page cache. In the historical long runs a 512 MB cache gave
+2.0–2.7 tok/s instead of 1.3; the current session gives 1.1–1.9.
 
 ### pool
 
@@ -197,8 +211,8 @@ do not compensate. The acceptance and cache-counter bugs are still open.
 | total | already > 380 ms |
 
 Even with free experts, 200 ms needs a ~7.8 GB/s dense stream. The full AHB
-stream is 5.21 GB/s. `--fast` (top-2, warm page cache) reaches 4.52 tok/s,
-i.e. ~7.0 GB/s effective, but it is lossy.
+stream is 5.21 GB/s. The historical `--fast` run (top-2, warm page cache)
+reaches 4.52 tok/s, i.e. ~7.0 GB/s effective, but it is lossy.
 
 The current full top-6 path is limited by the dense stream and expert reads.
 Reaching 5 tok/s needs a faster dense stream (contiguous memory, fewer
@@ -207,6 +221,10 @@ mode. The 5 tok/s target is in progress; concrete steps are in
 [ROADMAP.md](ROADMAP.md).
 
 ## what to try next
+
+First reproduce the current 1.1–1.9 baseline and the historical 2.0–2.7
+configuration interleaved in one session. Without that, no kernel or cache
+change can be credited.
 
 1. **Fix speculation metrics and acceptance.** Count `expert_hit/miss` in the
    batch path, then explain the 0% full-verify acceptance.
@@ -234,10 +252,13 @@ mode. The 5 tok/s target is in progress; concrete steps are in
 - Quote normal-decode numbers only from full top-6 runs, not from `--fast`
   or microbenchmarks.
 
-## open bugs
+## open bugs and issues
 
 1. The batched path breaks on contexts longer than the sliding window (513):
    prefilling a ~1040-token prompt yields blown-up logits and garbage decode.
    Short prompts are correct. Main open speculation bug.
 2. gralloc rejects one 1.55 GB AHB buffer (`rc=-129`); 391 buffers are a
    workaround, not a fix.
+3. Current top-6 short runs are 1.1–1.9 tok/s, below the historical 2.0–2.7
+   long-run range. The cause is not isolated; treat it as an open performance
+   issue until an interleaved A/B clears it.
