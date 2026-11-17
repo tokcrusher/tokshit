@@ -13,13 +13,17 @@ Full Russian version with more detail:
 
 | question | answer |
 |---|---|
-| normal top-6 decode, 512 MB cache (current session) | **1.1–1.9 tok/s** |
-| same config, earlier long runs | 2.0–2.7 tok/s (historical) |
+| normal top-6 decode, 8 tokens, 47 °C | **2.40 tok/s** |
+| normal top-6 decode, 16 tokens, 60 °C | 0.96 tok/s |
+| normal decode, session range | 1.0–2.4 tok/s (thermal) |
+| earlier long runs | 2.0–2.7 tok/s (historical) |
 | no cache, mmap (historical) | 1.24–1.37 tok/s |
 | 2–3 GB cache (historical) | ~2.05 tok/s, no gain |
 | `--fast` (historical) | 4.52 tok/s, but **lossy top-2** |
+| `--turbo` (LOSSY, top-2 + Q4_0) | 3.52 tok/s |
 | speculation, full verify | 0.93–1.00 tok/s, 50–78% acceptance |
-| batched prefill | 4–5.3 tok/s (`TOKSHIT_PREFILL_BATCH=32`) |
+| batched prefill, T=224 | 4.53 tok/s (`TOKSHIT_PREFILL_BATCH=32`) |
+| prefill-bulk, T=224 | 2.32 tok/s (worse than union) |
 | AHB | 5.2 GB/s on the hot stream; removes ZRAM/swap |
 
 ## model

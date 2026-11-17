@@ -43,15 +43,19 @@ runs are noisy.
 
 | mode | tok/s |
 |---|---:|
-| top-6 decode, 512 MB cache, `O_DIRECT` (this session) | 1.1–1.9 |
-| top-6 decode, 512 MB cache (earlier long runs, historical) | 2.0–2.7 |
-| batched prefill (`TOKSHIT_PREFILL_BATCH=32`) | 4–5.3 |
-| `--fast` (top-2, **LOSSY**) | ~4.5 |
+| top-6 decode, 8 tokens, 47 °C, 1024 MB cache, io 8 | **2.40** |
+| top-6 decode, 16 tokens, 60 °C, same config | 0.96 |
+| top-6 decode, historical long run | 2.0–2.7 |
+| `--turbo` (top-2 + Q4_0, **LOSSY**) | 3.52 |
+| prefill union, T=224, batch 32 | 4.53 |
+| prefill union, T=128 | 6.01 |
+| prefill-bulk, T=224 | 2.32 (worse than union) |
 | speculation, full verify (lossless) | 0.93–1.0, 50–78% acceptance |
 
-The 2.0–2.7 row is the best long-run result from earlier sessions. It is a
-historical reference, not the current baseline: spot runs in the current
-session land at 1.1–1.9 tok/s with the same normal top-6 path.
+The 1.0–2.4 tok/s spread is thermal: at 60 °C the CPU drops to 1.2–1.7 GHz
+and the dense stream from 12.6 to 4.2 GB/s. Run with `termux-wake-lock`,
+record temperature, and let the phone cool between runs. Turbo changes the
+model output and does not replace normal top-6.
 
 Microbenchmarks: Q8_0 matvec on individual segments 25–35 GB/s; the full
 1.74 GB hot stream over AHB 5.2 GB/s; raw sequential flash read ~1.4 GB/s.
