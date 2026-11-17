@@ -528,7 +528,7 @@ ExpertIo::Loaded ExpertIo::load(std::size_t layer, uint64_t key,
   CacheBlock block;
   {
     std::lock_guard<std::mutex> lock(inline_mu_);
-    block = fetch(Job{layer, key, gkey, offset, size, true, epoch, slot},
+    block = fetch(Job{layer, key, gkey, offset, size, true, epoch, slot, {}},
                   kInlineLane);
   }
   CacheBlock out;
@@ -571,7 +571,8 @@ bool ExpertIo::demand_async(std::size_t layer, uint64_t key, uint64_t offset,
     auto slot = std::make_shared<Slot>();
     inflight_.emplace(gkey, slot);
     demand_q_.push_back(
-        Job{layer, key, gkey, offset, size, true, epoch_, std::move(slot)});
+        Job{layer, key, gkey, offset, size, true, epoch_, std::move(slot),
+            {}});
   }
   metrics().c_dem_queued.fetch_add(1, std::memory_order_relaxed);
   cv_work_.notify_all();
@@ -630,7 +631,8 @@ void ExpertIo::prefetch(std::size_t layer, uint64_t key, uint64_t offset,
     auto slot = std::make_shared<Slot>();
     inflight_.emplace(gkey, slot);
     spec_q_.push_back(
-        Job{layer, key, gkey, offset, size, false, epoch_, std::move(slot)});
+        Job{layer, key, gkey, offset, size, false, epoch_, std::move(slot),
+            {}});
   }
   cv_work_.notify_one();
 }

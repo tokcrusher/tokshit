@@ -120,9 +120,9 @@ is not lossless speculation. Env knobs: `TOKSHIT_SPEC`, `TOKSHIT_SPEC_K`,
 - деквант Q8_0 плюс `dot_row_multi` на нескольких активациях;
 - batched matvec vs `dot_row` for F32 and Q8_0, plus `dot_row_multi` over
   several activations;
-- полный набор 161 кейс / 7716 проверок зелёный локально; на устройстве
+- полный набор 161 кейс / 7781 проверок зелёный локально; на устройстве
   проверяется при следующем деплое.
-  the full 161 cases / 7716 assertions are green locally; the device run
+  the full 161 cases / 7781 assertions are green locally; the device run
   happens on the next deploy.
 - паритет на устройстве: greedy-иды `--spec` и обычного декода совпали
   байт в байт (`[ids: 150006 27177 11 269 1464 950]`).

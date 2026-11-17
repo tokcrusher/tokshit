@@ -821,7 +821,7 @@ void print_chat_status(const ChatSession& s, bool color) {
   st.ctx_pos = s.pos;
   st.cache_budget_mb = s.cache_budget_mb;
   st.spec = false;  // чат идёт обычным декодом
-  const std::string text = tokshit::tui::format_status(st, false);
+  const std::string text = tokshit::tui::format_status(st, color);
   std::fprintf(stderr, "%s\n", text.c_str());
 }
 
@@ -853,7 +853,7 @@ void print_chat_stats(const ChatSession& s, bool color) {
   stats.reasoning_budget = s.reasoning_budget;
   stats.has_system = !s.system_prompt.empty();
   stats.system_prompt = s.system_prompt;
-  const std::string text = tokshit::tui::format_stats(stats, false);
+  const std::string text = tokshit::tui::format_stats(stats, color);
   std::fwrite(text.data(), 1, text.size(), stdout);
   std::fputc('\n', stdout);
   std::fflush(stdout);

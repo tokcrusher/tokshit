@@ -135,14 +135,25 @@ build/tokshit --help
 отличается от обычного top-6. Он полезен как быстрый черновик и для
 сравнения полосы, но не заменяет обычный декод.
 
-`--spec-fast` — тот же набор плюс:
+`--turbo` — отдельный **LOSSY**-пресет для длинного decode:
+
+```text
+--draft-topk 2 --o-direct=1 --cache-mb 1024 --io-threads 8 --drop-cache=0
+```
+
+Роутер берёт 2 эксперта из 6, плотные веса переквантовываются в Q4_0,
+но кэш экспертов и `O_DIRECT` остаются включёнными. Это не normal top-6:
+выход модели отличается. `--turbo` полезен, когда нужна скорость, а не
+паритет с полным роутингом.
+
+`--spec-fast` — набор `--fast` плюс:
 
 ```text
 --spec --spec-k 4 --spec-maxb 8 --spec-verify-topk 2
 ```
 
-Тоже **LOSSY**. Переменные `TOKSHIT_FAST=1` и `TOKSHIT_SPEC_FAST=1`
-включают те же пресеты без флага.
+Тоже **LOSSY**. Переменные `TOKSHIT_FAST=1`, `TOKSHIT_TURBO=1` и
+`TOKSHIT_SPEC_FAST=1` включают те же пресеты без флага.
 
 ## 4. Переменные окружения
 
@@ -300,6 +311,10 @@ scripts/safe_run.sh build/tokshit --temperature 0 --cache-mb 512 \
 
 # быстрый, но LOSSY
 scripts/safe_run.sh build/tokshit --fast --temperature 0 \
+  ~/models/flint-UD-Q3_K_XL.gguf "hi" 24
+
+# LOSSY turbo: top-2 + Q4_0 dense, с кэшем и O_DIRECT
+scripts/safe_run.sh build/tokshit --turbo --temperature 0 \
   ~/models/flint-UD-Q3_K_XL.gguf "hi" 24
 ```
 

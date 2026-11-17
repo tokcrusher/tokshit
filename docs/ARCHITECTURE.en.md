@@ -249,7 +249,7 @@ and tokenizer do.
 
 doctest, one file per area: quants, dequant, GGUF, mmap, cache, expert I/O,
 pool, sampling, tokenizer, KV, attention, batched kernels. The current line
-is 161 cases / 7716 assertions. Kernel and layer code is checked against the
+is 161 cases / 7781 assertions. Kernel and layer code is checked against the
 scalar reference in `compute/kernels_scalar.cpp`.
 
 ## invariants
