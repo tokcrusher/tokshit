@@ -123,6 +123,8 @@ constexpr FlagDoc kFlags[] = {
     // пресеты / presets
     {"fast", "TOKSHIT_FAST", "", FlagGroup::Preset,
      "LOSSY: top-2 (2 из 6 экспертов), кэш/O_DIRECT выкл", "выкл"},
+    {"turbo", "TOKSHIT_TURBO", "", FlagGroup::Preset,
+     "LOSSY: top-2 + Q4_0 dense, кэш 1024 и O_DIRECT", "выкл"},
     {"spec-fast", "TOKSHIT_SPEC_FAST", "", FlagGroup::Preset,
      "LOSSY: --fast + спекуляция K=4, verify top-2", "выкл"},};
 
@@ -333,6 +335,9 @@ std::string help_text(std::string_view default_model) {
   out.push_back('\n');
   append_line(out, "  # быстро, но LOSSY: черновик берёт 2 эксперта из 6");
   append_line(out, "  tokshit --fast --temperature 0 model.gguf \"привет\" 64");
+  out.push_back('\n');
+  append_line(out, "  # LOSSY turbo: top-2 + Q4_0 dense, кэш 1024 и O_DIRECT");
+  append_line(out, "  tokshit --turbo --temperature 0 model.gguf \"привет\" 64");
   out.push_back('\n');
   append_line(out, "  # эта справка");
   append_line(out, "  tokshit --help");

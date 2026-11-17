@@ -1237,7 +1237,7 @@ bool flag_is_bool(const std::string& name) {
       "pool-rt",       "pool-stats",     "print-ids",
       "spec",          "bench-mm",       "bench-breakdown", "debug-tok",
       "seg-debug",     "mlock",          "expert-stats",   "fast",
-      "spec-fast",
+      "spec-fast",     "turbo",
   };
   for (const char* b : kBool) {
     if (name == b) return true;
@@ -1258,6 +1258,23 @@ void print_help() {
 // hidden: fast is plain top-2 decode through the page cache, spec-fast adds
 // speculation with a cut verify router
 bool apply_preset(const std::string& name) {
+  // turbo — отдельный LOSSY-пресет: top-2 эксперта, Q4_0 dense, но с
+  // рабочим кэшем и O_DIRECT. --fast специально уходил в page cache и
+  // cache-mb=0; для длинного decode это медленнее.
+  // turbo is a separate LOSSY preset: top-2 experts and Q4_0 dense, but with
+  // a real cache and O_DIRECT. --fast deliberately used the page cache and
+  // cache-mb=0; that is slower for long decode.
+  if (name == "turbo") {
+    setenv("TOKSHIT_DRAFT_TOPK", "2", 1);
+    setenv("TOKSHIT_HOT_Q4", "1", 1);
+    setenv("TOKSHIT_O_DIRECT", "1", 1);
+    setenv("TOKSHIT_EXPERT_CACHE_MB", "1024", 1);
+    setenv("TOKSHIT_IO_THREADS", "8", 1);
+    setenv("TOKSHIT_DROP_CACHE", "0", 1);
+    unsetenv("TOKSHIT_SPEC");
+    unsetenv("TOKSHIT_PREFETCH");
+    return true;
+  }
   if (name != "fast" && name != "spec-fast") return false;
   setenv("TOKSHIT_O_DIRECT", "0", 1);
   setenv("TOKSHIT_EXPERT_CACHE_MB", "0", 1);
@@ -1289,7 +1306,9 @@ void apply_env_presets() {
     const char* v = std::getenv(name);
     return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
   };
-  if (enabled("TOKSHIT_SPEC_FAST")) {
+  if (enabled("TOKSHIT_TURBO")) {
+    apply_preset("turbo");
+  } else if (enabled("TOKSHIT_SPEC_FAST")) {
     apply_preset("spec-fast");
   } else if (enabled("TOKSHIT_FAST")) {
     apply_preset("fast");
