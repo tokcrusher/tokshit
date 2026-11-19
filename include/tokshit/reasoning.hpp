@@ -7,15 +7,10 @@
 
 #include <cstdint>
 
+#include "tokshit/special_tokens.hpp"
+
 namespace tokshit {
 
-// спецтокены Flint: открытие и закрытие блока рассуждений
-// Flint special tokens: open and close of the reasoning block
-inline constexpr std::uint32_t kThinkOpen = 150006;
-inline constexpr std::uint32_t kThinkClose = 150007;
-
-// бюджет: -1 — без лимита, 0 — закрыть сразу после открытия, N > 0 — кап
-// budget: -1 means unlimited, 0 closes right after the open token, N > 0 caps
 class ReasoningBudget {
  public:
   explicit ReasoningBudget(int budget = -1) noexcept;

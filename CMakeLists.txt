@@ -35,6 +35,7 @@ set(TOKSHIT_CORE_SOURCES
   src/model_hot.cpp
   src/model_cache.cpp
   src/model_layer.cpp
+  src/model_moe.cpp
   src/model_token.cpp
   src/model_math.cpp
   src/model_batch.cpp
@@ -44,7 +45,9 @@ set(TOKSHIT_CORE_SOURCES
   src/spec_loop.cpp
   src/expert_io.cpp
   src/reasoning.cpp
-  src/tui.cpp
+  src/tui_flags.cpp
+  src/tui_status.cpp
+  src/tui_command.cpp
 )
 
 if(TOKSHIT_NEON AND TOKSHIT_DOTPROD AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
@@ -107,7 +110,13 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(tokshit_core PUBLIC Threads::Threads)
 
-add_executable(tokshit src/main.cpp)
+add_executable(tokshit
+  src/main.cpp
+  src/cli_common.cpp
+  src/cli_flags.cpp
+  src/cli_run.cpp
+  src/cli_chat.cpp
+)
 target_link_libraries(tokshit PRIVATE tokshit_core)
 tokshit_set_warnings(tokshit)
 

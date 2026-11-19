@@ -14,13 +14,11 @@
 
 #include "tokshit/metrics.hpp"
 #include "tokshit/pool.hpp"
+#include "tokshit/special_tokens.hpp"
 
 namespace tokshit::spec {
 
 namespace {
-
-constexpr uint32_t kUser = 150003;
-constexpr uint32_t kAssistant = 150004;
 
 std::size_t env_u(const char* name, std::size_t def) {
   const char* v = std::getenv(name);

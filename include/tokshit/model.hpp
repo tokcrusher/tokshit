@@ -285,6 +285,14 @@ class Model {
 
   void layer(std::size_t layer, Workspace& ws, KVCache& kv,
              std::span<const std::pair<float, float>> rope_table);
+  // слой разбит на три шага: attention, плотный FFN, MoE FFN. layer() только
+  // связывает их и ведёт общий тайминг.
+  [[nodiscard]] Seg make_seg(const Meta& meta, const float* x,
+                             const kernels::ActQ8& act, float* y) const;
+  void layer_attention(std::size_t layer, Workspace& ws, KVCache& kv,
+                       std::span<const std::pair<float, float>> rope_table);
+  void layer_dense(std::size_t layer, Workspace& ws);
+  void layer_moe(std::size_t layer, Workspace& ws);
   // батч-слой: b позиций за проход, kv пишет сам через abi Kv. агрегирован
   // с model_batch.cpp, буферы — через opaque BatchBuf
   // batched layer: b positions per pass, kv written through the Kv abi.
