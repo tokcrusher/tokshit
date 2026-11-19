@@ -121,12 +121,10 @@ constexpr FlagDoc kFlags[] = {
      "отладка сегментов matvec", "выкл"},
 
     // пресеты / presets
-    {"fast", "TOKSHIT_FAST", "", FlagGroup::Preset,
-     "LOSSY: top-2 (2 из 6 экспертов), кэш/O_DIRECT выкл", "выкл"},
     {"turbo", "TOKSHIT_TURBO", "", FlagGroup::Preset,
      "LOSSY: top-2 + Q4_0 dense, кэш 1024 и O_DIRECT", "выкл"},
     {"spec-fast", "TOKSHIT_SPEC_FAST", "", FlagGroup::Preset,
-     "LOSSY: --fast + спекуляция K=4, verify top-2", "выкл"},};
+     "LOSSY: спекуляция K=4, черновик top-2, verify top-2", "выкл"},};
 
 std::string_view trim(std::string_view s) {
   std::size_t b = 0;
@@ -332,9 +330,6 @@ std::string help_text(std::string_view default_model) {
   append_line(out,
               "  tokshit --spec --spec-k 4 --spec-verify-topk 2 \\");
   append_line(out, "    --temperature 0 model.gguf \"привет\" 64");
-  out.push_back('\n');
-  append_line(out, "  # быстро, но LOSSY: черновик берёт 2 эксперта из 6");
-  append_line(out, "  tokshit --fast --temperature 0 model.gguf \"привет\" 64");
   out.push_back('\n');
   append_line(out, "  # LOSSY turbo: top-2 + Q4_0 dense, кэш 1024 и O_DIRECT");
   append_line(out, "  tokshit --turbo --temperature 0 model.gguf \"привет\" 64");

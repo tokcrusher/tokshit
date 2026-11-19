@@ -31,7 +31,12 @@ set(TOKSHIT_CORE_SOURCES
   src/ahb.cpp
   src/tokenizer.cpp
   src/sampling.cpp
-  src/model.cpp
+  src/model_load.cpp
+  src/model_hot.cpp
+  src/model_cache.cpp
+  src/model_layer.cpp
+  src/model_token.cpp
+  src/model_math.cpp
   src/model_batch.cpp
   src/kv.cpp
   src/compute/kernels_batch.cpp

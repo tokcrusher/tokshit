@@ -25,6 +25,8 @@
 #include "tokshit/tokenizer.hpp"
 #include "tokshit/tui.hpp"
 
+#include "env.hpp"
+
 namespace {
 
 constexpr uint32_t kUser = 150003;
@@ -35,12 +37,6 @@ constexpr uint32_t kAssistant = 150004;
 volatile std::sig_atomic_t g_interrupt = 0;
 
 extern "C" void on_sigint(int) { g_interrupt = 1; }
-
-uint64_t env_u64(const char* name, uint64_t fallback) {
-  const char* v = std::getenv(name);
-  if (v == nullptr || *v == '\0') return fallback;
-  return std::strtoull(v, nullptr, 10);
-}
 
 // TOKSHIT_REASONING_BUDGET: -1 без лимита, 0 закрыть сразу, N > 0 кап.
 // мусор и значения меньше -1 трактуем как «без лимита»
@@ -885,7 +881,7 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   ChatSession s;
   s.kv.assign(model.n_layers(), std::vector<float>{});
   s.params = sample_params_from_env();
-  s.cache_budget_mb = env_u64("TOKSHIT_EXPERT_CACHE_MB", 1024);
+  s.cache_budget_mb = tokshit::env_u64("TOKSHIT_EXPERT_CACHE_MB", 1024);
   s.reasoning_budget = reasoning_budget_from_env();
   tokshit::Rng rng;
 
@@ -1227,8 +1223,6 @@ const char* env_for_flag(const std::string& name) {
 
 // булевы флаги не съедают следующий аргумент: --spec "model.gguf" должен
 // трактовать model.gguf как позиционный, а не как значение
-// boolean flags do not consume the next arg: --spec "model.gguf" must treat
-// model.gguf as positional, not as a value
 bool flag_is_bool(const std::string& name) {
   static const char* const kBool[] = {
       "hot",           "hot-conv",       "o-direct",       "drop-cache",
@@ -1236,7 +1230,7 @@ bool flag_is_bool(const std::string& name) {
       "mmap-willneed", "fadv-dontneed",  "fadv-random",    "pool-pin",
       "pool-rt",       "pool-stats",     "print-ids",
       "spec",          "bench-mm",       "bench-breakdown", "debug-tok",
-      "seg-debug",     "mlock",          "expert-stats",   "fast",
+      "seg-debug",     "mlock",          "expert-stats",
       "spec-fast",     "turbo",
   };
   for (const char* b : kBool) {
@@ -1251,19 +1245,9 @@ void print_help() {
   std::fflush(stdout);
 }
 
-// пресеты для быстрых замеров. это просто набор флагов, ничего скрытого:
-// fast — обычный декод top-2 через page cache, spec-fast — то же плюс
-// спекуляция с урезанным verify-роутером
-// presets for quick measurements. they are just flag bundles, nothing
-// hidden: fast is plain top-2 decode through the page cache, spec-fast adds
-// speculation with a cut verify router
+// Пресеты — просто наборы флагов. Оба LOSSY: turbo меняет квант dense и
+// число экспертов, spec-fast урезает черновик и verify.
 bool apply_preset(const std::string& name) {
-  // turbo — отдельный LOSSY-пресет: top-2 эксперта, Q4_0 dense, но с
-  // рабочим кэшем и O_DIRECT. --fast специально уходил в page cache и
-  // cache-mb=0; для длинного decode это медленнее.
-  // turbo is a separate LOSSY preset: top-2 experts and Q4_0 dense, but with
-  // a real cache and O_DIRECT. --fast deliberately used the page cache and
-  // cache-mb=0; that is slower for long decode.
   if (name == "turbo") {
     setenv("TOKSHIT_DRAFT_TOPK", "2", 1);
     setenv("TOKSHIT_HOT_Q4", "1", 1);
@@ -1275,32 +1259,21 @@ bool apply_preset(const std::string& name) {
     unsetenv("TOKSHIT_PREFETCH");
     return true;
   }
-  if (name != "fast" && name != "spec-fast") return false;
+  if (name != "spec-fast") return false;
   setenv("TOKSHIT_O_DIRECT", "0", 1);
   setenv("TOKSHIT_EXPERT_CACHE_MB", "0", 1);
   setenv("TOKSHIT_DRAFT_TOPK", "2", 1);
   setenv("TOKSHIT_DROP_CACHE", "0", 1);
   unsetenv("TOKSHIT_PREFETCH");
-  // --fast — это именно обычный декод, поэтому спекуляцию гасим, даже если
-  // она пришла из окружения. --spec-fast включает её обратно
-  // --fast means plain decode, so turn speculation off even if the
-  // environment had it. --spec-fast turns it back on
-  unsetenv("TOKSHIT_SPEC");
-  if (name == "spec-fast") {
-    setenv("TOKSHIT_SPEC", "1", 1);
-    setenv("TOKSHIT_SPEC_K", "4", 1);
-    setenv("TOKSHIT_SPEC_MAXB", "8", 1);
-    setenv("TOKSHIT_SPEC_VERIFY_TOPK", "2", 1);
-  }
+  setenv("TOKSHIT_SPEC", "1", 1);
+  setenv("TOKSHIT_SPEC_K", "4", 1);
+  setenv("TOKSHIT_SPEC_MAXB", "8", 1);
+  setenv("TOKSHIT_SPEC_VERIFY_TOPK", "2", 1);
   return true;
 }
 
-// пресеты из окружения: справка обещает TOKSHIT_FAST/TOKSHIT_SPEC_FAST, так
-// что они должны работать и без флага. вызываем до разбора argv, чтобы явные
-// флаги могли переопределить отдельные значения пресета
-// env presets: --help advertises TOKSHIT_FAST/TOKSHIT_SPEC_FAST, so they must
-// work without flags. called before argv parsing so explicit flags can override
-// individual preset values
+// Пресеты из окружения работают и без флага. Вызываются до разбора argv,
+// чтобы явные флаги могли переопределить отдельные значения.
 void apply_env_presets() {
   const auto enabled = [](const char* name) {
     const char* v = std::getenv(name);
@@ -1310,8 +1283,6 @@ void apply_env_presets() {
     apply_preset("turbo");
   } else if (enabled("TOKSHIT_SPEC_FAST")) {
     apply_preset("spec-fast");
-  } else if (enabled("TOKSHIT_FAST")) {
-    apply_preset("fast");
   }
 }
 
