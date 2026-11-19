@@ -16,7 +16,7 @@ namespace tokshit {
 struct KvCap {
   std::size_t layers = 0;
   std::size_t kv_dim = 0;  // n_kv_heads * head_dim
-  std::size_t cap = 0;     // токенов на слой / positions per layer
+  std::size_t cap = 0;     // токенов на слой
   bool f16 = true;         // f16 слябы, иначе plain f32
 };
 
@@ -29,7 +29,7 @@ class Kv {
   static Kv alloc(const KvCap& cap);
 
   // пишет b токенов с абсолютной позиции pos. k/v полустроками: строка j
-  // начинается с k[j * k_stride], kv_dim элементов, stride в float'ах
+  // начинается с k[j * k_stride], kv_dim элементов, stride в float
   void write(std::size_t layer, std::size_t pos, std::size_t b,
              const float* k, std::size_t k_stride, const float* v,
              std::size_t v_stride);

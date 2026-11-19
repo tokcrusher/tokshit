@@ -339,8 +339,7 @@ float dot_iq2s(const std::uint8_t* row, const ActQ8& act,
   return vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 }
 
-// iq3_s: переписал без промежуточного wbuf на стеке, сразу считаем по
-// распакованным int8. это дало примерно 5.9 -> 8.9 гб/с
+// iq3_s: без промежуточного wbuf на стеке, считаем сразу по распакованным int8.
 float dot_iq3s(const std::uint8_t* row, const ActQ8& act,
                std::size_t in_dim) noexcept {
   constexpr std::size_t kBs = 110;
@@ -402,9 +401,7 @@ float dot_iq3s(const std::uint8_t* row, const ActQ8& act,
   return vaddvq_f32(vaddq_f32(accv, accv2));
 }
 
-// iq3_xxs: то же что iq3_s, только другая раскладка qh/scales. тоже без wbuf,
-// ~5.3 -> 7.5 гб/с
-// ~5.3 -> ~7.5 gb/s
+// iq3_xxs: как iq3_s, другая раскладка qh/scales, тоже без wbuf.
 float dot_iq3xxs(const std::uint8_t* row, const ActQ8& act,
                  std::size_t in_dim) noexcept {
   constexpr std::size_t kBs = 98;

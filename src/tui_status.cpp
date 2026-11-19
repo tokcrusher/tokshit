@@ -117,7 +117,7 @@ std::string format_stats(const Stats& stats, bool color) {
                 "╭─ СТАТИСТИКА СЕССИИ ────────────────────────────\n");
   out.append(buf);
 
-  // скорость / speed
+  // Скорость
   out.append("│ скорость\n");
   std::snprintf(buf, sizeof(buf),
                 "│   последняя: %.1f tok/s  ·  средняя: %.1f tok/s\n",
@@ -129,7 +129,7 @@ std::string format_stats(const Stats& stats, bool color) {
                 static_cast<unsigned long long>(stats.total_tokens));
   out.append(buf);
 
-  // кэш экспертов / expert cache
+  // Кэш экспертов
   out.append("│ кэш экспертов\n");
   std::snprintf(buf, sizeof(buf),
                 "│   кэш %s (hit %llu / miss %llu)  ·  union %.2f/проход\n",
@@ -139,7 +139,7 @@ std::string format_stats(const Stats& stats, bool color) {
                 stats.union_per_pass);
   out.append(buf);
 
-  // память / memory
+  // Память
   out.append("│ память\n");
   std::snprintf(buf, sizeof(buf),
                 "│   RSS %llu MB  ·  MemAvailable %llu MB  ·  кэш %llu MB\n",
@@ -148,7 +148,7 @@ std::string format_stats(const Stats& stats, bool color) {
                 static_cast<unsigned long long>(s.cache_budget_mb));
   out.append(buf);
 
-  // сессия / session
+  // Сессия
   out.append("│ сессия\n");
   std::snprintf(buf, sizeof(buf),
                 "│   %llu ходов  ·  контекст %zu  ·  spec %s",
@@ -157,7 +157,7 @@ std::string format_stats(const Stats& stats, bool color) {
   out.append(buf);
   out.push_back('\n');
 
-  // сэмплинг / sampling
+  // Сэмплинг
   out.append("│ сэмплинг\n");
   std::snprintf(buf, sizeof(buf),
                 "│   temp %.2f  ·  top-k %zu  ·  top-p %.2f  ·  reasoning-budget: %d",

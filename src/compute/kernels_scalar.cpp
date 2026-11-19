@@ -30,8 +30,7 @@ ActQ8 quantize(std::span<const float> x) {
   return act;
 }
 
-// симметричный int8 квант блоками по 32. тот же алгоритм что в rust версии,
-// поэтому числа должны совпадать
+// Симметричный int8 квант блоками по 32: x ~= q * scale, q = max/127.
 void quantize_into(std::span<const float> x, ActQ8& act) {
   act.len = x.size();
   act.q.resize(act.len);

@@ -19,7 +19,7 @@ struct AttendArgs {
   bool f16 = true;  // иначе слябы — plain f32
   // запросы: b × n_heads × head_dim, rope уже применён; строка j — q[j * sq]
   const float* q = nullptr;
-  std::size_t sq = 0;              // шаг между строками в float'ах
+  std::size_t sq = 0;              // шаг между строками в float
   const float* sinks = nullptr;    // n_heads значений (attn_sinks слоя)
   float* out = nullptr;            // b × n_heads × head_dim
   std::size_t b = 0;

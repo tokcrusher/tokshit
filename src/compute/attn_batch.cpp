@@ -99,11 +99,8 @@ void kvh_work(const KvhJob& j, std::size_t kvh) {
     const std::size_t h0 = kvh * group;
     const std::size_t koff = kvh * hd * (a.f16 ? 2 : 4);
 
-    // слайс скоров этого kvh. раньше все воркеры писали один и тот же диапазон
-    // sc[gi*len+col]: индекс не включал kvh, и на батчах с len*group >= 2048
-    // (позиции >= ~254 на флинте) головы 8..31 softmax'или и взвешивали скоры
-    // чужих голов, а в пуле ещё и гонялись за одними ячейками. на коротком
-    // контексте путь сериальный и сломанное место не выполнялось
+    // Срез скоров этого kvh: sc[h0*len .. h0*len+group*len). Срезы голов не
+    // пересекаются, поэтому воркеры пишут их параллельно.
     float* sc = j.sc + h0 * len;
     thread_local std::vector<float> kbuf, vbuf, acc;
     kbuf.resize(hd);

@@ -29,7 +29,7 @@ class Rng {
   std::uniform_real_distribution<float> dist_{0.0F, 1.0F};
 };
 
-// сэмплинг точь в точь как в rust эталоне: exp(logit / T), top-k через
+// сэмплинг: exp(logit / T), top-k через
 // nth_element, top-p по накопленной сумме, потом один uniform выбор
 [[nodiscard]] uint32_t sample(std::span<const float> logits,
                               const SampleParams& params, Rng& rng);

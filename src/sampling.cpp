@@ -15,7 +15,7 @@ struct Utf8Check {
   std::size_t error_len = 0;
 };
 
-// проверяем utf-8 вручную, как в эталоне. отдаём до какого места валидно и
+// проверяем utf-8 вручную. отдаём до какого места валидно и
 // длину ошибки
 Utf8Check check_utf8(std::span<const uint8_t> s) {
   std::size_t i = 0;

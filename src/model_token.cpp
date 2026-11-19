@@ -216,8 +216,8 @@ void Model::token_logits(uint32_t token, KVCache& kv, std::size_t pos,
   // выставит prefilling_ = false перед генерацией
   const auto t_embd = Clock::now();
   const auto embd_bytes = meta_bytes(embd_);
-  // границы словаря: невалидный id (битый сэмплер/промпт) раньше уходил
-  // subspan'ом за пределы буфера весов — UB вместо управляемого нуля
+  // id вне словаря (битый сэмплер или промпт) даёт нулевые логиты вместо
+  // выхода за буфер весов.
   if (static_cast<std::size_t>(token) >= vocab_) {
     std::fill(out.begin(), out.end(), 0.0F);
     return;

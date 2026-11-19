@@ -1,9 +1,9 @@
 #pragma once
-// CacheBlock: заменяет std::shared_ptr<const std::vector<uint8_t>> в expert-кэше.
-// Память идёт из AHB-пула (pinned dma-buf, не сжимается ZRAM, не вытесняется LMK).
-// Если AHB недоступен или размер больше slot_bytes -- fallback на malloc.
-//
-// Совместим по API с vector: .data() и .size(). Для записи -- .writable().
+
+// Блок памяти expert-кэша из AHB-пула: pinned dma-buf, не сжимается ZRAM и не
+// вытесняется LMK. Если AHB недоступен или размер больше slot_bytes, пул
+// отдаёт malloc. Интерфейс чтения: .data() и .size(); запись доступна только
+// до публикации блока в кэш.
 
 #include <cstddef>
 #include <cstdint>

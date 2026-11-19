@@ -85,9 +85,8 @@ struct CacheEntry {
   std::list<uint64_t>::iterator lru;
 };
 
-// послойный lru. попадание/промах/эвикция за o(1), через intrusive список
-// ключей. старая версия на каждую эвикцию сканила весь map целиком, это было
-// тупо и медленно
+// Послойный LRU: попадание, промах и эвикция за O(1) через intrusive список
+// ключей.
 class ResidentCache {
  public:
   explicit ResidentCache(std::size_t layers);
@@ -112,7 +111,7 @@ class ResidentCache {
   struct LayerCache {
     mutable std::mutex mu;
     std::unordered_map<uint64_t, CacheEntry> map;
-    std::list<uint64_t> order;  // спереди самый свежий / front is mru
+    std::list<uint64_t> order;  // спереди самый свежий
     uint64_t bytes = 0;
   };
   std::vector<LayerCache> layers_;

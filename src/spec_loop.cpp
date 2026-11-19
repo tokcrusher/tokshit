@@ -109,7 +109,7 @@ void run(Model& model, const BpeTokenizer& tok, const std::string& prompt,
   const auto g0 = Clock::now();
 
   while (gen < max_new) {
-    if (pos >= kv.cap()) break;  // кеш полон / cache is full
+    if (pos >= kv.cap()) break;  // кеш полон
     const uint32_t first = static_cast<uint32_t>(argmax(head));
     if (tok.is_eog(first)) break;
     ++rounds;

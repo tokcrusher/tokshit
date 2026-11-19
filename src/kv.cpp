@@ -58,10 +58,8 @@ void Kv::write(std::size_t layer, std::size_t pos, std::size_t b,
       store_f32(vrow, v + j * v_stride, cap_.kv_dim);
     }
   }
-  // high-water только по реально записанным строкам: раньше hi = pos + b
-  // заявлял позиции за контуром, tokens() сообщал о несуществующих строках,
-  // и attention читал мусор вместо k/v. при writable == 0 (pos за контуром)
-  // high-water не двигается вовсе
+  // high-water двигается только по реально записанным строкам. Если pos за
+  // контуром, счётчик не меняется.
   if (writable != 0) {
     const std::size_t hi = pos + writable;
     if (hi > high_[layer]) high_[layer] = hi;

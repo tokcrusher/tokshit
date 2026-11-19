@@ -332,8 +332,8 @@ std::size_t Model::router_topk() const noexcept {
   return router_topk_ != 0 && router_topk_ < n_used_ ? router_topk_ : n_used_;
 }
 
-// прогрев после промпта: топ-k по истории частоты на каждом слое. теперь это
-// реальные чтения в наш кэш, а не madvise в page cache
+// Прогрев после промпта: топ-k по истории частоты на каждом слое. Это чтения
+// в кэш экспертов, а не madvise в page cache.
 void Model::prefill_bulk_layer(std::size_t layer) {
   if (!ws_) return;
   prefill_bulk_layer(
@@ -540,5 +540,5 @@ void Model::pin_hot_experts(std::size_t k) {
                pinned, batches,
                static_cast<unsigned long long>(total / (1024ULL * 1024ULL)));
 }
-// rmsnorm на месте, как в эталоне
+// rmsnorm на месте
 }  // namespace tokshit

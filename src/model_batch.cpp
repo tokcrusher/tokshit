@@ -17,8 +17,8 @@
 namespace tokshit {
 
 struct Model::BatchBuf {
-  std::size_t b = 0;      // ёмкость строк / row capacity
-  std::size_t maxm = 0;   // ёмкость пар эксперт-строка / expert-member pairs
+  std::size_t b = 0;      // ёмкость строк
+  std::size_t maxm = 0;   // ёмкость пар эксперт-строка
   std::vector<float> x, hn, hf, o, moe, dd, g, u;
   std::vector<float> q, attn, k, v, router;
   std::vector<float> gu, uu, gx, ddm;
@@ -340,7 +340,7 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
   if (io_ != nullptr && resident_budget_ != 0) {
     // hit/miss как в одиночном пути: demand_async вернул true (блок уже в
     // кэше или вне диапазона) — hit, иначе чтение реально заказано — miss.
-    // дупликаат (чтение уже в полёте) тоже miss, чтобы совпадать с model.cpp
+    // дубликат (чтение уже в полёте) тоже miss, чтобы совпадать с model.cpp
     const ExpertMeta* ems[2] = {&em_g, &em_u};
     for (std::size_t u = 0; u < nu; ++u) {
       const std::size_t e = bf.utop[u];

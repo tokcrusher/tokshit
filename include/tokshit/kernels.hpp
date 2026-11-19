@@ -12,11 +12,11 @@ namespace tokshit::kernels {
 // активация проквантованная в int8 блоками по 32: x ~= q * scale
 struct ActQ8 {
   std::vector<int8_t> q;
-  std::vector<float> scales;  // одна на блок 32 / one per 32 elems
+  std::vector<float> scales;  // одна на блок 32
   size_t len = 0;
 };
 
-// симметричный per-block int8 квант (max/127), как в rust эталоне
+// симметричный per-block int8 квант (max/127)
 [[nodiscard]] ActQ8 quantize(std::span<const float> x);
 
 // то же что quantize, но переиспользует буферы внутри `act`. горячий путь

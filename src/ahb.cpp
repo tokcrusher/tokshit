@@ -142,8 +142,7 @@ std::size_t ahb_limit_bytes() {
     const char* v = std::getenv("TOKSHIT_AHB_MAX_MB");
     if (v != nullptr && *v != '\0') {
       const unsigned long long parsed = std::strtoull(v, nullptr, 10);
-      // clamp before multiplying: TOKSHIT_AHB_MAX_MB=18446744073709551615
-      // used to wrap the limit around to a tiny value (or zero).
+      // Ограничить до умножения на 1 MiB, чтобы не переполнить size_t.
       constexpr unsigned long long kMaxMb =
           std::numeric_limits<std::size_t>::max() / (1024ULL * 1024ULL);
       if (parsed != 0) {
@@ -174,9 +173,7 @@ bool reserve_ahb(std::size_t bytes) {
   // MemAvailable важнее, чем «5 ГиБ разрешено».
   constexpr std::size_t kMemReserve = 1ULL * 1024 * 1024 * 1024;
   const std::size_t limit = ahb_limit_bytes();
-  // All arithmetic below is guarded: `bytes` comes from configuration, and
-  // `bytes + kMemReserve` / `cur + bytes` used to wrap around for huge values,
-  // letting an absurd reservation through to AHardwareBuffer_allocate.
+  // Арифметика проверяется: bytes приходит из конфига и может быть огромным.
   if (bytes == 0 || bytes > limit) return false;
   const std::size_t avail = mem_available_bytes();
   if (avail != 0 && (bytes > avail || avail - bytes < kMemReserve)) return false;
@@ -356,9 +353,8 @@ struct Pool::Impl {
 };
 
 Pool& Pool::instance() {
-  // намеренная утечка: пул держит мьютекс и AHB-слябы, а CacheBlock'и из
-  // статических/thread_local кэшей могут умирать уже после статической
-  // деструкции. разрушение пула раньше них даёт
+  // Пул живёт до конца процесса: CacheBlock'и из статических и thread_local
+  // кэшей могут умирать после статической деструкции.
   static Pool* p = new Pool();
   return *p;
 }
@@ -485,8 +481,7 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
   std::vector<std::size_t> offsets(sizes.size() + 1, 0);
   std::size_t total = 0;
   for (std::size_t i = 0; i < sizes.size(); ++i) {
-    // A wrapped total used to make the MemAvailable check nonsensical and let
-    // the loader start allocating an impossible layout.
+    // Проверка переполнения total.
     if (sizes[i] > std::numeric_limits<std::size_t>::max() - total) {
       return false;
     }
@@ -753,8 +748,7 @@ uint8_t* Pool::allocate(std::size_t size) {
   // вернуть nullptr, и вызывающий прочитает эксперта из mmap. Иначе кэш
   // «5 ГиБ AHB + сколько получится malloc» снова приводит к OOM.
   constexpr std::size_t kFallbackCap = 256ULL * 1024 * 1024;
-  // `fallback_bytes + size` used to overflow for a huge request, sneaking past
-  // the cap and reaching malloc(SIZE_MAX).
+  // Проверка переполнения перед malloc.
   if (size > kFallbackCap || impl_->fallback_bytes > kFallbackCap - size) {
     return nullptr;
   }
@@ -770,11 +764,8 @@ void Pool::deallocate(uint8_t* ptr, std::size_t size) {
   if (ptr == nullptr) return;
   (void)size;  // hint only, accounting comes from the pool's own records
   std::lock_guard<std::mutex> lock(impl_->mu);
-  // `size` is only a hint. Both the slab pool and the malloc fallback know
-  // what they handed out, so accounting must never be driven by the caller:
-  // a mismatched size used to underflow fallback_bytes (permanently disabling
-  // the fallback) and the old loop `break` after the first class whose slot
-  // size was >= size, stranding a slab slot forever when the hint was small.
+  // size — только подсказка. Учёт ведёт пул: слябы и malloc-fallback знают,
+  // что выдали.
   for (auto& c : impl_->classes) {
     for (auto& s : c.slabs) {
       if (ptr >= s.base && ptr < s.base + s.bytes) {

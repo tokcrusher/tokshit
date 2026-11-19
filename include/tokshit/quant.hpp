@@ -58,7 +58,7 @@ enum class QuantType : uint16_t {
   return static_cast<uint16_t>(quant);
 }
 
-// Debug/statistics name, matching Rust's `{:?}` output.
+// Debug/statistics name.
 [[nodiscard]] constexpr std::string_view quant_name(QuantType quant) noexcept {
   switch (quant) {
     case QuantType::F32:

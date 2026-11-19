@@ -8,8 +8,7 @@
 
 namespace tokshit {
 
-// Profiling counters. Names and output format match the Rust reference so logs
-// from both implementations can be compared directly.
+// Profiling counters used by logs and diagnostics.
 struct Metrics {
   std::atomic<uint64_t> t_attn{0};
   std::atomic<uint64_t> t_mm{0};

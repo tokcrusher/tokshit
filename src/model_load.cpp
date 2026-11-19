@@ -322,14 +322,10 @@ Result<Model> Model::load(const std::string& path,
     // Fallback на malloc если AHB недоступен.
     {
       ahb::Config acfg;
-      // The pool budget must cover the whole expert cache. The old 3/4 split
-      // left a quarter of the cache to the malloc fallback, whose 256 MB cap
-      // silently turned later expert reads into mmap faults. Only the global
-      // AHB limit and the MemAvailable reserve may shrink the pool.
+      // Бюджет пула покрывает весь кэш экспертов. Уменьшать его могут только
+      // глобальный лимит AHB и резерв MemAvailable.
       acfg.total_bytes = total_budget;
-      // Small slabs keep the per-size-class split from wasting budget: one
-      // oversized slab per class used to strand hundreds of megabytes in a
-      // class that the current layer mix barely touches.
+      // Мелкие слябы не дают одному классу размера занять весь бюджет.
       acfg.slab_bytes  = env_u64("TOKSHIT_AHB_SLAB_MB", 16) * 1024ULL * 1024ULL;
       std::size_t max_slice = 0;
       for (const auto& lt : model.layers_) {

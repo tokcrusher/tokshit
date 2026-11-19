@@ -18,7 +18,7 @@ using detail::wrap;
 
 namespace {
 constexpr FlagDoc kFlags[] = {
-    // запуск и модель / run and model
+    // Запуск и модель
     {"model", "TOKSHIT_MODEL", "FILE", FlagGroup::Run,
      "путь к .gguf-модели; иначе TOKSHIT_MODEL или вшитый", "встроенный"},
     {"prompt-file", "TOKSHIT_PROMPT_FILE", "FILE", FlagGroup::Run,
@@ -26,7 +26,7 @@ constexpr FlagDoc kFlags[] = {
     {"layers", "GGUF_NLAYERS", "N", FlagGroup::Run,
      "ограничить число слоёв (только отладка)", "все"},
 
-    // производительность и память / performance and memory
+    // Производительность и память
     {"hot", "TOKSHIT_HOT", "", FlagGroup::Memory,
      "копировать плотные веса в RAM; 0 = mmap", "1"},
     {"hot-conv", "TOKSHIT_HOT_CONV", "", FlagGroup::Memory,
@@ -45,7 +45,7 @@ constexpr FlagDoc kFlags[] = {
     {"main-cpu", "TOKSHIT_MAIN_CPU", "N", FlagGroup::Memory,
      "ядро главного потока при --pool-pin", "7"},
 
-    // экспертный кэш и ввод-вывод / expert cache and io
+    // Экспертный кэш и ввод-вывод
     {"cache-mb", "TOKSHIT_EXPERT_CACHE_MB", "MB", FlagGroup::Cache,
      "бюджет кэша экспертов, МБ; 0 = не кэшировать", "1024"},
     {"expert-cache-mb", "TOKSHIT_EXPERT_CACHE_MB", "MB", FlagGroup::Cache,
@@ -74,7 +74,7 @@ constexpr FlagDoc kFlags[] = {
     {"fadv-random", "TOKSHIT_FADV_RANDOM", "", FlagGroup::Cache,
      "fadvise(RANDOM) на файл модели", "выкл"},
 
-    // спекуляция и черновик / speculation and draft
+    // Спекуляция и черновик
     {"spec", "TOKSHIT_SPEC", "", FlagGroup::Spec,
      "спекулятивный декод: lossless, только greedy", "выкл"},
     {"spec-k", "TOKSHIT_SPEC_K", "K", FlagGroup::Spec,
@@ -92,7 +92,7 @@ constexpr FlagDoc kFlags[] = {
     {"verify-ids", "TOKSHIT_VERIFY_IDS", "FILE", FlagGroup::Spec,
      "эталонные id: замер acceptance черновика", "нет"},
 
-    // сэмплинг / sampling
+    // Сэмплинг
     {"temperature", "TOKSHIT_TEMPERATURE", "X", FlagGroup::Sampling,
      "температура; 0 = жадный argmax", "0.8"},
     {"top-k", "TOKSHIT_TOP_K", "N", FlagGroup::Sampling,
@@ -104,7 +104,7 @@ constexpr FlagDoc kFlags[] = {
     {"reasoning-budget", "TOKSHIT_REASONING_BUDGET", "N", FlagGroup::Sampling,
      "бюджет thinking-токенов: N>0 кап, 0 закрыть сразу, -1 без лимита", "-1"},
 
-    // отладка и бенчмарки / debug and benchmarks
+    // Отладка и бенчмарки
     {"print-ids", "TOKSHIT_PRINT_IDS", "", FlagGroup::Debug,
      "печатать id сгенерированных токенов", "выкл"},
     {"dump-logits", "TOKSHIT_DUMP_LOGITS", "FILE", FlagGroup::Debug,
@@ -124,7 +124,7 @@ constexpr FlagDoc kFlags[] = {
     {"seg-debug", "TOKSHIT_SEG_DEBUG", "", FlagGroup::Debug,
      "отладка сегментов matvec", "выкл"},
 
-    // пресеты / presets
+    // Пресеты
     {"turbo", "TOKSHIT_TURBO", "", FlagGroup::Preset,
      "LOSSY: top-2 + Q4_0 dense, кэш 1024 и O_DIRECT", "выкл"},
     {"spec-fast", "TOKSHIT_SPEC_FAST", "", FlagGroup::Preset,
