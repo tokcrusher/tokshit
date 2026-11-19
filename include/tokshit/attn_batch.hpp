@@ -10,9 +10,6 @@ namespace attn {
 // однострочный (одна позиция батча) attention по kv-слябам. строго та же
 // математика, что в Model::layer::attention: scores = q·k с масштабом,
 // sink добавляется как последний элемент softmax, в V-сумму НЕ входит
-// one-row attention over the kv slabs. exactly the same math as in
-// Model::layer's attention: scaled q·k scores, the sink joins the softmax
-// as its last element but does NOT enter the weighted v sum
 struct AttendArgs {
   // слябы текущего слоя, как отдаёт Kv
   const uint8_t* k = nullptr;  // cap × k_stride байт
@@ -32,7 +29,6 @@ struct AttendArgs {
   float scale = 1.0F;              // 1 / sqrt(head_dim)
   std::size_t first = 0;           // абсолютная позиция строки 0
   // ёмкость сляба в позициях; end не может её превысить
-  // slab capacity in positions; end never crosses it
   std::size_t cap = static_cast<std::size_t>(-1);
   const std::size_t* win = nullptr;  // per row j: старт окна (absolute); 0 = без окна
 };

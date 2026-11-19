@@ -205,8 +205,6 @@ std::string utf8_lossy(std::span<const uint8_t> bytes) {
 
 // строим словарь токенов и merge-таблицу. тут можно чуть-чуть аллоцировать,
 // это холодный путь
-// build the token vocab and the merge table. a bit of allocation is fine here,
-// this is the cold path
 BpeTokenizer::BpeTokenizer(const TokenizerMeta& meta) {
   token_bytes_by_id_.resize(meta.tokens.size());
   tokens_.reserve(meta.tokens.size() * 2);
@@ -431,7 +429,6 @@ std::vector<uint32_t> BpeTokenizer::encode_word(std::string_view word) const {
 }
 
 // энкодим текст в токены: сначала по словам/границам, потом bpe внутри слова
-// encode text into tokens: split by words/boundaries first, then bpe per word
 std::vector<uint32_t> BpeTokenizer::encode(std::string_view text) const {
   const std::vector<char32_t> cpts = decode_utf8(text);
   std::vector<uint32_t> out;
@@ -457,7 +454,6 @@ std::vector<uint32_t> BpeTokenizer::encode(std::string_view text) const {
 }
 
 // тащим токенизатор из метадаты gguf
-// pull the tokenizer out of the gguf metadata
 Result<BpeTokenizer> build_tokenizer(const Gguf& gguf) {
   TOKSHIT_TRY(tokens, gguf.strings("tokenizer.ggml.tokens"));
   TOKSHIT_TRY(merges, gguf.strings("tokenizer.ggml.merges"));

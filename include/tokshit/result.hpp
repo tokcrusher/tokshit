@@ -12,9 +12,6 @@ namespace tokshit {
 // `Result<T>` специально маленький: внутри либо значение либо `Error`.
 // парсер/загрузчик могут строить длинные тексты ошибок, а вычислительный путь
 // ошибок вообще не создаёт
-// rust-like Result<T, Error> without exceptions on the hot path.
-// Result<T> is intentionally small, it owns either a value or an Error.
-// loader/parser may build long strings, the compute path never errors
 template <class T>
 class [[nodiscard]] Result {
  public:
@@ -39,7 +36,6 @@ class [[nodiscard]] Result {
 };
 
 // `Result<void>` для операций где нужно только успех/провал
-// `Result<void>` for operations that only need success/failure
 template <>
 class [[nodiscard]] Result<void> {
  public:
@@ -65,9 +61,6 @@ class [[nodiscard]] Result<void> {
 //
 // объявляет `layout` при успехе и возвращает `error()` иначе. имя временной
 // переменной берётся из `__LINE__`, так что несколько штук в одном скопе можно
-// propagate an error out of a fn returning Result<...>. declares var on
-// success, returns error() otherwise. name comes from __LINE__, so several in
-// one scope are fine
 #define TOKSHIT_DETAIL_CONCAT_IMPL(a, b) a##b
 #define TOKSHIT_DETAIL_CONCAT(a, b) TOKSHIT_DETAIL_CONCAT_IMPL(a, b)
 
@@ -79,7 +72,6 @@ class [[nodiscard]] Result<void> {
 
 // то же самое но значение на успехе выбрасываем. функция может возвращать
 // любой `tokshit::Result<...>`
-// same but discards the value on success, enclosing fn can return any Result
 #define TOKSHIT_TRY_VOID(expr)                                          \
   do {                                                                  \
     auto&& _tokshit_void_tmp_ = (expr);                                 \

@@ -35,7 +35,6 @@ int reasoning_budget_from_env() {
 }
 
 // путь к модели по умолчанию, из TOKSHIT_MODEL или вшитый
-// default model path, from TOKSHIT_MODEL or the builtin one
 std::string default_model_path() {
   if (const char* v = std::getenv("TOKSHIT_MODEL");
       v != nullptr && *v != '\0') {
@@ -48,7 +47,6 @@ std::string default_model_path() {
 }
 
 // параметры сэмплинга из env: температура, top-k, top-p
-// sampling params from env: temperature, top-k, top-p
 tokshit::SampleParams sample_params_from_env() {
   tokshit::SampleParams p;
   if (const char* v = std::getenv("TOKSHIT_TEMPERATURE");
@@ -67,7 +65,6 @@ tokshit::SampleParams sample_params_from_env() {
 // TOKSHIT_DUMP_LOGITS=<path>: пишем uint32 count + little-endian f32 логиты на
 // каждый посчитанный токен. это для паритетного гейта (сравнить с эталоном)
 // TOKSHIT_DUMP_LOGITS=<path>: append uint32 count + little-endian f32 logits per
-// evaluated token. used by the parity gate (compare against the reference)
 void dump_logits(FILE* f, const std::vector<float>& logits) {
   if (f == nullptr) return;
   const auto count = static_cast<uint32_t>(logits.size());
@@ -92,7 +89,6 @@ void print_timing_short(const tokshit::Metrics& m) {
 }
 
 // полная разбивка + счётчики кэша
-// full breakdown + cache counters
 void print_timing_full(const tokshit::Metrics& m) {
   const uint64_t passes = m.c_expert_passes.load();
   const uint64_t union_sum = m.c_expert_union.load();
@@ -140,7 +136,6 @@ void print_timing_full(const tokshit::Metrics& m) {
 }
 
 // компактная строка про экспертов: сколько уникальных на слой и попадания
-// compact expert line: unique experts per layer pass and cache hits
 void print_expert_stats(const tokshit::Metrics& m) {
   const uint64_t passes = m.c_expert_passes.load();
   const uint64_t union_sum = m.c_expert_union.load();

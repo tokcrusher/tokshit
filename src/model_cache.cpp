@@ -20,9 +20,6 @@ namespace {
 // ── сериализация частотного профиля (TKFQ v1) ──────────────────────────────
 // little-endian: u32 магия "TKFQ", u32 версия=1, u32 слоёв, дальше на каждый
 // слой u32 count и count пар (u32 эксперт, u64 счёт)
-// frequency profile serialization (TKFQ v1): little-endian, u32 magic "TKFQ",
-// u32 version=1, u32 layers, then per layer u32 count and count pairs
-// (u32 expert, u64 count)
 void put_le32(std::vector<uint8_t>& buf, uint32_t v) {
   buf.push_back(static_cast<uint8_t>(v));
   buf.push_back(static_cast<uint8_t>(v >> 8));
@@ -78,8 +75,6 @@ bool save_freq_profile(const FreqState& freq, std::size_t n_layers,
   }
   // атомарная запись: temp-файл с pid в имени + rename. профили параллельных
   // агентов не рвут друг друга, а сбой записи не оставляет битый файл
-  // atomic write: temp file with pid in the name + rename. concurrent agents
-  // don't tear each other's profiles and a failed write leaves no trash
   const std::string tmp = path + ".tmp" +
                           std::to_string(static_cast<long>(::getpid()));
   FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -130,7 +125,6 @@ bool load_freq_profile(FreqState& freq, std::size_t n_layers,
     const uint32_t count = get_le32(p);
     p += 4;
     // count обязан поместиться в файл и не превосходить число экспертов
-    // count must fit in the remaining bytes and not exceed the expert count
     if (count > n_experts || end - p < static_cast<std::ptrdiff_t>(count) * 12) {
       return false;
     }
@@ -151,7 +145,6 @@ bool load_freq_profile(FreqState& freq, std::size_t n_layers,
   }
   if (p != end) {
     // хвост разрешён только пустой: расхождение значит битый файл
-    // only an empty tail is allowed: a mismatch means a corrupt file
     if (static_cast<std::size_t>(end - p) > 0) return false;
   }
   return loaded_layers == n_layers;
@@ -161,8 +154,6 @@ ResidentCache::ResidentCache(std::size_t layers) : layers_(layers) {}
 
 // достаём блок и двигаем его в начало списка (mru). список и map живут под
 // одним мьютексом слоя
-// grab the block and move it to the front (mru). list and map live under the
-// same per-layer mutex
 CacheBlock ResidentCache::get(std::size_t layer, uint64_t key) {
   LayerCache& lc = layers_[layer];
   std::lock_guard<std::mutex> lock(lc.mu);
@@ -176,8 +167,6 @@ CacheBlock ResidentCache::get(std::size_t layer, uint64_t key) {
 
 // кладём блок. если бюджет 0 или блок больше бюджета то не кэшируем вообще,
 // просто отдаём как есть (direct режим)
-// store a block. budget 0 or a block bigger than budget means no caching at
-// all, just hand it back (direct mode)
 CacheBlock ResidentCache::put(std::size_t layer, uint64_t key,
                             CacheBlock data, uint64_t budget) {
   LayerCache& lc = layers_[layer];
@@ -231,8 +220,6 @@ std::size_t ResidentCache::size(std::size_t layer) const {
 // одна задача = кусок строк одного сегмента. ищем к какому сегменту относится
 // task, потом считаем rows_per_task строк. scratch thread_local чтобы не
 // аллоцировать в каждом вызове
-// one task = a chunk of rows of one segment. find which segment `task` belongs
-// to, then do rows_per_task rows. scratch is thread_local so we dont allocate
 
 Model::WRef Model::resident_expert(std::size_t layer, uint8_t proj,
                                    const ExpertMeta& em,
@@ -257,7 +244,6 @@ Model::WRef Model::resident_expert(std::size_t layer, uint8_t proj,
 
   if (got.block == nullptr) {
     // чтение не удалось. падаем обратно на mmap, лишь бы не сломать токен
-    // the read failed. fall back to the mmap so the token still works
     auto owned = std::make_shared<CacheBlockData>(em.size);
     if (!owned->valid()) {
       return WRef{mm_data + base, em.size, {}};
@@ -272,8 +258,6 @@ Model::WRef Model::resident_expert(std::size_t layer, uint8_t proj,
 
 // берём эксперта, который уже заказан через demand_async: ждём его и отдаём
 // из кэша. если чтение не удалось, идём обычным путём
-// take an expert already ordered through demand_async: wait for it and hand it
-// out of the cache. on a failed read, fall back to the normal path
 Model::WRef Model::take_expert(std::size_t layer, uint8_t proj,
                                const ExpertMeta& em,
                                std::size_t expert) const {
@@ -290,8 +274,6 @@ Model::WRef Model::take_expert(std::size_t layer, uint8_t proj,
 
 // записываем частоту роутинга, потом по ней выбираем что пинить/префетчить.
 // мьютекс на слой чтобы не толкаться на каждом токене
-// record routing frequency, used later to decide what to pin/prefetch.
-// per-layer mutex so we dont fight on every token
 void Model::record_freq(std::size_t layer,
                         std::span<const std::size_t> top) {
   std::lock_guard<std::mutex> lock(freq_->mu[layer]);
@@ -304,10 +286,6 @@ void Model::record_freq(std::size_t layer,
 // прошлый токен на этом же слое. роутинг соседних токенов почти не меняется,
 // а диск греется пока cpu считает attention. это замена старому madvise,
 // который только мусорил page cache
-// prediction: queue exactly the experts the previous token picked on the same
-// layer. routing barely changes between neighbours, and the drive warms up
-// while the cpu does attention. replaces the old madvise that only polluted
-// the page cache
 void Model::prefetch_experts(std::size_t layer,
                              std::span<const std::size_t> top) {
   if (!io_ || resident_budget_ == 0 || top.empty()) return;
@@ -318,8 +296,6 @@ void Model::prefetch_experts(std::size_t layer,
   // kTopP=4 экспертов. на idle-диске это всё, что спрос успеет съесть до
   // своего слоя; down приезжает обычным demand-путём
   // TOKSHIT_PREFETCH_IDLE: speculation is capped — gate/up only, at most
-  // kTopP=4 experts. on an idle drive that is all demand can consume before
-  // its layer; down arrives through the plain demand path
   static const bool idle = prefetch_idle();
   static constexpr std::size_t kTopP = 4;
   const std::size_t n = idle && top.size() > kTopP ? kTopP : top.size();
@@ -337,7 +313,6 @@ void Model::prefetch_experts(std::size_t layer,
 }
 
 // обёртки частотного профиля: see free functions above
-// frequency profile wrappers: see the free functions above
 bool Model::save_freq_profile(const std::string& path) const {
   return tokshit::save_freq_profile(*freq_, n_layers_, path);
 }
@@ -349,9 +324,6 @@ bool Model::load_freq_profile(const std::string& path) {
 // draft-режим: роутер отбирает меньше экспертов, чем n_used. 0 = конфиг
 // модели. веса при k_used=1 вырождаются в единицу — черновик читает в n_used
 // раз меньше байтов с диска и считается пропорционально быстрее
-// draft mode: the router picks fewer experts than n_used. 0 = the model
-// config. at k_used=1 weights degenerate to one, so the draft reads n_used
-// times fewer expert bytes and runs proportionally faster
 void Model::set_router_topk(std::size_t k) {
   router_topk_ = k;
 }
@@ -362,8 +334,6 @@ std::size_t Model::router_topk() const noexcept {
 
 // прогрев после промпта: топ-k по истории частоты на каждом слое. теперь это
 // реальные чтения в наш кэш, а не madvise в page cache
-// warm-up after the prompt: top-k by frequency history per layer. these are
-// real reads into our cache now, not madvise into page cache
 void Model::prefill_bulk_layer(std::size_t layer) {
   if (!ws_) return;
   prefill_bulk_layer(
@@ -384,8 +354,6 @@ void Model::prefill_bulk_layer(std::size_t layer,
   for (int pi = 0; pi < 3; ++pi) {
     // n_experts_, не 256: захардкоженное число сделало бы регион неверным
     // для любой модели не из флинта, и memcpy ниже читал бы за границей буфера
-    // n_experts_, not 256: the hardcoded count would compute a wrong region
-    // for any non-flint model, and the memcpy below would read out of bounds
     regions[pi] = Region{ems[pi]->base,
                          static_cast<std::size_t>(ems[pi]->size * n_experts_)};
   }
@@ -416,7 +384,6 @@ void Model::prefill_bulk_layer(std::size_t layer,
   // memcpy в AHB и resident_->put. при prefill бюджет слоя — общий, иначе
   // union экспертов батча вытесняется до take_expert
   // memcpy into AHB and resident_->put. during prefill the layer budget is
-  // the total one, otherwise the batch's expert union is evicted before take
   const std::size_t n_used = experts.size();
   const uint64_t put_budget = prefilling_ ? total_budget_ : resident_budget_;
   std::size_t copied = 0;
@@ -465,8 +432,6 @@ void Model::pin_hot_experts(std::size_t k) {
   std::vector<Entry> all;
   all.reserve(n_layers_ * k * 3);
   // диагностика: freq реально пуст или места нет (boundary-чек auto-подгонки)
-  // diagnostics: is freq really empty or is there just no room (auto-fit
-  // boundary check)
   std::size_t layers_with_items = 0, total_items = 0, free_experts = 0;
   for (std::size_t layer = n_dense_; layer < n_layers_; ++layer) {
     const Layer& lt = layers_[layer];

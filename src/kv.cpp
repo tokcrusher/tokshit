@@ -10,9 +10,6 @@ namespace tokshit {
 // полный kv-кеш: два сплошных сляба (k и v), слой l начинается с
 // l * cap * stride. f16 вдвое дешевле f32 по полосе внимания — на 2К это
 // ~195 мб вместо ~390, и attention читает вдвое меньше из RAM
-// full kv cache: two flat slabs (k and v), layer l starts at
-// l * cap * stride. f16 halves the attention bandwidth vs f32 — ~195 mb
-// instead of ~390 at 2k, and attention reads half as much from RAM
 Kv Kv::alloc(const KvCap& cap) {
   Kv kv;
   kv.cap_ = cap;
@@ -65,10 +62,6 @@ void Kv::write(std::size_t layer, std::size_t pos, std::size_t b,
   // заявлял позиции за контуром, tokens() сообщал о несуществующих строках,
   // и attention читал мусор вместо k/v. при writable == 0 (pos за контуром)
   // high-water не двигается вовсе
-  // high-water over actually written rows only: hi = pos + b used to claim
-  // positions past the slab, tokens() reported rows that were never written,
-  // and attention read garbage instead of k/v. with writable == 0 (pos past
-  // the slab) the high-water does not move at all
   if (writable != 0) {
     const std::size_t hi = pos + writable;
     if (hi > high_[layer]) high_[layer] = hi;

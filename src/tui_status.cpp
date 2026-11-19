@@ -59,7 +59,6 @@ std::string_view rate_color_code(RateColor color) noexcept {
 }
 
 // hit-rate строкой: цветное значение при color, «—» без данных
-// hit-rate as text: colored value when color, "—" without data
 std::string hit_rate_text(std::uint64_t hit, std::uint64_t miss,
                           bool color) {
   if (hit + miss == 0) return "—";
@@ -186,7 +185,6 @@ std::string format_stats(const Stats& stats, bool color) {
 namespace {
 
 // кадры спиннера живого индикатора декода
-// spinner frames of the live decode indicator
 constexpr std::string_view kFrames[] = {"◜", "◠", "◝", "◞", "◡", "◟"};
 
 }  // namespace
@@ -201,7 +199,6 @@ std::string_view spinner_frame(std::size_t index) noexcept {
 }
 
 // добавляет « · текст» только если строка остаётся в пределах width
-// appends " · text" only while the line still fits into width
 void append_fit(std::string& out, std::string_view piece, std::size_t width) {
   if (width == 0) {
     out.append(piece);
@@ -222,8 +219,6 @@ std::string format_decode(const DecodeInfo& info, std::size_t width) {
   char buf[192];
   // скорость печатаем только когда её можно измерить: на первом токене
   // elapsed близок к нулю и «2030 tok/s» только сбивает
-  // show the rate only once it is measurable: right after the first token
-  // elapsed is near zero and "2030 tok/s" is just noise
   if (info.seconds > 0.3) {
     std::snprintf(buf, sizeof(buf), "%s генерирую · %llu ток · %.1f tok/s",
                   std::string(spinner_frame(info.frame)).c_str(),

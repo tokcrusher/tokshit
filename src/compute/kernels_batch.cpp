@@ -12,9 +12,6 @@ namespace {
 // задача: чанк строк весов одного сегмента. внутри — b активаций по этой
 // строке. строку весов читаем через существующие ядра (на aarch64 это
 // dotprod-варианты), повторные проходы по b ловят её из L1
-// task: a chunk of weight rows of one segment. inside — b activations per
-// row. the row goes through the existing kernels (dotprod on aarch64), the
-// repeat passes for b activations hit it in L1
 struct BJob {
   const BatchSeg* segs = nullptr;
   std::size_t nsegs = 0;

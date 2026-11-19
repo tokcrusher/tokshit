@@ -4,7 +4,6 @@ namespace tokshit {
 
 ReasoningBudget::ReasoningBudget(int budget) noexcept
     // отрицательные значения кроме -1 трактуем как «без лимита»
-    // negatives other than -1 are treated as unlimited
     : budget_(budget < 0 ? -1 : budget) {}
 
 void ReasoningBudget::reset() noexcept {
@@ -16,12 +15,10 @@ void ReasoningBudget::observe(std::uint32_t token) noexcept {
   if (token == kThinkOpen) {
     if (!in_think_) {
       // открывающий токен запускает блок, но в бюджет не входит
-      // the opening token starts the block but does not spend the budget
       in_think_ = true;
       used_ = 0;
     } else {
       // вложенный open — обычный токен внутри блока
-      // a nested open is a regular token inside the block
       ++used_;
     }
     return;
@@ -29,8 +26,6 @@ void ReasoningBudget::observe(std::uint32_t token) noexcept {
   if (token == kThinkClose) {
     // счётчик не трогаем: used() показывает, сколько токенов было в
     // последнем блоке; новый kThinkOpen сбросит его
-    // keep the counter: used() reports the last block; a new kThinkOpen
-    // resets it
     in_think_ = false;
     return;
   }

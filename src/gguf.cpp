@@ -20,7 +20,6 @@ constexpr uint64_t kMaxItems = 10'000'000;
 constexpr uint64_t kMaxString = 64ull * 1024 * 1024;
 
 // типы значений метадаты gguf (ggml)
-// gguf metadata value types (ggml)
 constexpr uint32_t kTypeUint8 = 0;
 constexpr uint32_t kTypeInt8 = 1;
 constexpr uint32_t kTypeUint16 = 2;
@@ -536,8 +535,6 @@ Gguf& Gguf::operator=(Gguf&& other) noexcept {
 
 // открываем файл, читаем заголовок. если распарсить не вышло из-за обрезки то
 // увеличиваем буфер и дочитываем только хвост (а не с нуля)
-// open the file and parse the header. if it was truncated, grow the buffer
-// and read only the new tail (not from zero again)
 Result<Gguf> Gguf::open(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return errno_error(ErrCode::Io, "gguf.open");

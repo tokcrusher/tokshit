@@ -70,8 +70,6 @@ namespace {
 
 // разложение квантов обратно в float. используется в vcheck, эмбеддингах и
 // фолбэке, на горячем пути почти не вызывается
-// dequant back to float. used by vcheck, embeddings and the fallback, almost
-// never on the hot path
 void dequant_f16(const uint8_t* src, size_t numel, float* out) noexcept {
   for (size_t i = 0; i < numel; ++i) {
     out[i] = f16_to_f32(read_u16(src, i * 2));
@@ -608,9 +606,6 @@ Result<void> quantize_q8_0_into(std::span<const float> x,
     // та же схема что у активаций: симметричный int8 с шагом amax/127.
     // q8_0 хранит масштаб как f16, поэтому округляем через него же, иначе
     // вес и его масштаб разъедутся на последнем бите
-    // same scheme as the activations: symmetric int8 with step amax/127.
-    // q8_0 stores the scale as f16, so round through it, otherwise the weight
-    // and its scale disagree in the last bit
     const uint16_t d_bits = f32_to_f16(amax / 127.0F);
     const float d = f16_to_f32(d_bits);
     const float id = d != 0.0F ? 1.0F / d : 0.0F;

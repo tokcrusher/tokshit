@@ -13,8 +13,6 @@ namespace tokshit::cli {
 // единственный источник правды о флагах — tokshit::tui::flag_docs(): по нему
 // печатается --help и разбираются аргументы, так что новый флаг нельзя
 // добавить без описания
-// the single source of truth for flags is tokshit::tui::flag_docs(): --help
-// and the parser both read it, so a flag cannot be added without docs
 const char* env_for_flag(const std::string& name) {
   for (const tokshit::tui::FlagDoc& f : tokshit::tui::flag_docs()) {
     if (name == f.flag) return f.env;
@@ -90,11 +88,8 @@ void apply_env_presets() {
 // разбираем флаги, выставляем TOKSHIT_* и оставляем только позиционные
 // аргументы. так все существующие getenv-чтения продолжают работать, а
 // пользователь получает нормальный --cli
-// parse flags, export TOKSHIT_* and keep only positional args. existing
-// getenv reads keep working while users get a normal --cli
 void apply_flags(int& argc, char** argv) {
   // static: argv указывает на эти строки и после возврата из функции
-  // static: argv points here and must outlive this function
   static std::vector<std::string> pos;
   pos.clear();
   pos.reserve(static_cast<std::size_t>(argc));
@@ -105,7 +100,6 @@ void apply_flags(int& argc, char** argv) {
       std::exit(0);
     }
     // "--" дальше не флаги: промпт может начинаться с дефиса
-    // "--" ends flag parsing: a prompt may start with a dash
     if (a == "--") {
       for (++i; i < argc; ++i) pos.emplace_back(argv[i]);
       break;

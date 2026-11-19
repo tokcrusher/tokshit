@@ -1,9 +1,6 @@
 // батч-путь модели: b токенов за один проход по весам. здесь живёт verify
 // спекуляции и префилл длинных промптов. зеркалит Model::layer/token_logits,
 // но каждая матрица весов читается один раз на b активаций
-// batched model path: b tokens per weight pass. this hosts the speculative
-// verify and long-prompt prefill. mirrors Model::layer/token_logits, but every
-// weight matrix is read once for b activations
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -34,7 +31,6 @@ struct Model::BatchBuf {
   std::vector<int> emap;
   std::vector<std::size_t> utop, moff, mcur, idx;
   // плоские пары эксперт-строка вместо vector<vector>: ноль аллокаций на слой
-  // flat expert-member pairs instead of vector<vector>: no per-layer allocs
   std::vector<std::size_t> mem_j;
   std::vector<float> mem_w;
   std::vector<BatchSeg> segs;
@@ -42,7 +38,6 @@ struct Model::BatchBuf {
 };
 
 // тут BatchBuf уже полный, поэтому особые члены модели можно сгенерировать
-// BatchBuf is complete here, so the model's special members can be generated
 Model::Model() = default;
 Model::Model(Model&&) noexcept = default;
 Model& Model::operator=(Model&&) noexcept = default;
@@ -95,8 +90,6 @@ void Model::ensure_batch_buf(std::size_t b) {
 
 // один слой на b строк. порядок строго как в Model::layer: attention, потом
 // ffn. kv пишется по абсолютным позициям, строки внутри батча каузальны
-// one layer for b rows. order matches Model::layer: attention then ffn. kv is
-// written at absolute positions, rows within the batch are causal
 void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
                         std::size_t b,
                         std::span<const std::pair<float, float>> rope_table) {
@@ -105,9 +98,6 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
   // Батч-префилл: union экспертов слоя не влезает в штатный per-layer
   // бюджет, поэтому на время слоя расширяем его до общего и чистим кэш от
   // прошлых слоёв. Иначе блоки вытесняются до take_expert и читаются повторно.
-  // batched prefill: the layer's expert union does not fit the default
-  // per-layer budget, so widen it to the total for the layer and drop older
-  // layers. otherwise blocks are evicted before take and re-read from disk.
   if (prefilling_ && layer >= n_dense_ && io_ != nullptr && resident_ != nullptr &&
       total_budget_ != 0) {
     resident_->clear();
@@ -246,7 +236,6 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
   }
 
   // MoE: роутер per row, затем union экспертов батча загружается один раз
-  // MoE: per-row router, then the batch's expert union is loaded once
   {
     const BatchSeg seg{meta_bytes(*lt.gate_inp), lt.gate_inp->rb,
                        lt.gate_inp->quant, lt.gate_inp->in_dim,
@@ -300,9 +289,6 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
   // sequential-чтением региона. Мелкие чанки оставляем на demand-путь:
   // читать 252 МБ ради 40 экспертов бессмысленно.
   // TOKSHIT_PREFILL_BULK: for a long chunk the union is close to all 256
-  // experts, so one sequential region read beats random per-expert reads.
-  // Small chunks stay on the demand path: reading 252 MB for 40 experts is
-  // pointless.
   if (prefilling_ && io_ != nullptr && resident_budget_ != 0 && b >= 16 &&
       nu >= 96) {
     static const bool bulk = [] {
@@ -316,7 +302,6 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
   }
 
   // считаем размеры групп, потом раскладываем плоские пары (эксперт, строка)
-  // count group sizes, then flatten the (expert, row) pairs
   std::fill(bf.moff.begin(), bf.moff.begin() + static_cast<std::ptrdiff_t>(nu),
             std::size_t{0});
   std::size_t total = 0;
@@ -356,10 +341,6 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
     // hit/miss как в одиночном пути: demand_async вернул true (блок уже в
     // кэше или вне диапазона) — hit, иначе чтение реально заказано — miss.
     // дупликаат (чтение уже в полёте) тоже miss, чтобы совпадать с model.cpp
-    // hit/miss like the single path: demand_async returning true (block
-    // already cached or out of range) is a hit, otherwise a read was
-    // ordered — a miss. an in-flight duplicate counts as a miss to match
-    // model.cpp
     const ExpertMeta* ems[2] = {&em_g, &em_u};
     for (std::size_t u = 0; u < nu; ++u) {
       const std::size_t e = bf.utop[u];
@@ -473,7 +454,6 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
   }
 
   // shared expert, плотный mlp как в одиночном пути
-  // shared expert, plain dense mlp like the single-token path
   for (std::size_t j = 0; j < b; ++j) {
     kernels::quantize_into(
         std::span<const float>(bf.hf.data() + j * hidden, hidden), bf.acts[j]);
@@ -524,7 +504,6 @@ void Model::token_logits_batch(std::span<const uint32_t> tokens, Kv& kv,
   for (std::size_t j = 0; j < b; ++j) {
     auto dst = std::span<float>(bf.x.data() + j * hidden, hidden);
     // невалидный id — нулевая строка, как при провале деквантования
-    // invalid id — zero row, same as a failed dequant
     if (static_cast<std::size_t>(tokens[j]) >= vocab_) {
       std::fill(dst.begin(), dst.end(), 0.0F);
       continue;
@@ -553,8 +532,6 @@ void Model::token_logits_batch(std::span<const uint32_t> tokens, Kv& kv,
   }
   // вернуть штатный бюджет после батч-префилла, иначе декод будет держать
   // слишком много блоков на слой и упрётся в общий AHB
-  // restore the default budget after batched prefill; otherwise decode keeps
-  // too many blocks per layer and exhausts the shared AHB pool
   if (prefilling_ && io_ != nullptr) io_->set_budget(resident_budget_);
 
   for (std::size_t j = 0; j < b; ++j) {

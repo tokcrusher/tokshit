@@ -48,7 +48,6 @@ namespace {
 }
 
 // сколько элементов в тензоре начиная с оси start, тупое произведение
-// product of the dims from `start` to the end, nothing clever
 uint64_t product_dims(const GgufTensor& t, std::size_t start) {
   uint64_t product = 1;
   for (std::size_t i = start; i < t.dims.size(); ++i) product *= t.dims[i];
@@ -61,17 +60,12 @@ Result<Model> Model::load(const std::string& path,
   TOKSHIT_TRY(gguf, Gguf::open(path));
   // запоминаем до перемещения gguf в модель: дальше он moved-from, и его
   // fd/file_len уже нули
-  // remember before gguf is moved into the model: after that it is moved-from
-  // and its fd/file_len are already zero
   const int file_fd = gguf.fd();
   const uint64_t file_len = gguf.file_len();
 
   // читаем файл вразнобой: readahead тут только тянет соседние эксперты,
   // которые нам не нужны. включается отдельно, потому что mmap-часть
   // (attention) наоборот любит readahead
-  // we read the file all over the place: readahead here only drags in
-  // neighbouring experts we dont need. opt-in, because the mmap part
-  // (attention) actually likes readahead
   if (env_flag("TOKSHIT_FADV_RANDOM")) {
     (void)::posix_fadvise(gguf.fd(), 0, 0, POSIX_FADV_RANDOM);
   }
@@ -285,8 +279,6 @@ Result<Model> Model::load(const std::string& path,
   model.total_budget_ = total_budget;
   // ключ частотного профиля: геометрия и кванты, не путь к файлу. один и тот
   // же gguf, скопированный в другое место, делит один профиль
-  // frequency profile key: geometry and quants, not the file path. the same
-  // gguf copied elsewhere shares one profile
   {
     uint64_t h = 1469598103934665603ULL;  // FNV-1a offset basis
     auto mix = [&h](uint64_t v) {
@@ -365,8 +357,6 @@ Result<Model> Model::load(const std::string& path,
         env_u64("TOKSHIT_IO_THREADS", options.io_threads));
     // fadvise только по явному запросу: дроп page cache полезен не всегда,
     // на телефоне с малым запасом ram он может выкинуть нужное
-    // fadvise only on request: dropping page cache is not always a win, on a
-    // phone with little ram it can throw away something useful
     const bool fadv = env_flag("TOKSHIT_FADV_DONTNEED");
     model.io_ = std::make_unique<ExpertIo>(
         file_fd, file_len, *model.resident_, resident_budget,

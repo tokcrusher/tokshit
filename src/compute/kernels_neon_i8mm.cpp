@@ -5,9 +5,6 @@
 // (kernels::have_i8mm); по умолчанию работает dotprod-путь.
 //
 // семантика lane SMMLA (проверено пробником на целевом cpu):
-//   A = [a[0..7] | a[8..15]], B = [b[0..7] | b[8..15]]
-//   lane0 = sum a[k]b[k], lane1 = sum a[k]b[8+k],
-//   lane2 = sum a[8+k]b[k], lane3 = sum a[8+k]b[8+k], k=0..7
 //
 // для чистого dot произведения полезны только диагональные lane 0 и 3
 // (lane 1/2 — кросс-члены a[k]b[8+k]); то есть SMMLA даёт те же 16 полезных
@@ -16,23 +13,9 @@
 // выигрывает ли оно у vdotq-ядра (та же длина зависимости, латентность
 // SMMLA выше, но меньше операций на блок шкалы).
 //
-// i8mm (SMMLA) kernels for the matvec shape (aarch64 + FEAT_I8MM + DotProd).
 //
-// compiled with -march=armv8.2-a+dotprod+i8mm so smmla never leaks into the
-// baseline binary. enabled via TOKSHIT_I8MM=1 when the cpu has the feature
-// (kernels::have_i8mm); the default path stays the dotprod kernel.
 //
-// SMMLA lane semantics (verified with a probe on the target cpu):
-//   A = [a[0..7] | a[8..15]], B = [b[0..7] | b[8..15]]
-//   lane0 = sum a[k]b[k], lane1 = sum a[k]b[8+k],
-//   lane2 = sum a[8+k]b[k], lane3 = sum a[8+k]b[8+k], k=0..7
 //
-// for a plain dot product only the diagonal lanes 0 and 3 are useful (lanes
-// 1/2 are the cross terms a[k]b[8+k]); without repacking weights for row
-// pairs SMMLA offers the same 16 useful MACs per op as SDOT. the kernel below
-// uses the natural layout, 2 SMMLAs per row per 32-weight block, and the
-// benchmark decides whether it beats the vdotq kernel (same dependency
-// length, higher SMMLA latency, fewer scale ops per block).
 
 #include "kernels_internal.hpp"
 
@@ -64,7 +47,6 @@ namespace {
 }  // namespace
 
 // q8_0, по две строки за проход с независимыми цепочками SMMLA.
-// q8_0, two rows per pass with independent SMMLA chains.
 void dot_rows_q8_0_i8mm(const std::uint8_t* rows, std::size_t rb,
                         std::size_t nrows, const ActQ8& act,
                         std::size_t in_dim, float* out) noexcept {
@@ -85,15 +67,11 @@ void dot_rows_q8_0_i8mm(const std::uint8_t* rows, std::size_t rb,
       const std::uint8_t* p1 = rows + (r + 1) * rb + b * kBs;
       // шкала веса d_b — своя у каждого блока 34B, выносить её из блока
       // нельзя: произведение d_b * s_b живёт только внутри блока
-      // the weight scale d_b is per 34B block and cannot be hoisted: the
-      // d_b * s_b product exists only inside the block
       const float32x4_t sc0 = vdupq_n_f32(load_f16(p0) * sp[b]);
       const float32x4_t sc1 = vdupq_n_f32(load_f16(p1) * sp[b]);
 
       // диагональные lane 0 и 3 несут полный dot блока, кросс-члены в
       // lane 1/2 копятся в отдельных lane фасc и не читаются
-      // diagonal lanes 0 and 3 carry the full block dot; the cross terms sit
-      // in their own facc lanes and are never read
       int32x4_t acc0 = vmmlaq_s32(vdupq_n_s32(0), a0, load_w(p0 + 2));
       acc0 = vmmlaq_s32(acc0, a1, load_w(p0 + 18));
       facc0 = vfmaq_f32(facc0, vcvtq_f32_s32(acc0), sc0);

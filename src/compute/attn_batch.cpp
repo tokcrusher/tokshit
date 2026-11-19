@@ -104,11 +104,6 @@ void kvh_work(const KvhJob& j, std::size_t kvh) {
     // (позиции >= ~254 на флинте) головы 8..31 softmax'или и взвешивали скоры
     // чужих голов, а в пуле ещё и гонялись за одними ячейками. на коротком
     // контексте путь сериальный и сломанное место не выполнялось
-    // per-kvh score slice. all workers used to write the same sc[gi*len+col]
-    // range: the index missed kvh, so on batches with len*group >= 2048
-    // (positions >= ~254 on flint) heads 8..31 softmaxed and weighted other
-    // heads' scores, and the pool ran the same cells concurrently. short
-    // contexts take the serial path and never execute the broken code
     float* sc = j.sc + h0 * len;
     thread_local std::vector<float> kbuf, vbuf, acc;
     kbuf.resize(hd);
@@ -159,7 +154,6 @@ void attend_row(const AttendArgs& a, std::size_t row) {
 
     thread_local std::vector<float> sc;
     // n_heads слябов по len: воркер kvh занимает [kvh*group, (kvh+1)*group)
-    // n_heads slices of len: worker kvh owns [kvh*group, (kvh+1)*group)
     sc.resize(a.n_heads * len);
 
     KvhJob job;

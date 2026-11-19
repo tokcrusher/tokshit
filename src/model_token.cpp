@@ -37,8 +37,6 @@ void Model::row_task(void* ctx, std::size_t task) {
 
 // грузим один эксперт одной проекции через кэш. задачи намеренно плоские:
 // индекс i кодирует (какой эксперт, какая проекция)
-// load one expert of one projection through the cache. tasks are flat on
-// purpose: index i encodes (which expert, which projection)
 void Model::load_task(void* ctx, std::size_t i) {
   LoadJob& job = *static_cast<LoadJob*>(ctx);
   const std::size_t e = i % job.n_used;
@@ -49,8 +47,6 @@ void Model::load_task(void* ctx, std::size_t i) {
 
 // главный загрузчик. читает конфиг, строит Layer с Meta смещениями, валидирует
 // паттерны и создаёт workspace. тяжёлых копий нет (кроме hot и norm векторов)
-// the main loader. reads config, builds Layer structs with Meta offsets,
-// validates the patterns and makes the workspace. no heavy copies except hot
 
 std::span<const uint8_t> Model::meta_bytes(const Meta& meta) const {
   if (meta.hot) {
@@ -67,8 +63,6 @@ std::span<const uint8_t> Model::meta_bytes(const Meta& meta) const {
 
 // удобная версия: квантуем активацию во временный буфер и считаем. нужна
 // только холодным вызовам, горячий путь юзает версию с переданным act
-// convenience version, quantizes into a temp buffer and runs. only for cold
-// calls, the hot path uses the overload with an external act
 void Model::matvec(const Meta& meta, std::span<const float> x,
                    std::span<float> y) const {
   kernels::ActQ8 act;
@@ -77,8 +71,6 @@ void Model::matvec(const Meta& meta, std::span<const float> x,
 
 // квантуем x в act и считаем. активация остаётся снаружи чтобы можно было
 // переиспользовать её для нескольких матриц с тем же входом
-// quantize x into act and run. activation stays outside so several matrices
-// with the same input can share it
 void Model::matvec(const Meta& meta, std::span<const float> x,
                    std::span<float> y, kernels::ActQ8& act) const {
   kernels::quantize_into(x, act);
@@ -87,8 +79,6 @@ void Model::matvec(const Meta& meta, std::span<const float> x,
 
 // версия с уже готовой активацией. именно её зовёт горячий путь, тут нет ни
 // одной аллокации
-// version with a ready activation. this is what the hot path calls, zero
-// allocations in here
 void Model::matvec_preact(const Meta& meta, std::span<const float> x,
                           std::span<float> y,
                           const kernels::ActQ8& act) const {
@@ -112,8 +102,6 @@ void Model::matvec_preact(const Meta& meta, std::span<const float> x,
 
 // раскладываем все сегменты в задачи по строкам и кидаем в пул. вызывающий
 // поток тоже работает, так что не простаивает
-// flatten segments into row tasks and throw them at the pool. the calling
-// thread also works so it doesnt just sit there
 void Model::run_segs(std::span<const Seg> segs,
                      std::size_t rows_per_task) const {
   thread_local std::vector<std::size_t> task_starts;
@@ -180,7 +168,6 @@ void Model::run_segs(std::span<const Seg> segs,
 // достаём эксперта. бюджет 0 = отдаём span прямо в mmap. иначе через
 // фоновых читателей: они и кэш проверят, и подхватят уже начатое чтение.
 // ключ это (proj << 32) | expert
-// get an expert. budget 0 = return a span straight into the mmap. otherwise
 
 void Model::prepare_workspace() {
   ws_ = std::make_unique<Workspace>();
@@ -222,8 +209,6 @@ void Model::prepare_workspace() {
 
 // главный вход на токен, без аллокаций (при условии что out уже нужного
 // размера). делает эмбеддинг, все слои, финальную норму и голову
-// the main per-token entry, allocation free (as long as `out` is big enough).
-// does the embedding, all layers, the final norm and the head
 void Model::token_logits(uint32_t token, KVCache& kv, std::size_t pos,
                          std::vector<float>& out) {
   Workspace& ws = *ws_;
@@ -233,8 +218,6 @@ void Model::token_logits(uint32_t token, KVCache& kv, std::size_t pos,
   const auto embd_bytes = meta_bytes(embd_);
   // границы словаря: невалидный id (битый сэмплер/промпт) раньше уходил
   // subspan'ом за пределы буфера весов — UB вместо управляемого нуля
-  // vocab bounds: an invalid id (broken sampler/prompt) used to subspan past
-  // the weight buffer — UB instead of a controlled zero
   if (static_cast<std::size_t>(token) >= vocab_) {
     std::fill(out.begin(), out.end(), 0.0F);
     return;
@@ -266,10 +249,6 @@ void Model::token_logits(uint32_t token, KVCache& kv, std::size_t pos,
   // предсказанное прошлым токеном ставим в очередь. только первый moe слой:
   // читать весь токен вперёд бессмысленно, диск и так в полку, а промахи
   // предсказания тратят полосу
-  // new token, new predictions. drop the stale ones and queue what the last
-  // token picked. only the first moe layer: reading the whole token ahead is
-  // pointless, the drive is saturated anyway and wrong guesses waste
-  // bandwidth
   if (prefetch_enabled() && io_ && resident_budget_ != 0) {
     io_->new_epoch();
     static const bool idle_pf = prefetch_idle();
@@ -277,8 +256,6 @@ void Model::token_logits(uint32_t token, KVCache& kv, std::size_t pos,
       prefetch_experts(n_dense_, freq_->last[n_dense_]);
       // в idle-режиме второй слой вперёд не читаем: спекуляция только на
       // окнах простоя, а их хватает на один слой
-      // in idle mode skip the second layer ahead: speculation only on idle
-      // windows, and one layer is all they cover
       if (!idle_pf && n_dense_ + 1 < n_run) {
         prefetch_experts(n_dense_ + 1, freq_->last[n_dense_ + 1]);
       }
@@ -298,7 +275,6 @@ void Model::token_logits(uint32_t token, KVCache& kv, std::size_t pos,
 }
 
 // удобная обёртка для холодных вызовов, возвращает vector по значению
-// convenience wrapper for cold calls, returns a vector by value
 std::vector<float> Model::token_logits(uint32_t token, KVCache& kv,
                                         std::size_t pos) {
   std::vector<float> out(vocab_, 0.0F);

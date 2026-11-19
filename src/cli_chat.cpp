@@ -34,8 +34,6 @@ extern "C" void on_sigint(int) { g_interrupt = 1; }
 // Inline REPL: без ncurses и без полного экрана. В TTY — цветные роли,
 // стриминг по токену, строка статуса; в пайпе — обычный построчный читатель
 // без ANSI. Управление: /help, /clear, /stats, /temp, /topk, /system, /save.
-// Inline REPL, no ncurses, no full screen. In a TTY: colored roles, per-token
-// streaming, a status line; in a pipe: a plain line reader without ANSI.
 struct ChatSession {
   tokshit::KVCache kv;
   std::size_t pos = 0;
@@ -112,12 +110,9 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   const bool err_tty = ::isatty(STDERR_FILENO) != 0;
   // ширина терминала для живых строк: на узких экранах хвост индикатора
   // отрезается, чтобы \r-перерисовка не ломалась
-  // terminal width for live lines: on narrow screens the indicator tail is
-  // trimmed so the \r redraw stays intact
   const std::size_t width = tokshit::tui::terminal_width(STDERR_FILENO);
 
   // SIGINT без SA_RESTART: getline и цикл генерации сами увидят флаг
-  // SIGINT without SA_RESTART: getline and the decode loop both check the flag
   struct sigaction sa {};
   sa.sa_handler = on_sigint;
   sigemptyset(&sa.sa_mask);
@@ -153,9 +148,6 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     // замечание: ядро собрано с -fno-exceptions. если поток упадёт то
     // libstdc++ позовёт std::terminate, для cli это ок (нормальный выход это
     // eof), просто держим это внутри цикла
-    // NOTE: the core is built with -fno-exceptions. a stream failure here
-    // makes libstdc++ call std::terminate, acceptable for the cli (eof is the
-    // normal exit path), so keep it contained to this loop
     if (!std::getline(std::cin, line)) {
       if (g_interrupt != 0) {
         g_interrupt = 0;
@@ -168,7 +160,6 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
         continue;
       }
       // Ctrl-D/EOF: аккуратный выход, не падаем и не зависаем
-      // Ctrl-D/EOF: a clean exit, no crash and no hang
       if (tty) {
         std::fputc('\n', stdout);
         std::fputs("пока\n", stderr);
@@ -191,8 +182,6 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
         clear_chat_context(s);
         // utf8-буфер живёт один ход, так что после очистки контекста он
         // уже пуст; в TTY дополнительно чистим экран целиком
-        // the utf8 buffer lives for one turn, so it is already empty once
-        // the context is cleared; in a TTY the screen is cleared as well
         if (tty) {
           std::fputs("\x1b[H\x1b[2J\x1b[3J", stdout);
         }
@@ -379,7 +368,6 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
       const uint32_t next = reasoning.constrain(sampled);
       if (tok.is_eog(next)) break;
       // Не печатаем служебные <think/></think/> и скрываем thinking-блок.
-      // Do not print the <think/></think/> control tokens and hide thinking.
       const bool control = next == tokshit::kThinkOpen ||
                            next == tokshit::kThinkClose;
       const bool hidden = control;

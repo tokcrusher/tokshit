@@ -32,8 +32,6 @@ ActQ8 quantize(std::span<const float> x) {
 
 // симметричный int8 квант блоками по 32. тот же алгоритм что в rust версии,
 // поэтому числа должны совпадать
-// symmetric int8 quant in blocks of 32. same algorithm as the rust version so
-// the numbers should match
 void quantize_into(std::span<const float> x, ActQ8& act) {
   act.len = x.size();
   act.q.resize(act.len);
@@ -82,8 +80,6 @@ void quantize_into(std::span<const float> x, ActQ8& act) {
 
 // резервный путь: сначала разложить строку в float, потом скалярно умножить.
 // медленно, но нужно для тестов и для платформ без neon
-// fallback path: dequant the row to float first, then scalar dot. slow, but
-// needed for the tests and for platforms without neon
 float dot_fallback(QuantType quant, std::span<const uint8_t> row, size_t rb,
                    std::span<const float> x, const ActQ8& act, size_t in_dim,
                    std::vector<float>& scratch) {

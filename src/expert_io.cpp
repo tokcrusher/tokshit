@@ -20,7 +20,6 @@ namespace tokshit {
 namespace {
 
 // глобальный ключ: слой в старших битах, внутри слоя уже (proj << 32) | expert
-// global key: layer in the high bits, inside a layer it is (proj << 32) | expert
 uint64_t global_key(std::size_t layer, uint64_t key) {
   return (static_cast<uint64_t>(layer) << 40) | (key & 0xFF'FFFF'FFFFULL);
 }
@@ -57,9 +56,6 @@ ExpertIo::ExpertIo(int fd, uint64_t file_len, ResidentCache& cache,
   // просим o_direct: экспертные чтения не должны засорять page cache и
   // вытеснять оттуда плотные веса. на андроиде это ещё и меньше давление
   // на reclaim: грязных анонимных страниц не появляется
-  // ask for o_direct: expert reads must not pollute the page cache and evict
-  // the dense weights. on android it is also less reclaim pressure: no dirty
-  // anonymous pages appear
   if (!path.empty() && std::getenv("TOKSHIT_O_DIRECT") != nullptr &&
       std::string(std::getenv("TOKSHIT_O_DIRECT")) == "0") {
     path.clear();
@@ -84,8 +80,6 @@ ExpertIo::ExpertIo(int fd, uint64_t file_len, ResidentCache& cache,
       if (align_ < sizeof(void*) || (align_ & (align_ - 1)) != 0) align_ = 4096;
       // o_direct бывает врёт на эмулированных и fuse-разделах. сверяем один
       // выровненный блок с буферизованным чтением и молча откатываемся
-      // o_direct lies on emulated and fuse mounts sometimes. compare one
-      // aligned block against a buffered read and silently fall back
       bool good = true;
       if (file_len_ >= align_) {
         void* d = nullptr;
@@ -129,7 +123,6 @@ ExpertIo::~ExpertIo() {
     std::lock_guard<std::mutex> lock(mu_);
     stop_ = true;
     // будим всех, воркеры увидят stop и выйдут
-    // wake everybody, the workers see stop and leave
     for (auto& slot : inflight_) slot.second->state.store(1);
     demand_q_.clear();
     spec_q_.clear();
@@ -151,9 +144,6 @@ uint64_t ExpertIo::queued() const {
 
 // само чтение. pread прямо в буфер, потом put в кэш (он же решает выкинуть
 // кого-то). без кэша не бывает: budget 0 обрабатывается выше в Model
-// the read itself. pread straight into a buffer, then put into the cache
-// (which decides who to evict). no cache-less mode here: budget 0 is handled
-// in Model before we are called
 ExpertIo::Bounce& ExpertIo::bounce(std::size_t lane, std::size_t need) {
   Bounce& b = (lane == kInlineLane) ? inline_bounce_ : bounces_[lane];
   if (b.cap >= need) return b;
@@ -169,8 +159,6 @@ ExpertIo::Bounce& ExpertIo::bounce(std::size_t lane, std::size_t need) {
 
 // чтение эксперта: через o_direct мимо page cache. если окно не выровнено,
 // читаем выровненный диапазон в bounce и копируем нужный кусок
-// expert read: through o_direct, bypassing the page cache. if the window is
-// not aligned, read the aligned range into a bounce and copy the slice out
 CacheBlock ExpertIo::fetch(const Job& job, std::size_t lane) {
   auto buf = std::make_shared<CacheBlockData>(job.size);
   if (!buf->valid()) {
@@ -252,11 +240,6 @@ CacheBlock ExpertIo::fetch(const Job& job, std::size_t lane) {
 // одиночный fetch; o_direct не поедет — падаем на буферизованный pread по
 // срезам. возвращает ровно group.size() блоков: при ошибке элементы nullptr,
 // воркер всё равно закрывает слоты, и ожидающие уходят в fallback
-// merged read: the whole job range in one pread into a bounce (o_direct needs
-// an aligned window), then a memcpy split across slots. bypasses the page
-// cache like a plain fetch; when o_direct fails we fall back to per-slice
-// buffered preads. returns exactly group.size() blocks: on error entries are
-// nullptr, the worker still completes the slots so waiters take the fallback
 std::vector<CacheBlock> ExpertIo::fetch_group(const Job& job,
                                               std::size_t lane) {
   const std::size_t n = job.group.size();
@@ -264,8 +247,6 @@ std::vector<CacheBlock> ExpertIo::fetch_group(const Job& job,
   // у merge-задачи все срезы одинаковые, job.size = n * slice — это контракт
   // demand_merged. аномалию трактуем как ошибку чтения: воркер закроет слоты
   // пустыми блоками
-  // a merged job has equal slices and job.size = n * slice by contract. treat
-  // an anomaly as a failed read: the worker closes the slots with null blocks
   if (job.size % n != 0) {
     metrics().c_read_fail.fetch_add(1, std::memory_order_relaxed);
     return std::vector<CacheBlock>(n);
@@ -273,8 +254,6 @@ std::vector<CacheBlock> ExpertIo::fetch_group(const Job& job,
   const std::size_t slice = job.size / n;
   // свежие блоки ещё не опубликованы в кэше: писать в них можно, CacheBlock
   // (shared_ptr<const ...>) отдаёт их только после put
-  // fresh blocks are not published yet: writing is allowed, CacheBlock
-  // (shared_ptr<const ...>) hands them out only after put
   std::vector<std::shared_ptr<CacheBlockData>> bufs(n);
   for (std::size_t i = 0; i < n; ++i) {
     bufs[i] = std::make_shared<CacheBlockData>(slice);
@@ -327,7 +306,6 @@ std::vector<CacheBlock> ExpertIo::fetch_group(const Job& job,
   }
   if (!ok) {
     // буферизованный fallback: читаем каждый срез сразу в его блок
-    // buffered fallback: read each slice straight into its block
     ok = true;
     for (std::size_t i = 0; i < n; ++i) {
       const auto rd = pread_at(fd_, job.offset + i * slice,
@@ -367,8 +345,6 @@ void ExpertIo::demand_merged(
   if (entries.empty() || size == 0 || budget_ == 0) return;
   // сначала кэш (как в demand_async: попадание это попадание), потом под
   // мьютексом inflight и сборка цепочек
-  // cache first (like demand_async: a hit is a hit), then in-flight filtering
-  // and run assembly under the mutex
   std::vector<std::pair<uint64_t, uint64_t>> live;  // (gkey, offset)
   live.reserve(entries.size());
   for (const auto& en : entries) {
@@ -389,8 +365,6 @@ void ExpertIo::demand_merged(
 
   // ограничение на цепочку: bounce воркера растёт до размера самой длинной,
   // на телефоне лишние десятки мегабайт никто не дарил
-  // run cap: a worker's bounce grows to the longest run, nobody donated tens
-  // of megabytes on this phone
   constexpr std::size_t kMaxMergeSlices = 8;
 
   std::lock_guard<std::mutex> lock(mu_);
@@ -481,10 +455,6 @@ void ExpertIo::worker(std::size_t lane) {
 // префетч — просто ждём его, второй раз с диска не тянем. иначе читаем сами
 // прямо в вызывающем потоке: у счётных воркеров параллелизма больше, чем у
 // пары фоновых читателей, и диск это любит
-// demand: cache first (that is what counts as a hit). if a prefetch is already
-// reading this block, just wait for it, no second read from the drive.
-// otherwise read it ourselves on the calling thread: the compute workers have
-// more parallelism than a couple of background readers, and the drive likes it
 ExpertIo::Loaded ExpertIo::load(std::size_t layer, uint64_t key,
                                 uint64_t offset, std::size_t size) {
   if (const auto hit = cache_.get(layer, key); hit != nullptr) {
@@ -519,9 +489,6 @@ ExpertIo::Loaded ExpertIo::load(std::size_t layer, uint64_t key,
     // копия, не move: слот могут ждать несколько потоков, и данные остаются
     // на месте для следующего ожидающего. чтение под mu_ — тот же мьютекс,
     // под которым данные положил читатель
-    // copy, not move: several threads can wait on this slot and the data
-    // must stay in place for the next waiter. reading under mu_ is the same
-    // mutex the reader wrote under
     return Loaded{slot->data, false};
   }
 
@@ -541,7 +508,6 @@ ExpertIo::Loaded ExpertIo::load(std::size_t layer, uint64_t key,
     // забираем копию под мьютексом: снаружи слот->data двигать нельзя, ждущие
     // потоки просыпаются параллельно и читают его же
     // take a copy under the mutex: slot->data must not be moved outside it,
-    // waiters wake concurrently and read the same field
     out = slot->data;
   }
   cv_done_.notify_all();
@@ -549,7 +515,6 @@ ExpertIo::Loaded ExpertIo::load(std::size_t layer, uint64_t key,
 }
 
 // заказ чтения без ожидания. если блок уже в кэше или уже читается — ничего
-// order a read without waiting. nothing to do if it is cached or in flight
 bool ExpertIo::demand_async(std::size_t layer, uint64_t key, uint64_t offset,
                             std::size_t size) {
   if (budget_.load(std::memory_order_relaxed) == 0 || !in_file(offset, size)) {
@@ -580,7 +545,6 @@ bool ExpertIo::demand_async(std::size_t layer, uint64_t key, uint64_t offset,
 }
 
 // ждём пока ключ перестанет быть в полёте, потом берём из кэша
-// wait until the key is no longer in flight, then take it from the cache
 CacheBlock ExpertIo::wait_for(std::size_t layer, uint64_t key) {
   const uint64_t gkey = global_key(layer, key);
   {
@@ -601,9 +565,7 @@ CacheBlock ExpertIo::wait_for(std::size_t layer, uint64_t key) {
 // предсказание: если блок уже в кэше или уже читается, ничего не делаем.
 // TOKSHIT_PREFETCH_IDLE: спек-заказы принимаются только когда дисковый путь
 // свободен — иначе спекуляция встаёт в очередь перед спросом и душит его
-// prediction: nothing to do if the block is cached or already being read.
 // TOKSHIT_PREFETCH_IDLE: spec orders are accepted only while the drive path
-// is idle — otherwise speculation lines up ahead of demand and chokes it
 void ExpertIo::prefetch(std::size_t layer, uint64_t key, uint64_t offset,
                         std::size_t size) {
   if (budget_.load(std::memory_order_relaxed) == 0 || !in_file(offset, size))
@@ -638,7 +600,6 @@ void ExpertIo::prefetch(std::size_t layer, uint64_t key, uint64_t offset,
 }
 
 // новый токен. старые предсказания выбрасываем, но начатые чтения не трогаем
-// new token. drop the old predictions, but leave started reads alone
 void ExpertIo::new_epoch() {
   {
     std::lock_guard<std::mutex> lock(mu_);

@@ -10,8 +10,6 @@ namespace tokshit {
 
 // raii-обёртка над read-only маппингом файла. madvise/mlock это best-effort:
 // android/termux могут их отклонить, а рантайм должен продолжать работать
-// raii read-only mapping. madvise/mlock are best-effort, android/termux may
-// reject them and the runtime must keep going
 class Mmap {
  public:
   Mmap() = default;

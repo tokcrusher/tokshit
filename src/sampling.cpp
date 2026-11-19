@@ -17,8 +17,6 @@ struct Utf8Check {
 
 // проверяем utf-8 вручную, как в эталоне. отдаём до какого места валидно и
 // длину ошибки
-// validate utf-8 by hand, like the reference. returns valid_up_to and the
-// error length
 Utf8Check check_utf8(std::span<const uint8_t> s) {
   std::size_t i = 0;
   while (i < s.size()) {
@@ -73,7 +71,6 @@ Utf8Check check_utf8(std::span<const uint8_t> s) {
 }
 
 // заменяем битые куски на U+FFFD, чтобы не сломать терминал
-// replace broken chunks with U+FFFD so we dont break the terminal
 std::string utf8_lossy(std::span<const uint8_t> bytes) {
   std::string out;
   out.reserve(bytes.size());
@@ -118,8 +115,6 @@ float Rng::f32() { return dist_(state_); }
 
 // если temperature <= 0 то честный greedy argmax (первый максимум). иначе
 // softmax с температурой, top-k, top-p и один uniform выбор
-// temperature <= 0 means honest greedy argmax (first max). otherwise softmax
-// with temperature, top-k, top-p and one uniform draw
 uint32_t sample(std::span<const float> logits, const SampleParams& params,
                 Rng& rng) {
   const std::size_t n = logits.size();
@@ -201,8 +196,6 @@ uint32_t sample(std::span<const float> logits, const SampleParams& params,
 
 // копим байты и отдаём самый длинный целый utf-8 префикс. хвост остаётся
 // внутри до следующего push
-// accumulate bytes and emit the longest complete utf-8 prefix. the tail stays
-// inside until the next push
 std::string Utf8Buffer::push(std::span<const uint8_t> bytes) {
   buf_.insert(buf_.end(), bytes.begin(), bytes.end());
   const Utf8Check c =
@@ -216,7 +209,6 @@ std::string Utf8Buffer::push(std::span<const uint8_t> bytes) {
 }
 
 // в конце генерации выплёвываем хвост, даже если он неполный
-// at the end of generation flush the tail even if it is incomplete
 std::string Utf8Buffer::flush() {
   std::string out = utf8_lossy(std::span<const uint8_t>(buf_.data(), buf_.size()));
   buf_.clear();
@@ -225,8 +217,6 @@ std::string Utf8Buffer::flush() {
 
 // пробуем сэмплить так чтобы токен не создал битый utf-8, максимум 8 попыток.
 // если совсем не вышло берём lossy вариант
-// try to sample so the token doesnt create broken utf-8, max 8 attempts. if
-// it really fails take the lossy option
 uint32_t sample_utf8_safe(std::span<const float> logits,
                           const SampleParams& params, const BpeTokenizer& tok,
                           Utf8Buffer& buf, Rng& rng) {

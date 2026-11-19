@@ -35,7 +35,6 @@ struct Metrics {
   // TOKSHIT_IO_MERGE: сколько слоёв-задач слилось в один pread и сколько
   // отдельных чтений они заменили
   // TOKSHIT_IO_MERGE: how many jobs were merged into one pread and how many
-  // individual reads they replaced
   std::atomic<uint64_t> c_dem_merged_jobs{0};
   std::atomic<uint64_t> c_dem_merged_slices{0};
   // TOKSHIT_PREFETCH_IDLE: спек-заказы, отброшенные из-за занятого диска
@@ -45,7 +44,6 @@ struct Metrics {
   std::atomic<uint64_t> c_expert_hit{0};
   std::atomic<uint64_t> c_expert_miss{0};
   // сколько уникальных экспертов в среднем тянет один проход moe-слоя
-  // average number of unique experts a single moe layer pass pulls
   std::atomic<uint64_t> c_expert_union{0};
   std::atomic<uint64_t> c_expert_passes{0};
 };
@@ -54,8 +52,6 @@ struct Metrics {
 
 // обнуляет таймеры и счётчики. нужен профилировщику, чтобы отделить
 // генерацию от prefill
-// zeroes timers and counters. the profiler uses it to separate decode from
-// prefill
 void metrics_reset() noexcept;
 
 [[nodiscard]] bool timing_enabled() noexcept;
@@ -63,7 +59,6 @@ void metrics_reset() noexcept;
 // TOKSHIT_PREFETCH_IDLE: спекулятивные заказы ставить в очередь только когда
 // дисковый путь полностью свободен (demand пуст, воркеры не читают)
 // TOKSHIT_PREFETCH_IDLE: queue speculative orders only when the drive path is
-// completely idle (demand empty, no worker reading)
 [[nodiscard]] bool prefetch_idle() noexcept;
 // TOKSHIT_IO_MERGE: соседние срезы экспертов одного proj одним pread
 // TOKSHIT_IO_MERGE: adjacent expert slices of one proj in a single pread

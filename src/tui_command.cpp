@@ -135,7 +135,6 @@ Command parse_command(std::string_view line) {
           end != nullptr &&
           static_cast<std::size_t>(end - tmp.c_str()) == tmp.size();
       // допустимы только -1, 0 и положительные значения
-      // only -1, 0 and positive values are valid
       if (whole && errno != ERANGE && v >= -1 && v <= INT_MAX) {
         cmd.budget = static_cast<int>(v);
       } else {

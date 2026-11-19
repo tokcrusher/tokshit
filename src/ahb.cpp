@@ -23,12 +23,8 @@ namespace tokshit::ahb {
 // AHB грузим через dlopen, а не через -landroid. Termux не даёт системную
 // libandroid.so: его stub собран без version-узлов, а бинарь, слинкованный
 // с -landroid, требует LIBANDROID vN и падает ещё до main
-// ("CANNOT LINK EXECUTABLE ... cannot find libandroid.so from verneed").
 // dlopen обходит и линковку, и version-проверку, и работает одинаково
 // и в Termux, и в APK.
-// AHB is reached through dlopen instead of -landroid, see the long note in the
-// git history: Termux's unversioned libandroid.so stub cannot satisfy the
-// LIBANDROID verneed of a -landroid binary.
 struct AHardwareBuffer;
 
 struct AhbApi {
@@ -43,9 +39,6 @@ struct AhbApi {
 // AHardwareBuffer_Desc из <android/hardware_buffer.h>. объявляем сами чтобы
 // не зависеть от уровня __ANDROID_API__ (в Termux это 24, а структура есть
 // только с 26).
-// AHardwareBuffer_Desc from <android/hardware_buffer.h>, declared by hand so we
-// dont depend on __ANDROID_API__ (Termux pins it to 24 while the struct only
-// exists from 26).
 struct AhbDesc {
   uint32_t width;
   uint32_t height;
@@ -60,13 +53,8 @@ struct AhbDesc {
 constexpr uint32_t kFormatBlob = 0x21;  // AHARDWAREBUFFER_FORMAT_BLOB
 
 // Значения строго из NDK-хедера (android/hardware_buffer.h):
-//   CPU_READ_NEVER=0, CPU_READ_RARELY=2, CPU_READ_OFTEN=3
-//   CPU_WRITE_NEVER=0, CPU_WRITE_RARELY=0x20, CPU_WRITE_OFTEN=0x30
 // Старый код использовал 0x40 как "write never": это не флаг CPU, а мусор,
 // из-за чего gralloc выдавал read-only mapping, а мы в него писали memcpy.
-// Values are taken verbatim from the NDK header. The old code used 0x40 for
-// CPU_WRITE_NEVER; that is not a CPU flag at all, so the mapping could come
-// back read-only while the loader memcpy'd into it.
 constexpr uint64_t kCpuReadRarely = 0x2;
 constexpr uint64_t kCpuReadOften = 0x3;
 constexpr uint64_t kCpuWriteRarely = 0x20;
@@ -105,9 +93,6 @@ const AhbApi& ahb_api() {
 // относится к read-only/read-write и к частоте доступа. Нам нужен один
 // долгоживущий mapping, в который можно писать при загрузке и читать на
 // каждом matvec.
-// Try a few usage combinations: gralloc implementations disagree about which
-// CPU flags produce a writable mapping. We need one long-lived mapping that
-// can be filled once and read on every matvec.
 bool lock_ahb_buffer(AHardwareBuffer* buf, void** out, uint64_t* usage_used) {
   const AhbApi& api = ahb_api();
   struct Combo {
@@ -117,9 +102,6 @@ bool lock_ahb_buffer(AHardwareBuffer* buf, void** out, uint64_t* usage_used) {
   // read-rarely по умолчанию: gralloc на этом устройстве отдаёт для
   // read-often некэшируемый mapping, и streaming 1.6 ГБ hot-весов падает с
   // 5.2 до 3.1 ГБ/с. read-rarely кэшируется, а lock мы держим один раз.
-  // read-rarely is the default: on this device gralloc returns an uncached
-  // mapping for read-often, and streaming 1.6 GB of hot weights drops from 5.2
-  // to 3.1 GB/s. read-rarely is cacheable and the lock is taken once.
   static const Combo combos[] = {
       {kCpuReadRarely | kCpuWriteRarely, "read-rarely+write-rarely"},
       {kCpuReadOften | kCpuWriteRarely, "read-often+write-rarely"},
@@ -154,7 +136,6 @@ bool ahb_disabled() {
 
 // Общий бюджет AHB на процесс: hot-веса и expert-кэш делят его, иначе
 // «5 ГиБ на hot + 5 ГиБ на экспертов» снова заканчиваются OOM.
-// One process-wide AHB budget shared by hot weights and the expert cache.
 std::size_t ahb_limit_bytes() {
   static const std::size_t limit = [] {
     std::size_t mb = 5120;  // 5 GiB по умолчанию
@@ -191,7 +172,6 @@ std::size_t mem_available_bytes() {
 bool reserve_ahb(std::size_t bytes) {
   // Не занимаем последний гигабайт даже в рамках формального лимита:
   // MemAvailable важнее, чем «5 ГиБ разрешено».
-  // Never eat the last gigabyte even inside the formal limit.
   constexpr std::size_t kMemReserve = 1ULL * 1024 * 1024 * 1024;
   const std::size_t limit = ahb_limit_bytes();
   // All arithmetic below is guarded: `bytes` comes from configuration, and
@@ -224,8 +204,6 @@ void release_ahb(std::size_t bytes) {
 }
 
 // Размер сегмента hot-весов. 0 — старый режим: отдельный буфер на тензор.
-// Anything above 16 GiB is clamped: the phone has 15.2 GiB of RAM, and a huge
-// value must not overflow `mb * 1 MiB`.
 std::size_t hot_seg_target_bytes() {
   std::size_t mb = 32;
   if (const char* v = std::getenv("TOKSHIT_HOT_SEG_MB");
@@ -381,9 +359,6 @@ Pool& Pool::instance() {
   // намеренная утечка: пул держит мьютекс и AHB-слябы, а CacheBlock'и из
   // статических/thread_local кэшей могут умирать уже после статической
   // деструкции. разрушение пула раньше них даёт
-  // "pthread_mutex_lock called on a destroyed mutex".
-  // deliberate leak: the pool owns a mutex and AHB slabs, while CacheBlocks in
-  // static/thread_local caches can die after static destruction starts.
   static Pool* p = new Pool();
   return *p;
 }
@@ -507,8 +482,6 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
   // offsets[i] — логическое смещение тензора i; offsets[n] — полный размер.
   // Сегменты режутся только по этим границам, поэтому тензор никогда не
   // пересекает mapping.
-  // offsets[i] is tensor i's logical offset; offsets[n] is the total. Segments
-  // are cut only at these boundaries, so a tensor never crosses a mapping.
   std::vector<std::size_t> offsets(sizes.size() + 1, 0);
   std::size_t total = 0;
   for (std::size_t i = 0; i < sizes.size(); ++i) {
@@ -525,8 +498,6 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
 
   // Жёсткий предохранитель: не занимаем последний 1 ГиБ. Лучше остаться на
   // mmap и потерять скорость, чем получить LMK/OOM на телефоне.
-  // Hard guard: never eat the last 1 GiB. Falling back to mmap is slower, an
-  // OOM on a phone is worse.
   const std::size_t avail = mem_available_bytes();
   constexpr std::size_t kReserve = 1ULL * 1024 * 1024 * 1024;
   if (avail != 0 && (total > avail || avail - total < kReserve)) {
@@ -543,9 +514,6 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
   // Группируем подряд идущие тензоры в сегмент не больше seg_target. Если
   // следующий тензор не влезает — начинаем новый сегмент. Тензор больше
   // seg_target получает собственный сегмент.
-  // Pack consecutive tensors into a segment of at most seg_target bytes. The
-  // next tensor starts a new segment when it does not fit; a tensor larger than
-  // seg_target gets a segment of its own.
   struct Run {
     std::size_t begin = 0;
     std::size_t end = 0;
@@ -581,13 +549,9 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
   const bool ahb_ok = !ahb_disabled() && ahb_api().ok;
   // Не дробим меньше мегабайта: на такой гранулярности per-buffer overhead
   // уже не окупается, а бюджет AHB всё равно не спасёт.
-  // Do not split below 1 MiB: at that granularity per-buffer overhead wins
-  // nothing and an exhausted AHB budget will not recover.
   constexpr std::size_t kMinSplit = 1ULL << 20;
   // Если свободного AHB-бюджета меньше этого, дробить бессмысленно: получим
   // сотни malloc-сегментов. Лучше отдать остаток сегментов в malloc целиком.
-  // Below this much free AHB budget splitting is pointless: it only produces
-  // hundreds of malloc segments, so the remaining runs go straight to malloc.
   constexpr std::size_t kMinUsefulAhb = 8ULL << 20;
   const std::size_t ahb_limit = ahb_limit_bytes();
   auto ahb_room = [&]() -> std::size_t {
@@ -614,8 +578,6 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
     if (!buf.valid() && ahb_ok && !budget_blocked) {
       // gralloc не дал сегмент целиком — режем по границе тензора и пробуем
       // меньшие буферы. Это лучше, чем молча уйти в malloc на весь сегмент.
-      // gralloc refused the whole segment: split at a tensor boundary and try
-      // smaller buffers instead of silently dropping the whole run to malloc.
       if (end - begin > 1 && bytes > kMinSplit) {
         const std::size_t half = bytes / 2;
         std::size_t mid = begin + 1;
@@ -640,8 +602,6 @@ bool HotWeights::allocate(const std::vector<std::size_t>& sizes) {
       }
       // Один тензор или уже слишком мелко: последняя попытка через Auto
       // (AHB ещё раз, затем malloc).
-      // Single tensor or already tiny: one Auto attempt (AHB again, then
-      // malloc).
       buf = Buffer(bytes);
     }
     if (!buf.valid()) return false;
@@ -744,8 +704,6 @@ void Pool::init(const Config& cfg) {
   impl_->slab_bytes = cfg.slab_bytes;
   // Не даём expert-кэшу съесть последние гигабайты: на телефоне это
   // заканчивается LMK/OOM, а не ускорением.
-  // Never let the expert cache eat the last few gigabytes: on a phone that ends
-  // in LMK/OOM, not in speed.
   std::size_t budget = std::min(cfg.total_bytes, ahb_limit_bytes());
   const std::size_t avail = mem_available_bytes();
   constexpr std::size_t kReserve = 1ULL * 1024 * 1024 * 1024;
@@ -768,8 +726,6 @@ void Pool::init(const Config& cfg) {
   // Не аллоцируем слябы заранее: эксперт-кэш заполняется только после того,
   // как роутер реально начнёт выбирать экспертов. Так 6 ГБ конфига не
   // превращаются в 6 ГБ занятой памяти на старте.
-  // Slabs are allocated lazily: an idle cache must not pin the whole budget at
-  // startup.
   std::fprintf(stderr, "[ahb] ready: %zu size class(es), %zu MB budget\n",
                impl_->classes.size(), impl_->budget_left / (1024 * 1024));
 }
@@ -796,8 +752,6 @@ uint8_t* Pool::allocate(std::size_t size) {
   // Когда AHB-бюджет исчерпан, не уходим в бесконечный malloc: лучше
   // вернуть nullptr, и вызывающий прочитает эксперта из mmap. Иначе кэш
   // «5 ГиБ AHB + сколько получится malloc» снова приводит к OOM.
-  // When the AHB budget is exhausted, avoid unbounded malloc: return nullptr
-  // and let the caller read the expert from mmap instead of risking OOM.
   constexpr std::size_t kFallbackCap = 256ULL * 1024 * 1024;
   // `fallback_bytes + size` used to overflow for a huge request, sneaking past
   // the cap and reaching malloc(SIZE_MAX).

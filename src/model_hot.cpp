@@ -14,8 +14,6 @@ namespace tokshit {
 
 // копируем все неэкспертные веса в отдельный vector чтобы их не вытеснял
 // поток экспертов из page cache. на андроиде может не спасти (своп)
-// copy all non-expert weights into a separate vector so the expert stream
-// doesnt evict them from page cache. on android it may not save you (swap)
 void Model::collect_hot() {
   std::vector<Meta*> list;
   list.reserve(n_layers_ * 11 + 1);
@@ -40,18 +38,11 @@ void Model::collect_hot() {
   // Плотные веса кладём в AHB, а не в анонимный vector: под давлением
   // Android отправляет анонимные страницы в zram, и matvec начинает платить
   // за распаковку на каждом токене. dma-buf не свопится.
-  // Dense weights go to AHB instead of an anonymous vector: under pressure
-  // Android swaps anonymous pages into zram, making every token pay for
-  // decompression. dma-buf is not swappable.
   //
   // Заодно переквантовываем в Q8_0 всё, для чего нет neon-ядра (Q5K/Q6K/
   // Bf16). Скалярный dequant+dot на этих весах даёт 1-1.6 ГБ/с, а q8_0 -
   // 30+. Это +1.5 бита на вес и ~0.6 ГБ памяти на флинте, но плотные веса
   // читаются на каждом токене, так что обмен того стоит.
-  // While we are here, requantize everything without a neon kernel (Q5K/Q6K/
-  // Bf16) to Q8_0. The scalar dequant+dot path runs those at 1-1.6 GB/s while
-  // q8_0 does 30+. Costs ~1.5 bits per weight (~0.6 GB on the flint), but the
-  // dense weights are read on every token, so the trade is worth it.
   const char* hc = std::getenv("TOKSHIT_HOT_CONV");
   const bool conv_on = hc == nullptr || hc[0] != '0';
   const bool conv_fast = kernels::has_neon_dot(QuantType::Q8_0);
@@ -105,11 +96,6 @@ void Model::collect_hot() {
         // строка ШИРЕ q8_0, и старый код оставлял hot-слот неинициализо-
         // ванным, а метаданные — с исходным квантом. max() убирает эту
         // дыру ценой неиспользованного хвоста только у Bf16.
-        // The slot must hold both versions: if conversion fails midway we
-        // store the original bytes. For Bf16 the source row is WIDER than
-        // q8_0, and the old code left the hot slot uninitialized while
-        // keeping the original quant in the metadata. max() closes that hole;
-        // the only cost is an unused tail for Bf16 tensors.
         d.bytes = std::max(src, d.rb * m->out_dim);
         d.target = target;
         d.conv = true;
@@ -200,8 +186,6 @@ void Model::collect_hot() {
       // не смогли переквантовать: кладём исходные байты, тензор остаётся
       // в своём кванте и считается медленным путём. слот выделен как
       // max(src, q8), поэтому копия всегда помещается
-      // requant failed: store the original bytes and keep the slow path.
-      // the slot is sized max(src, q8), so the copy always fits
       std::memcpy(dsts[i], mm_data + m.base, d.src);
       ++failed;
       continue;

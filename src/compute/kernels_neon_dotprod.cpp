@@ -4,11 +4,7 @@
 // протекают в базовый бинарь. каждое ядро сначала проверяется против
 // скалярного эталона в tests/test_kernels.cpp, и только потом попадает в
 // горячий путь
-// NEON dot-product kernels (aarch64 + FEAT_DotProd).
 //
-// compiled with -march=armv8.2-a+dotprod so vdotq_s32 never leaks into the
-// baseline binary. every kernel is checked against the scalar reference in
-// tests/test_kernels.cpp before it can enter the hot path
 
 #include "kernels_internal.hpp"
 
@@ -65,7 +61,6 @@ constexpr std::array<std::uint64_t, 256> kMask8 = build_mask8();
   // стоила примерно столько же, сколько сам vdotq, потому что вызывалась на
   // каждый блок из 32 весов
   // hardware half->float: the software f16_to_f32 cost about as much as the
-  // vdotq itself in the hot loop because it ran once per 32-weight block
   float16_t h;
   std::memcpy(&h, p, sizeof(h));
   return vgetq_lane_f32(vcvt_f32_f16(vdup_n_f16(h)), 0);
@@ -82,8 +77,6 @@ constexpr std::array<std::uint64_t, 256> kMask8 = build_mask8();
 
 // q8_0: блок 32 веса, f16 scale + 32 int8. активация уже int8, так что просто
 // vdotq и в конце умножаем на scale весов и scale активации
-// q8_0: block of 32, f16 scale + 32 int8. the activation is already int8, so
-// just vdotq and multiply by both scales at the end
 float dot_q8_0(const std::uint8_t* row, const ActQ8& act,
                std::size_t in_dim) noexcept {
   const std::size_t nb = in_dim >> 5;
@@ -152,7 +145,6 @@ float dot_q8_0(const std::uint8_t* row, const ActQ8& act,
 }
 
 // q4_0: 16 байт на 32 веса, половинки разворачиваем и поднимаем до int8
-// q4_0: 16 bytes per 32 weights, unpack nibbles and widen to int8
 float dot_q4_0(const std::uint8_t* row, const ActQ8& act,
                std::size_t in_dim) noexcept {
   constexpr std::size_t kBs = 18;
@@ -213,9 +205,6 @@ float dot_q4_0(const std::uint8_t* row, const ActQ8& act,
 // iq4_xs: кодбук + знаки, вес сразу в векторном регистре (без wbuf), dot,
 // потом две шкалы. чтобы независимые idp и fmla перестали стоять в очереди,
 // используем две цепочки аккумуляторов
-// iq4_xs: codebook + signs, weights unpack straight into registers (no wbuf),
-// dot, then the two scales. two accumulator chains keep the independent idps
-// and fmlas from serialising
 float dot_iq4xs(const std::uint8_t* row, const ActQ8& act,
                 std::size_t in_dim) noexcept {
   constexpr std::size_t kBs = 136;
@@ -255,8 +244,6 @@ float dot_iq4xs(const std::uint8_t* row, const ActQ8& act,
       const float32x4_t sc = vdupq_n_f32(dl * sp[a >> 5]);
       // две цепочки аккумуляторов, чередуем по ib: одна цепочка это 16 vfma
       // подряд на одном регистре, чистая латентность
-      // two accumulator chains, alternating by ib: a single chain is 16 vfma
-      // in a row on one register, pure latency
       if (((b + ib) & 1) != 0) {
         accv_odd = vfmaq_f32(accv_odd, vcvtq_f32_s32(s), sc);
       } else {
@@ -270,9 +257,6 @@ float dot_iq4xs(const std::uint8_t* row, const ActQ8& act,
 // iq2_s: 2 бита на вес. маски/сдвиги как в llama.cpp, потом vdotq. тут
 // 4 независимые цепочки аккумуляторов, индексы решётки без сдвигового
 // хоп через int64 и шкала, сплавленная в один scalar mul
-// iq2_s: 2 bits per weight. masks/shifts same as llama.cpp, then vdotq. this
-// one has 4 independent accumulator chains, no int64 hop for grid indices,
-// and the scale folded into a single scalar mul
 float dot_iq2s(const std::uint8_t* row, const ActQ8& act,
                std::size_t in_dim) noexcept {
   constexpr std::size_t kBs = 82;
@@ -293,14 +277,11 @@ float dot_iq2s(const std::uint8_t* row, const ActQ8& act,
     const std::uint8_t* scales = row + base + 74;
     const std::uint8_t* signs = qs + 32;
     // d * 0.25 выносим на блок: сабблок платит один scalar mul
-    // hoist d * 0.25 to the block: a subblock pays one scalar mul
     const float d4 = d * 0.25F;
 
     for (std::size_t ib = 0; ib < 8; ++ib) {
       // старший байт индекса решётки из nibble-байта qh[ib]:
       // idx = qsb[l] | (((qh >> 2l) & 3) << 8) == старый (qh << (8-2l)) & 0x300
-      // the grid index high byte from the qh nibble byte:
-      // idx = qsb[l] | (((qh >> 2l) & 3) << 8), same value as before
       const std::uint8_t qhb = qh[ib];
       const std::uint8_t* qsb = qs + ib * 4;
       const std::uint8_t* sgb = signs + ib * 4;
@@ -313,7 +294,6 @@ float dot_iq2s(const std::uint8_t* row, const ActQ8& act,
       const std::uint32_t i3 = static_cast<std::uint32_t>(qsb[3]) |
                                ((static_cast<std::uint32_t>(qhb) & 0xC0U) << 2);
       // решётку и знак тащим прямо в неоновые регистры, минуя int64 hop
-      // pull the grid entry and the sign straight into neon, no int64 hop
       const int8x8_t g0 = vld1_s8(reinterpret_cast<const std::int8_t*>(
           &tables::iq2s_grid[i0]));
       const int8x8_t g1 = vld1_s8(reinterpret_cast<const std::int8_t*>(
@@ -347,7 +327,6 @@ float dot_iq2s(const std::uint8_t* row, const ActQ8& act,
       const int32x4_t p1 =
           vdotq_s32(vdupq_n_s32(0), w23, vld1q_s8(ap + a + 16));
       // чередование ib/чёт: одна цепочка живёт ~25 ops, латентность закрыта
-      // alternating chains: one chain sleeps a full ib's work, latency closed
       if ((ib & 1) == 0) {
         acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(p0), f01);
         acc2 = vfmaq_f32(acc2, vcvtq_f32_s32(p1), f23);
@@ -362,8 +341,6 @@ float dot_iq2s(const std::uint8_t* row, const ActQ8& act,
 
 // iq3_s: переписал без промежуточного wbuf на стеке, сразу считаем по
 // распакованным int8. это дало примерно 5.9 -> 8.9 гб/с
-// iq3_s: rewrote it without the intermediate stack wbuf, compute straight on
-// unpacked int8. that took it from ~5.9 to ~8.9 gb/s
 float dot_iq3s(const std::uint8_t* row, const ActQ8& act,
                std::size_t in_dim) noexcept {
   constexpr std::size_t kBs = 110;
@@ -427,7 +404,6 @@ float dot_iq3s(const std::uint8_t* row, const ActQ8& act,
 
 // iq3_xxs: то же что iq3_s, только другая раскладка qh/scales. тоже без wbuf,
 // ~5.3 -> 7.5 гб/с
-// iq3_xxs: like iq3_s but a different qh/scales layout, also no wbuf,
 // ~5.3 -> ~7.5 gb/s
 float dot_iq3xxs(const std::uint8_t* row, const ActQ8& act,
                  std::size_t in_dim) noexcept {
@@ -599,11 +575,6 @@ void dot_rows_q4_0(const std::uint8_t* rows, std::size_t rb, std::size_t nrows,
 // dot с int8-активацией считается точно: w = d*sc*v - dmin*m, поэтому
 // sum(w*a) = d*sc*sum(v*q) - dmin*m*sum(q), где сумма q на 32-блоке
 // предвычислена один раз на вызов
-// ---- q4_k: block of 256, 8 sub-blocks of 32, per-sub-block scale+min (6-bit,
-// packed into 12 bytes). value = nibble 0..15, the offset lives in min.
-// the dot against the int8 activation is computed exactly: w = d*sc*v - dmin*m
-// so sum(w*a) = d*sc*sum(v*q) - dmin*m*sum(q) with sum(q) per 32-block
-// precomputed once per call
 
 void get_scale_min_k4(size_t j, const uint8_t* scales, uint8_t& d,
                       uint8_t& m) noexcept {
@@ -621,7 +592,6 @@ void get_scale_min_k4(size_t j, const uint8_t* scales, uint8_t& d,
 namespace {
 
 // сумма int8-активации на каждый блок 32. вызывается раз на dot_rows/dot_row
-// sum of the int8 activation per 32 block, computed once per call
 const std::int32_t* act_block_sums(const ActQ8& act, std::size_t nsb,
                                    std::vector<std::int32_t>& buf) {
   buf.assign(nsb, 0);
@@ -640,9 +610,6 @@ const std::int32_t* act_block_sums(const ActQ8& act, std::size_t nsb,
 // один 32-весовой сабблок q4_k: nibbles chunk (lo или hi половина) против
 // 32 значений активации. возвращает int32 4-lane частичную сумму (полный dot
 // сабблока после vaddvq)
-// one q4_k 32-weight sub-block: chunk nibbles (lo or hi half) against 32
-// activation values. returns the int32 4-lane partial (full sub-block dot
-// after vaddvq)
 [[nodiscard]] inline int32x4_t q4k_sub_dot(const std::uint8_t* chunk,
                                            bool hi, const std::int8_t* ap,
                                            std::size_t a,
@@ -731,7 +698,6 @@ void dot_rows_q4k(const std::uint8_t* rows, std::size_t rb, std::size_t nrows,
       const std::uint8_t* p2 = rows + (r + 2) * rb + base;
       const std::uint8_t* p3 = rows + (r + 3) * rb + base;
       // d/dmin не зависят от сабблока — поднимаем на блок
-      // d/dmin do not depend on the sub-block, hoist per block
       const float d0 = load_f16(p0);
       const float d1 = load_f16(p1);
       const float d2 = load_f16(p2);
@@ -806,13 +772,9 @@ void dot_rows_q4k(const std::uint8_t* rows, std::size_t rb, std::size_t nrows,
 // строки остаётся своим (решётки/знаки разные), но загрузка активации и
 // независимые цепочки деквант+dot идут параллельно, поэтому латентность
 // закрывается вдвое плотнее. включается TOKSHIT_IQ2ROW=1
-// ---- two-row IQ kernels: pair (r, r+1) per pass. each row still dequants
-// its own grids/signs, but the activation load and the independent
-// dequant+dot chains run in parallel, hiding twice the latency. enabled with
 // TOKSHIT_IQ2ROW=1
 
 // iq4_xs, две строки
-// iq4_xs, two rows
 void dot_rows_iq4xs(const std::uint8_t* rows, std::size_t rb,
                     std::size_t nrows, const ActQ8& act, std::size_t in_dim,
                     float* out) noexcept {
@@ -891,7 +853,6 @@ void dot_rows_iq4xs(const std::uint8_t* rows, std::size_t rb,
 }
 
 // iq3_s, две строки
-// iq3_s, two rows
 void dot_rows_iq3s(const std::uint8_t* rows, std::size_t rb, std::size_t nrows,
                    const ActQ8& act, std::size_t in_dim, float* out) noexcept {
   constexpr std::size_t kBs = 110;
@@ -1033,7 +994,6 @@ void dot_rows_iq3s(const std::uint8_t* rows, std::size_t rb, std::size_t nrows,
 }
 
 // iq3_xxs, две строки
-// iq3_xxs, two rows
 void dot_rows_iq3xxs(const std::uint8_t* rows, std::size_t rb,
                      std::size_t nrows, const ActQ8& act, std::size_t in_dim,
                      float* out) noexcept {

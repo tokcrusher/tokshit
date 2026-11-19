@@ -13,7 +13,6 @@ namespace {
 }  // namespace
 
 // раскладка кванта для n элементов: сколько байт и сколько блоков
-// quant layout for n elements: how many bytes and how many blocks
 Result<QuantLayout> layout_for(QuantType quant, uint64_t element_count) {
   const auto spec = block_spec(quant);
   if (!spec.has_value()) {

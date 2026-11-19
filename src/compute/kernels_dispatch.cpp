@@ -18,9 +18,6 @@
 // arm64 linux: FEAT_I8MM в AT_HWCAP2, бит 13. проверено пробником SMMLA на
 // целевом cpu; заголовки Termux описывают только 32-битный arm, их биты
 // совпадать не обязаны
-// arm64 linux: FEAT_I8MM is in AT_HWCAP2, bit 13. verified with an SMMLA probe
-// on the target cpu; the Termux headers only describe 32-bit arm and their
-// bit positions do not apply here
 #ifndef HWCAP2_I8MM
 #define HWCAP2_I8MM (1UL << 13)
 #endif
@@ -31,7 +28,6 @@ namespace tokshit::kernels {
 namespace {
 
 // env-гейт: не задано = 0 (старое поведение), "0" = 0, любое другое = 1
-// env gate: unset = 0 (old behavior), "0" = 0, anything else = 1
 int env_flag(const char* name) noexcept {
   const char* v = std::getenv(name);
   if (v == nullptr || v[0] == '\0' || v[0] == '0') return 0;
@@ -41,7 +37,6 @@ int env_flag(const char* name) noexcept {
 }  // namespace
 
 // проверяем есть ли на этом cpu dotprod. результат кэшируется
-// check if this cpu has dotprod. the result is cached
 bool have_dotprod() noexcept {
 #if defined(__aarch64__)
   static const bool detected =
@@ -64,8 +59,6 @@ bool have_i8mm() noexcept {
 
 // SMMLA-путь: только с TOKSHIT_I8MM=1 и наличием фичи. по умолчанию
 // работает старый dotprod-путь
-// SMMLA path: only with TOKSHIT_I8MM=1 and the cpu feature. the dotprod
-// path stays the default
 bool use_i8mm() noexcept {
 #if defined(TOKSHIT_HAVE_NEON_I8MM)
   return have_dotprod() && have_i8mm() && env_flag("TOKSHIT_I8MM") != 0;
@@ -75,7 +68,6 @@ bool use_i8mm() noexcept {
 }
 
 // K-квант ядра (q4_k): TOKSHIT_KQK=1, дефолт — старое поведение
-// K-quant kernels (q4_k): TOKSHIT_KQK=1, the default stays the old path
 bool use_kquant() noexcept {
 #if defined(TOKSHIT_HAVE_NEON_DOTPROD)
   return have_dotprod() && env_flag("TOKSHIT_KQK") != 0;
@@ -86,8 +78,6 @@ bool use_kquant() noexcept {
 
 // двухстрочные IQ-ядра: TOKSHIT_IQ2ROW=1 включает, "0" выключает; если
 // замер покажет выигрыш, дефолт можно перевернуть на автодетект
-// two-row IQ kernels: TOKSHIT_IQ2ROW=1 enables, "0" disables; if the
-// benchmark shows a win the default flips to autodetect
 bool use_iq2row() noexcept {
 #if defined(TOKSHIT_HAVE_NEON_DOTPROD)
   return have_dotprod() && env_flag("TOKSHIT_IQ2ROW") != 0;
@@ -117,7 +107,6 @@ bool has_neon_dot(QuantType quant) noexcept {
 }
 
 // выбираем neon или скаляр. никаких виртуальных вызовов, просто switch
-// pick neon or scalar. no virtual calls, just a switch
 float dot_row(QuantType quant, std::span<const uint8_t> row, size_t rb,
               std::span<const float> x, const ActQ8& act, size_t in_dim,
               std::vector<float>& scratch) {
@@ -176,8 +165,6 @@ void dot_row_multi(QuantType quant, std::span<const uint8_t> row, size_t rb,
 #if defined(__aarch64__) && defined(TOKSHIT_HAVE_NEON_DOTPROD)
   // если для кванта есть готовое neon-ядро, n вызовов дешевле одного
   // декванта в float: ядро читает упакованную строку из l1
-  // when a neon kernel exists it beats dequant-to-float: it reads the packed
-  // row from l1 on every pass
   if (have_dotprod()) {
     bool handled = true;
     switch (quant) {
@@ -227,8 +214,6 @@ void dot_row_multi(QuantType quant, std::span<const uint8_t> row, size_t rb,
 
   // общий путь: разложить строку один раз и умножить на каждую активацию.
   // арифметика ровно как в dot_fallback, поэтому числа совпадают
-  // generic path: dequantize the row once, then dot every activation. the
-  // arithmetic matches dot_fallback, so the numbers agree
   const auto spec = block_spec(quant);
   const size_t expected =
       spec.has_value() && spec->weights != 0
@@ -272,8 +257,6 @@ void dot_rows(QuantType quant, std::span<const uint8_t> rows, size_t rb,
 #if defined(__aarch64__) && defined(TOKSHIT_HAVE_NEON_DOTPROD)
   if (have_dotprod() && in_dim % 32 == 0) {
     // i8mm/SMMLA путь для q8_0: TOKSHIT_I8MM=1, дефолт — dotprod-ядро
-    // i8mm/SMMLA path for q8_0: TOKSHIT_I8MM=1, the default is the dotprod
-    // kernel
     if (quant == QuantType::Q8_0 && use_i8mm()) {
       neon::dot_rows_q8_0_i8mm(rows.data(), rb, nrows, act, in_dim, out);
       return;

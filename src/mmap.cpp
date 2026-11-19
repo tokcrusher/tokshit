@@ -50,7 +50,6 @@ void Mmap::reset() noexcept {
 }
 
 // мапим файл целиком, read-only. ошибки маппинга возвращаем как обычно
-// map the whole file read-only. mapping errors come back as usual
 Result<Mmap> Mmap::map_file(int fd, uint64_t len) {
   if (len == 0) {
     return make_error(ErrCode::InvalidValue, "mmap.len",

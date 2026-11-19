@@ -33,8 +33,6 @@ std::size_t prefill_batch_size() {
 
 // Переносим готовый батч-kv в старый KVCache, чтобы декод дальше шёл
 // неизменным путём. Слой хранится как [k0 v0 k1 v1 ...], по kv_dim float.
-// copy the batched kv into the legacy KVCache so decode keeps its old path.
-// a layer is [k0 v0 k1 v1 ...] with kv_dim floats per half-row
 void seed_kvcache(const tokshit::Kv& src, std::size_t n,
                   tokshit::KVCache& dst) {
   const std::size_t kvd = src.kv_dim();
@@ -64,8 +62,6 @@ void seed_kvcache(const tokshit::Kv& src, std::size_t n,
 
 // Батч-префилл чанками: веса читаются один раз на чанк, эксперты — union
 // роутинга чанка. Логиты последнего токена каждого чанка пишем в `logits`.
-// batched prefill in chunks: weights once per chunk, experts by routing union;
-// the last row of each chunk lands in `logits`
 void prefill_batched(tokshit::Model& model,
                      std::span<const uint32_t> tokens, std::size_t pos,
                      std::size_t chunk, tokshit::KVCache& kv,
@@ -94,7 +90,6 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
                  const std::string& prompt, std::size_t max_new,
                  const FreqProfileCfg& freq_cfg) {
   // индикаторы живут только на tty-stderr; в пайпе stdout/stderr чистые
-  // indicators live on tty-stderr only; a pipe gets clean stdout/stderr
   const bool err_tty = ::isatty(STDERR_FILENO) != 0;
   const std::size_t width = tokshit::tui::terminal_width(STDERR_FILENO);
   const uint64_t io0 = tokshit::io_read_bytes();
@@ -148,7 +143,6 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   }
   // TOKSHIT_FREQ_PERSIST: профиль накопился за prefill+генерацию — пишем
   // TOKSHIT_FREQ_PERSIST: the profile accumulated over prefill+generation —
-  // write it out
   if (freq_cfg.persist) {
     if (model.save_freq_profile(freq_cfg.path)) {
       std::fprintf(stderr, "[freq] профиль сохранён: %s\n",
@@ -162,7 +156,6 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   // TOKSHIT_PROF=1: обнуляем счётчики после прогрева, чтобы в конце увидеть
   // чистый профиль генерации, а не prefill+генерацию вместе
   // TOKSHIT_PROF=1: zero the counters after warm-up so the report at the end
-  // is the decode profile alone rather than prefill+decode mixed together
   const bool prof_gen_only = std::getenv("TOKSHIT_PROF") != nullptr;
   if (prof_gen_only) tokshit::metrics_reset();
 
@@ -178,21 +171,15 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
         tokshit::sample_utf8_safe(logits, params, tok, utf8, rng);
     // бюджет проверяем до печати и до forward: принудительный </think/>
     // проходит ровно тот же путь, что и обычный токен
-    // check the budget before printing and forward: a forced </think/>
-    // goes through exactly the same path as a regular token
     const uint32_t next = reasoning.constrain(sampled);
     if (tok.is_eog(next)) break;
     gen_ids.push_back(next);
     // <think/></think/> — служебные токены, их байты не текст ответа.
     // Thinking-блок скрываем целиком: пользователю нужен финальный ответ.
-    // <think/></think/> are control tokens, not answer text. Hide the whole
-    // thinking block; the user only wants the final answer.
     const bool control = next == tokshit::kThinkOpen ||
                          next == tokshit::kThinkClose;
     // thinking печатаем обычным текстом: иначе на медленном декоде
     // пользователь видит пустой экран, пока модель «думает»
-    // print thinking as plain text: otherwise, at slow decode speed, the
-    // user stares at an empty screen while the model is thinking
     const bool hidden = control;
     std::string text;
     if (control) {
@@ -236,7 +223,6 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     dump_logits(dump, logits);
     ++pos;
     // токен уже напечатан и попал в kv: обновляем состояние блока
-    // the token is printed and in the kv already: update the block state
     reasoning.observe(next);
     if (tok_dbg) {
       const auto& m = tokshit::metrics();
@@ -262,7 +248,6 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   const double dt =
       std::chrono::duration<double>(tokshit::Clock::now() - g0).count();
   // стереть живую строку декода и закончить ответ на чистой строке
-  // erase the live decode line and end the answer on a clean line
   if (err_tty) {
     std::fputs("\r\x1b[K", stderr);
     std::fflush(stderr);
@@ -286,7 +271,6 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     // TOKSHIT_PROF обнуляет счётчики после prefill, поэтому вычитать
     // prefill_hit/miss здесь нельзя: получится underflow и hit-rate > 100%.
     // TOKSHIT_PROF zeroes the counters after prefill, so subtracting
-    // prefill_hit/miss here underflows and reports a hit-rate above 100%.
     const uint64_t gh = prof_gen_only
                             ? m.c_expert_hit.load()
                             : m.c_expert_hit.load() - prefill_hit;
@@ -327,9 +311,6 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
 // (например с полного жадного прогона) и на каждом шаге сравниваем argmax
 // черновика с референсом. это и есть acceptance rate, который решает судьбу
 // спекции: установленного контекста больше не менять
-// teacher-forced verify: run the draft over the reference token sequence
-// produced by a full greedy run, and at every step compare the greedy draft
-// token with the reference. this is the acceptance rate that decides whether
 
 void verify_ids(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
                 const std::string& prompt, const std::string& path,
@@ -338,7 +319,6 @@ void verify_ids(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   {
     // парсер живучий: ест и сырую строку "[ids: 1 2 ...]" от TOKSHIT_PRINT_IDS,
     // и просто числа в столбик. нечисловой мусор перепрыгиваем
-    // forgiving parser: eats the raw "[ids: 1 2 ...]" line from
     // TOKSHIT_PRINT_IDS and bare numbers alike, skips non-numeric junk
     if (FILE* f = std::fopen(path.c_str(), "rb"); f != nullptr) {
       std::string buf;
@@ -417,7 +397,6 @@ void verify_ids(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   tokshit::pool::set_active(false);
 
   // средняя серия = длина принятого куска на раунд спин-вери
-  // avg run = accepted chunks per draft/verify round
   const double avg_run =
       runs == 0 ? 0.0 : static_cast<double>(agree) / static_cast<double>(runs);
   std::fprintf(stderr,

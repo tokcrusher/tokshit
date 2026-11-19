@@ -112,13 +112,10 @@ using MetadataMap =
 
 // сырое чтение по абсолютному смещению. без Gguf, чтобы фоновые читатели
 // экспертов не держали ссылку на объект, который может переехать при move
-// raw read at an absolute offset. no Gguf, so the background expert readers
-// dont hold a reference to an object that can move on move
 [[nodiscard]] Result<void> pread_at(int fd, uint64_t offset,
                                     std::span<uint8_t> dst);
 
 // POSIX_FADV_DONTNEED на диапазон, best effort
-// POSIX_FADV_DONTNEED over a range, best effort
 void fadvise_dontneed(int fd, uint64_t offset, uint64_t len) noexcept;
 
 // GGUF v2/v3 reader. Owns a read-only file descriptor; tensor data is fetched
@@ -159,8 +156,6 @@ class Gguf {
                                        uint64_t byte_offset,
                                        std::span<uint8_t> buf) const;
 
-  // raw pread at an absolute file offset. used by the expert cache to read
-  // straight into its own buffer instead of faulting the mmap in
   // сырое чтение по абсолютному смещению. кэш экспертов читает прямо в свой
   // буфер, а не через page fault на mmap
   [[nodiscard]] Result<void> read_at(uint64_t offset,
@@ -168,8 +163,6 @@ class Gguf {
 
   // роняем page cache для диапазона (POSIX_FADV_DONTNEED). нужно чтобы поток
   // экспертов не вытеснял неэкспертные веса
-  // drop page cache for a range. keeps the expert stream from evicting the
-  // non-expert weights
   void fadvise_dontneed(uint64_t offset, uint64_t len) const noexcept;
 
   [[nodiscard]] Result<std::vector<uint8_t>> read_tensor_slice(
