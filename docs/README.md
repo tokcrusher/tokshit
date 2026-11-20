@@ -1,12 +1,11 @@
 # Документация tokshit
 
 `tokshit` — специализированный C++20-инференс-движок для ARM64/Snapdragon,
-оптимизированный под конкретное устройство и модель. Он запускает
-MoE-модели, которые больше оперативной памяти устройства, читает GGUF,
-считает forward на NEON dot-product и стримит экспертов с флеша через
-послойный LRU-кэш.
+оптимизированный под конкретное устройство и модель. Запускает MoE-модели
+больше оперативной памяти, читает GGUF, считает forward на NEON
+dot-product и стримит экспертов с флеша через послойный LRU-кэш.
 
-Этот файл — карта чтения. Начните с быстрого старта, затем выберите тему.
+Этот файл — карта чтения.
 
 ## Быстрый старт
 
@@ -16,33 +15,30 @@ MoE-модели, которые больше оперативной памят�
 ## Архитектура
 
 3. [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md) — модули, загрузка, инварианты.
-4. [RUNTIME.md](RUNTIME.md) — сквозной путь токена, MoE, кэш, I/O, AHB, пул.
-5. [SPEC_KV.md](SPEC_KV.md) — KV-кеш, батч-матвек, спекулятивный цикл.
+4. [RUNTIME.md](RUNTIME.md) — путь токена, MoE, кэш, I/O, AHB, пул.
+5. [SPEC_KV.md](SPEC_KV.md) — KV-кеш, батч-матвек, спекуляция.
 
 ## Кванты и ядра
 
 6. [QUANTIZATION.md](QUANTIZATION.md) — Q8_0, Q4_0, K-кванты, IQ, деквант.
-7. [KERNELS.md](KERNELS.md) — NEON dotprod, fallback, диспетчеризация,
-   замеры полосы.
-8. [GGUF.md](GGUF.md) — формат, метаданные, смещения, mmap/pread, ошибки.
+7. [KERNELS.md](KERNELS.md) — NEON dotprod, fallback, диспетчеризация.
+8. [GGUF.md](GGUF.md) — формат, метаданные, mmap/pread, ошибки.
 9. [TOKENIZER.md](TOKENIZER.md) — BPE, байтовый fallback, сэмплинг.
 
 ## Результаты и планы
 
-10. [PERFORMANCE.ru.md](PERFORMANCE.ru.md) — методика, декод, спекуляция,
-    микробенчмарки, исторические прогоны.
-11. [PERF_SESSION2.md](PERF_SESSION2.md) — baseline сессии 16.11.2026,
-    отрицательные результаты, план.
-12. [BENCH.ru.md](BENCH.ru.md) — воспроизводимый харнесс decode/prefill/A/B,
-    JSON/CSV, regression gate.
-13. [ROADMAP.md](ROADMAP.md) — этапы, карта компонентов, риски, идеи.
-14. [CONTRIBUTING.md](CONTRIBUTING.md) — правила, гигиена модели, коммиты.
+10. [PERFORMANCE.ru.md](PERFORMANCE.ru.md) — текущие замеры, бюджет токена,
+    ограничения устройства.
+11. [PERF_SESSION2.md](PERF_SESSION2.md) — исторический отчёт сессии
+    16–17.11.2026: что проверено и какие гипотезы отклонены.
+12. [BENCH.ru.md](BENCH.ru.md) — харнесс decode/prefill/A/B, JSON/CSV,
+    regression gate.
+13. [ROADMAP.md](ROADMAP.md) — статус, задачи, риски.
+14. [CONTRIBUTING.md](CONTRIBUTING.md) — сборка и правила разработки.
 
-## English
-
-- [README.md](../README.md) — English entry point.
-- [ARCHITECTURE.en.md](ARCHITECTURE.en.md) — modules and data flow.
-- [PERFORMANCE.md](PERFORMANCE.md) — measurements and methodology.
+English entry point: [README.md](../README.md),
+[ARCHITECTURE.en.md](ARCHITECTURE.en.md),
+[PERFORMANCE.md](PERFORMANCE.md).
 
 ## Обозначения
 
@@ -56,8 +52,8 @@ MoE-модели, которые больше оперативной памят�
 
 ## Правила чисел
 
-- Все замеры — целевой телефон 8 ядер, 15.2 ГБ RAM, Android/Termux.
-- Телефон троттлит: одиночные прогоны шумные, сравнение — через
-  `scripts/bench_matrix.sh` (см. [BENCH.ru.md](BENCH.ru.md)).
+- Все замеры — целевой телефон: 8 ядер, 15.2 ГБ RAM, Android/Termux.
+- Телефон троттлит: сравнивайте конфиги через
+  `scripts/bench_matrix.sh`, а не одиночными прогонами.
 - Микробенчмарки не предсказывают tok/s полного декода.
 - Идеи и незавершённые эксперименты помечены в [ROADMAP.md](ROADMAP.md).

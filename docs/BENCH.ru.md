@@ -87,7 +87,7 @@ TOKSHIT_DEVICE_LOCK_WAIT=3600 scripts/device_lock.sh \
 | `--no-logs` | выкл | не писать сырые логи |
 | `--gate` | выкл | exit 3 при регрессе |
 | `--gate-pct N` | `10` | порог регресса, % |
-| `--baseline-decode N` | `1.1` | baseline decode tok/s |
+| `--baseline-decode N` | `1.1` | исторический baseline decode tok/s (для текущего кода задайте 2.4) |
 | `--baseline-dense N` | `12.55` | baseline dense GB/s |
 | `--baseline-hit N` | `27.5` | baseline hit % |
 | `--lock-wait SEC` | `3600` | ожидание device-lock |
@@ -131,7 +131,7 @@ decode/prefill/dense — в процентах, hit — в процентных 
 
 | метрика | baseline | порог при 10% |
 |---|---:|---:|
-| decode | 1.1 tok/s | 0.99 tok/s |
+| decode | 1.1 tok/s (исторический) | 0.99 tok/s |
 | dense | 12.55 GB/s | 11.30 GB/s |
 | hit | 27.5 % | 24.75 % |
 
@@ -193,9 +193,10 @@ timestamp`.
   прогоном без `GGUF_TIME`.
 - Page cache и AHB прогреваются от прогона к прогону; медиана из 3 повторов
   это учитывает, но «холодный» и «тёплый» режимы — разные измерения.
-- `--fast`, `--spec-*`, `--draft-topk` — lossy-режимы. Харнесс не запрещает
-  их, но в отчёте они должны быть помечены **LOSSY** и не сравниваться с
-  обычным top-6 как с равным.
+- `--turbo`, `--spec-fast`, `--draft-topk` и `--spec-verify-topk` — lossy-
+  режимы. Полный `--spec` без `--spec-verify-topk` остаётся lossless.
+  Харнесс не запрещает lossy-прогоны, но в отчёте они помечаются **LOSSY**
+  и не сравниваются с обычным top-6 как с равными.
 
 Связанные документы: [PERFORMANCE.ru.md](PERFORMANCE.ru.md) — измеренные
 цифры; [RUNTIME.md](RUNTIME.md) — что происходит внутри прогона;

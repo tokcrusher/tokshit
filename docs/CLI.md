@@ -113,7 +113,7 @@ build/tokshit --help
 | `--dump-logits FILE` | нет | f32-логиты для паритета |
 | `--expert-stats` | выкл | union экспертов и hit-rate |
 | `--pool-stats` | выкл | статистика пула |
-| `--bench-mm` | выкл | matvec по плотным тензорам |
+| `--bench-mm` | выкл | matvec q/k/v/o attention-слоя |
 | `--bench-passes N` | 5 | проходов `--bench-mm` |
 | `--bench-breakdown` | выкл | разбивка q/k/v/o |
 | `--debug-tok` | выкл | отладка токенизатора |
@@ -125,35 +125,25 @@ build/tokshit --help
 
 ## 3. Пресеты
 
-`--fast` — это набор:
-
-```text
---o-direct=0 --cache-mb 0 --draft-topk 2 --drop-cache=0
-```
-
-Роутер берёт **2 эксперта из 6**. Это **LOSSY**-режим: выход модели
-отличается от обычного top-6. Он полезен как быстрый черновик и для
-сравнения полосы, но не заменяет обычный декод.
-
-`--turbo` — отдельный **LOSSY**-пресет для длинного decode:
+`--turbo` — **LOSSY**-пресет для длинного decode:
 
 ```text
 --draft-topk 2 --o-direct=1 --cache-mb 1024 --io-threads 8 --drop-cache=0
 ```
 
-Роутер берёт 2 эксперта из 6, плотные веса переквантовываются в Q4_0,
-но кэш экспертов и `O_DIRECT` остаются включёнными. Это не normal top-6:
-выход модели отличается. `--turbo` полезен, когда нужна скорость, а не
-паритет с полным роутингом.
+Роутер берёт 2 эксперта из 6, плотные веса переквантовываются в Q4_0, но
+кэш экспертов и `O_DIRECT` остаются включёнными. Это не normal top-6:
+выход модели отличается.
 
-`--spec-fast` — набор `--fast` плюс:
+`--spec-fast` — отдельный **LOSSY**-пресет:
 
 ```text
+--o-direct=0 --cache-mb 0 --draft-topk 2 --drop-cache=0
 --spec --spec-k 4 --spec-maxb 8 --spec-verify-topk 2
 ```
 
-Тоже **LOSSY**. Переменные `TOKSHIT_FAST=1`, `TOKSHIT_TURBO=1` и
-`TOKSHIT_SPEC_FAST=1` включают те же пресеты без флага.
+Переменные `TOKSHIT_TURBO=1` и `TOKSHIT_SPEC_FAST=1` включают те же
+пресеты без флага.
 
 ## 4. Переменные окружения
 
@@ -182,7 +172,7 @@ build/tokshit --help
 | `TOKSHIT_POOL_RT` | выкл | realtime-приоритет |
 | `TOKSHIT_POOL_STATS` | выкл | статистика пула |
 | `TOKSHIT_MAIN_CPU` | 7 | CPU главного потока |
-| `TOKSHIT_MLOCK` | выкл | `mlock` плотных весов |
+| `TOKSHIT_MLOCK` | выкл | зарезервировано, не подключено |
 | `TOKSHIT_EXPERT_STATS` | выкл | union и hit-rate |
 | `TOKSHIT_DRAFT_TOPK` | 0 | lossy draft top-k |
 | `TOKSHIT_PIN_EXPERTS` | 0 | пиннинг частых экспертов |
@@ -190,7 +180,13 @@ build/tokshit --help
 | `TOKSHIT_FREQ_FILE` | авто | путь профиля (по умолчанию `$TMPDIR/tokshit-freq-<модель>.bin`) |
 | `TOKSHIT_PREFETCH_IDLE` | выкл | prefetch только при простое диска |
 | `TOKSHIT_IO_MERGE` | выкл | слитые pread смежных экспертов |
-| `TOKSHIT_I8MM` | выкл | SMMLA-путь для Q8_0-матвеков (нужна фича i8mm) |
+| `TOKSHIT_I8MM` | выкл | SMMLA-путь для Q8_0-матвеков (нужна фича i8mm; экспериментальный) |
+| `TOKSHIT_IQ2ROW` | выкл | двухстрочные IQ-ядра (экспериментальный) |
+| `TOKSHIT_KQK` | выкл | Q4_K NEON-ядро (экспериментальный) |
+| `TOKSHIT_PREFILL_BATCH` | 32 | размер чанка батч-префилла; 0 — по одному токену |
+| `TOKSHIT_PREFILL_BULK` | выкл | sequential-чтение региона слоя на батч-префилле |
+| `TOKSHIT_HOT_SEG_MB` | 32 | размер сегмента hot-весов, МиБ |
+| `TOKSHIT_HOT_Q4` | выкл | переквантовать dense в Q4_0 (turbo) |
 | `TOKSHIT_PIN_EVERY` | нет | повторять пиннинг каждые N токенов |
 | `TOKSHIT_SPEC` | выкл | спекулятивный цикл |
 | `TOKSHIT_SPEC_K` | 4 | черновиков за раунд |
@@ -209,12 +205,18 @@ build/tokshit --help
 | `TOKSHIT_VERIFY_IDS` | нет | teacher-forced verify |
 | `TOKSHIT_DEBUG_TOK` | выкл | отладка токенизатора |
 | `TOKSHIT_SEG_DEBUG` | выкл | отладка сегментов |
+| `TOKSHIT_SEG_DEBUG_ALL` | выкл | отлаживать все сегменты, не только первые |
+| `TOKSHIT_LAYER_DEBUG` | выкл | тайминги слоя и экспертов |
+| `TOKSHIT_TOKEN_DEBUG` | выкл | тайминги одного токена |
+| `TOKSHIT_DEBUG_NRUN` | выкл | печатать число выполненных слоёв |
+| `TOKSHIT_POOL_WAIT_STATS` | выкл | статистика барьера пула |
 | `TOKSHIT_BENCH_MM` | выкл | matvec-бенчмарк |
 | `TOKSHIT_BENCH_PASSES` | 5 | проходов бенчмарка |
 | `TOKSHIT_BENCH_BREAKDOWN` | выкл | разбивка q/k/v/o |
 | `TOKSHIT_MIN_AVAIL_MB` | 1200 | порог `safe_run.sh` |
 | `GGUF_TIME` | выкл | таймеры фаз |
-| `TOKSHIT_FAST`, `TOKSHIT_SPEC_FAST` | выкл | пресеты, LOSSY |
+| `TOKSHIT_SPEC_FAST` | выкл | LOSSY-пресет |
+| `TOKSHIT_TURBO` | выкл | LOSSY-пресет |
 
 ## 5. Интерактивный чат
 
@@ -308,10 +310,6 @@ GGUF_TIME=1 scripts/safe_run.sh build/tokshit --temperature 0 \
 # спекуляция, полный verify (lossless при greedy)
 scripts/safe_run.sh build/tokshit --temperature 0 --cache-mb 512 \
   --spec --spec-k 3 ~/models/flint-UD-Q3_K_XL.gguf "hi" 24
-
-# быстрый, но LOSSY
-scripts/safe_run.sh build/tokshit --fast --temperature 0 \
-  ~/models/flint-UD-Q3_K_XL.gguf "hi" 24
 
 # LOSSY turbo: top-2 + Q4_0 dense, с кэшем и O_DIRECT
 scripts/safe_run.sh build/tokshit --turbo --temperature 0 \

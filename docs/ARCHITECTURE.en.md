@@ -22,7 +22,7 @@ and from the loader code.
 | vocab | 150144 |
 | rope theta | 10000 |
 | sliding window | 513, per-layer 0/1 pattern |
-| hot weights | 391 tensors, 1551 MB |
+| hot weights | 52 segments of 32 MB, 1.74 GB |
 | expert traffic | ~0.37 GB/token on a full miss (6/256 × 3 projections) |
 
 "47 layers" in older notes means 47 MoE layers; there are 49 blocks in total.
@@ -69,7 +69,7 @@ and from the loader code.
 
 Nothing heavy is copied except the norm vectors. `collect_hot()` separately
 copies the dense weights: attention q/k/v/o, dense ffn, shared expert, router,
-`output.weight` — 391 tensors, 1551 MB. After that `Meta.base` points either
+`output.weight` — 52 segments of 32 MB, 1.74 GB. After that `Meta.base` points either
 into the mmap or into hot storage; `meta_bytes()` picks based on the `hot` flag.
 
 `TOKSHIT_HOT=0` keeps dense weights in the mmap. By default the model's page
@@ -171,13 +171,13 @@ Budget:
 - one per process, **5120 MiB** by default (`TOKSHIT_AHB_MAX_MB`);
 - shared by hot weights and the expert-cache pool;
 - `reserve_ahb` refuses if less than 1 GiB of `MemAvailable` would remain;
-- hot weights use **one buffer per tensor**, 391 buffers, 1551 MB. gralloc
-  rejects a single 1.55 GB buffer with `rc=-129`;
-- the expert pool uses 128 MB slabs and size classes matching the gate/up/down
+- hot weights use **52 segments of 32 MB**, 1.74 GB. gralloc rejects a
+  single 1.74 GB buffer with `rc=-129`;
+- the expert pool uses 16 MB slabs and size classes matching the gate/up/down
   slices. It is lazy: slabs appear only after the router starts choosing
   experts;
-- the pool gets `3/4` of the cache budget as its own limit; the rest is
-  headroom. Everything still counts against the global 5120 MiB;
+- the pool gets the whole expert cache budget; everything still counts against
+  the global 5120 MiB;
 - the cache's malloc fallback is capped at **256 MiB** so "AHB + as much malloc
   as fits" cannot cause another OOM;
 - `TOKSHIT_AHB=0` disables AHB completely: hot weights and cache use malloc;
@@ -186,7 +186,7 @@ Budget:
   5.21 GB/s.
 
 AHB is not an accelerator by itself: 328 KB blocks read at 25.7 GB/s vs
-21.7 GB/s for malloc, while the full 1.55 GB stream over 391 buffers runs at
+21.7 GB/s for malloc, while the full 1.74 GB stream over 52 segments runs at
 only ~5.2 GB/s. The benefit is no ZRAM/swap and stable latency.
 
 ## pool
@@ -226,18 +226,17 @@ Full tables, layouts and the rule for adding a kernel are in
 
 Known issues:
 
-- **the batched path breaks on contexts longer than the sliding window
-  (513).** Prefilling a ~1040-token prompt yields blown-up logits and
-  garbage decode; short prompts (up to ~500 tokens) are correct. Until this
-  is fixed, long speculative runs are invalid;
+- **contexts longer than the sliding window (513) need a separate check.**
+  Short prompts (up to ~500 tokens) are correct; long speculative runs are
+  not valid until a parity test passes;
 - `c_expert_hit/miss` counters are now updated in the batched path
   (`model_batch.cpp`) with the same semantics as the single-token path;
 - acceptance under full verify is measured: 50–78% on prompts up to ~500
   tokens (`--spec --spec-k 3` runs at 0.93–1.00 tok/s), and the ids match
   plain greedy byte for byte; `--spec-verify-topk 2` gives ~50% and ~1.5
   tok/s, `--spec-fast` gives 83% and 2.09 tok/s (both **lossy**). All of
-  these are slower than normal top-6 with a 512 MB cache: the current
-  session gives 1.1–1.9 tok/s, the historical long run 2.0–2.7 tok/s.
+  these are slower than normal top-6 with a 512 MB cache: 2.40 tok/s on a
+  cool phone, 0.96 tok/s at 60 °C.
 
 ## errors
 
@@ -249,7 +248,7 @@ and tokenizer do.
 
 doctest, one file per area: quants, dequant, GGUF, mmap, cache, expert I/O,
 pool, sampling, tokenizer, KV, attention, batched kernels. The current line
-is 161 cases / 7781 assertions. Kernel and layer code is checked against the
+is 161 cases / 7715 assertions. Kernel and layer code is checked against the
 scalar reference in `compute/kernels_scalar.cpp`.
 
 ## invariants
