@@ -55,6 +55,9 @@ freq.log
 /fixes.md
 /fixses.md
 
+# local agent memory tool
+/.nib/
+
 # unit tests and agent-facing docs live outside the public repository
 /tests/
 docs/TESTING.md
