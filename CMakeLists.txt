@@ -114,6 +114,7 @@ add_executable(tokshit
   src/main.cpp
   src/cli_common.cpp
   src/cli_flags.cpp
+  src/cli_decode.cpp
   src/cli_run.cpp
   src/cli_chat.cpp
 )

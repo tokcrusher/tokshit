@@ -159,103 +159,26 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   const bool prof_gen_only = std::getenv("TOKSHIT_PROF") != nullptr;
   if (prof_gen_only) tokshit::metrics_reset();
 
-  std::vector<uint32_t> gen_ids;
   const bool print_ids = std::getenv("TOKSHIT_PRINT_IDS") != nullptr;
-  tokshit::Utf8Buffer utf8;
-  tokshit::Rng rng;
-  tokshit::ReasoningBudget reasoning(reasoning_budget_from_env());
-  std::size_t n_gen = 0;
-  const auto g0 = tokshit::Clock::now();
-  for (;;) {
-    const uint32_t sampled =
-        tokshit::sample_utf8_safe(logits, params, tok, utf8, rng);
-    // бюджет проверяем до печати и до forward: принудительный </think/>
-    // проходит ровно тот же путь, что и обычный токен
-    const uint32_t next = reasoning.constrain(sampled);
-    if (tok.is_eog(next)) break;
-    gen_ids.push_back(next);
-    // <think/></think/> — служебные токены, их байты не текст ответа.
-    // Thinking-блок скрываем целиком: пользователю нужен финальный ответ.
-    const bool control = next == tokshit::kThinkOpen ||
-                         next == tokshit::kThinkClose;
-    // thinking печатаем обычным текстом: иначе на медленном декоде
-    // пользователь видит пустой экран, пока модель «думает»
-    const bool hidden = control;
-    std::string text;
-    if (control) {
-      utf8 = tokshit::Utf8Buffer{};
-    } else {
-      text = utf8.push(tok.token_bytes(next));
-    }
-    if (!hidden && !text.empty()) {
-      std::fwrite(text.data(), 1, text.size(), stdout);
-      std::fflush(stdout);
-    }
-    ++n_gen;
-    if (n_gen >= max_new) break;
-
-    // периодически донашивать топ-эксперты в кэш: freq_ накапливается от
-    // генерации, и каждый такой "pin" добавляет новые горячие эксперты
-    // (без clear, лру сам выкинет холодные)
-    if (const char* pv = std::getenv("TOKSHIT_PIN_EVERY");
-        pv != nullptr && *pv != '\0') {
-      const std::size_t pin_every =
-          static_cast<std::size_t>(std::strtoull(pv, nullptr, 10));
-      if (pin_every != 0 && n_gen % pin_every == 0) {
-        const char* kv_pin = std::getenv("TOKSHIT_PIN_EXPERTS");
-        const std::size_t pin_k =
-            kv_pin != nullptr
-                ? static_cast<std::size_t>(std::strtoull(kv_pin, nullptr, 10))
-                : 200;
-        model.pin_hot_experts(pin_k);
-      }
-    }
-
-    const bool tok_dbg = std::getenv("TOKSHIT_TOKEN_DEBUG") != nullptr;
-    const auto t_tok = tokshit::Clock::now();
-    const uint64_t io_t0 = tok_dbg ? tokshit::io_read_bytes() : 0;
-    const uint64_t ld_t0 = tok_dbg ? tokshit::metrics().t_load.load() : 0;
-    const uint64_t mm_t0 = tok_dbg ? tokshit::metrics().t_expert_mm.load() : 0;
-    const uint64_t dw_t0 = tokshit::metrics().t_down_wait.load();
-    const uint64_t hit_t0 = tokshit::metrics().c_expert_hit.load();
-    const uint64_t miss_t0 = tokshit::metrics().c_expert_miss.load();
-    model.token_logits(next, kv, pos, logits);
-    dump_logits(dump, logits);
-    ++pos;
-    // токен уже напечатан и попал в kv: обновляем состояние блока
-    reasoning.observe(next);
-    if (tok_dbg) {
-      const auto& m = tokshit::metrics();
-      const double dt = std::chrono::duration<double>(
-                            tokshit::Clock::now() - t_tok)
-                            .count();
-      std::fprintf(
-          stderr,
-          "[tok %zu] %.0fms io=%.1fMB load=%.0fms exmm=%.0fms dw=%.0fms "
-          "hit=%llu miss=%llu\n",
-          n_gen, dt * 1e3,
-          static_cast<double>(tokshit::io_read_bytes() - io_t0) / 1e6,
-          static_cast<double>(m.t_load.load() - ld_t0) / 1e6,
-          static_cast<double>(m.t_expert_mm.load() - mm_t0) / 1e6,
-          static_cast<double>(m.t_down_wait.load() - dw_t0) / 1e6,
-          static_cast<unsigned long long>(m.c_expert_hit.load() - hit_t0),
-          static_cast<unsigned long long>(m.c_expert_miss.load() - miss_t0));
-    }
-  }
+  Rng rng;
+  DecodeOptions dopt;
+  dopt.max_new = max_new;
+  dopt.token_debug = std::getenv("TOKSHIT_TOKEN_DEBUG") != nullptr;
+  dopt.pin_every = true;
+  const DecodeResult dec = decode(model, tok, kv, pos, logits, params, rng,
+                                  reasoning_budget_from_env(), dump, dopt);
   if (dump != nullptr) std::fclose(dump);
-  const std::string tail = reasoning.in_think() ? std::string{} : utf8.flush();
-  if (!tail.empty()) std::fwrite(tail.data(), 1, tail.size(), stdout);
-  const double dt =
-      std::chrono::duration<double>(tokshit::Clock::now() - g0).count();
+  const std::size_t n_gen = dec.generated;
+  const double dt = dec.seconds;
   // стереть живую строку декода и закончить ответ на чистой строке
   if (err_tty) {
     std::fputs("\r\x1b[K", stderr);
     std::fflush(stderr);
   }
   std::fputc('\n', stdout);
-  if (print_ids && !gen_ids.empty()) {
+  if (print_ids && !dec.ids.empty()) {
     std::fprintf(stderr, "[ids:");
-    for (uint32_t id : gen_ids) {
+    for (uint32_t id : dec.ids) {
       std::fprintf(stderr, " %u", id);
     }
     std::fprintf(stderr, "]\n");

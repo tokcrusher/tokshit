@@ -1,0 +1,114 @@
+#include "cli.hpp"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "tokshit/metrics.hpp"
+#include "tokshit/model.hpp"
+#include "tokshit/reasoning.hpp"
+#include "tokshit/sampling.hpp"
+#include "tokshit/special_tokens.hpp"
+#include "tokshit/tokenizer.hpp"
+
+namespace tokshit::cli {
+
+DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
+                    std::size_t& pos, std::vector<float>& logits,
+                    const SampleParams& params, Rng& rng, int reasoning_budget,
+                    FILE* dump, const DecodeOptions& options) {
+  DecodeResult result;
+  Utf8Buffer utf8;
+  ReasoningBudget reasoning(reasoning_budget);
+  const auto t0 = Clock::now();
+
+  for (;;) {
+    if (options.check_interrupt && g_interrupt != 0) {
+      result.interrupted = true;
+      break;
+    }
+    const uint32_t sampled = sample_utf8_safe(logits, params, tok, utf8, rng);
+    // Бюджет проверяется до печати и forward: принудительный </think/>
+    // проходит тот же путь, что и обычный токен.
+    const uint32_t next = reasoning.constrain(sampled);
+    if (tok.is_eog(next)) break;
+    result.ids.push_back(next);
+
+    // <think/> и </think/> не текст ответа; thinking-блок скрывается целиком.
+    const bool control =
+        next == kThinkOpen || next == kThinkClose;
+    std::string chunk;
+    if (control) {
+      utf8 = Utf8Buffer{};
+    } else {
+      chunk = utf8.push(tok.token_bytes(next));
+    }
+    if (!control && !chunk.empty()) {
+      std::fwrite(chunk.data(), 1, chunk.size(), stdout);
+      std::fflush(stdout);
+      result.text.append(chunk);
+    }
+    ++result.generated;
+    if (result.generated >= options.max_new) break;
+
+    if (options.pin_every) {
+      if (const char* pv = std::getenv("TOKSHIT_PIN_EVERY");
+          pv != nullptr && *pv != '\0') {
+        const std::size_t pin_every =
+            static_cast<std::size_t>(std::strtoull(pv, nullptr, 10));
+        if (pin_every != 0 && result.generated % pin_every == 0) {
+          const char* kv_pin = std::getenv("TOKSHIT_PIN_EXPERTS");
+          const std::size_t pin_k =
+              kv_pin != nullptr
+                  ? static_cast<std::size_t>(std::strtoull(kv_pin, nullptr, 10))
+                  : 200;
+          model.pin_hot_experts(pin_k);
+        }
+      }
+    }
+
+    const auto t_tok = Clock::now();
+    const uint64_t io_t0 = options.token_debug ? io_read_bytes() : 0;
+    const uint64_t ld_t0 =
+        options.token_debug ? metrics().t_load.load() : 0;
+    const uint64_t mm_t0 =
+        options.token_debug ? metrics().t_expert_mm.load() : 0;
+    const uint64_t dw_t0 = metrics().t_down_wait.load();
+    const uint64_t hit_t0 = metrics().c_expert_hit.load();
+    const uint64_t miss_t0 = metrics().c_expert_miss.load();
+
+    model.token_logits(next, kv, pos, logits);
+    dump_logits(dump, logits);
+    ++pos;
+    reasoning.observe(next);
+
+    if (options.token_debug) {
+      const auto& m = metrics();
+      const double dt =
+          std::chrono::duration<double>(Clock::now() - t_tok).count();
+      std::fprintf(
+          stderr,
+          "[tok %zu] %.0fms io=%.1fMB load=%.0fms exmm=%.0fms dw=%.0fms "
+          "hit=%llu miss=%llu\n",
+          result.generated, dt * 1e3,
+          static_cast<double>(io_read_bytes() - io_t0) / 1e6,
+          static_cast<double>(m.t_load.load() - ld_t0) / 1e6,
+          static_cast<double>(m.t_expert_mm.load() - mm_t0) / 1e6,
+          static_cast<double>(m.t_down_wait.load() - dw_t0) / 1e6,
+          static_cast<unsigned long long>(m.c_expert_hit.load() - hit_t0),
+          static_cast<unsigned long long>(m.c_expert_miss.load() - miss_t0));
+    }
+  }
+
+  const std::string tail = reasoning.in_think() ? std::string{} : utf8.flush();
+  if (!tail.empty()) {
+    std::fwrite(tail.data(), 1, tail.size(), stdout);
+    result.text.append(tail);
+  }
+  result.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
+  return result;
+}
+
+}  // namespace tokshit::cli

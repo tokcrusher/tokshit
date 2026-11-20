@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <climits>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,19 @@
 #include "tokshit/tui.hpp"
 
 namespace tokshit::cli {
+
+volatile std::sig_atomic_t g_interrupt = 0;
+
+extern "C" void on_sigint(int) { g_interrupt = 1; }
+
+void install_sigint() {
+  // Без SA_RESTART: getline и цикл генерации сами проверяют флаг.
+  struct sigaction sa {};
+  sa.sa_handler = on_sigint;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+  sigaction(SIGINT, &sa, nullptr);
+}
 
 int reasoning_budget_from_env() {
   const char* v = std::getenv("TOKSHIT_REASONING_BUDGET");

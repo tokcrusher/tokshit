@@ -23,14 +23,6 @@
 
 namespace tokshit::cli {
 
-namespace {
-
-volatile std::sig_atomic_t g_interrupt = 0;
-
-extern "C" void on_sigint(int) { g_interrupt = 1; }
-
-}  // namespace
-
 // Inline REPL: без ncurses и без полного экрана. В TTY — цветные роли,
 // стриминг по токену, строка статуса; в пайпе — обычный построчный читатель
 // без ANSI. Управление: /help, /clear, /stats, /temp, /topk, /system, /save.
@@ -112,12 +104,7 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   // отрезается, чтобы \r-перерисовка не ломалась
   const std::size_t width = tokshit::tui::terminal_width(STDERR_FILENO);
 
-  // SIGINT без SA_RESTART: getline и цикл генерации сами увидят флаг
-  struct sigaction sa {};
-  sa.sa_handler = on_sigint;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-  sigaction(SIGINT, &sa, nullptr);
+  install_sigint();
 
   ChatSession s;
   s.kv.assign(model.n_layers(), std::vector<float>{});
@@ -354,55 +341,18 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
       std::fputs("токшит: ", stdout);
       std::fflush(stdout);
     }
-    tokshit::Utf8Buffer utf8;
-    std::string answer;
-    tokshit::ReasoningBudget reasoning(s.reasoning_budget);
-    std::size_t n_gen = 0;
-    const auto g0 = tokshit::Clock::now();
-    for (;;) {
-      if (g_interrupt != 0) {
-        break;
-      }
-      const uint32_t sampled =
-          tokshit::sample_utf8_safe(logits, s.params, tok, utf8, rng);
-      const uint32_t next = reasoning.constrain(sampled);
-      if (tok.is_eog(next)) break;
-      // Не печатаем служебные <think/></think/> и скрываем thinking-блок.
-      const bool control = next == tokshit::kThinkOpen ||
-                           next == tokshit::kThinkClose;
-      const bool hidden = control;
-      std::string chunk;
-      if (control) {
-        utf8 = tokshit::Utf8Buffer{};
-      } else {
-        chunk = utf8.push(tok.token_bytes(next));
-      }
-      if (!hidden && !chunk.empty()) {
-        std::fwrite(chunk.data(), 1, chunk.size(), stdout);
-        answer.append(chunk);
-        std::fflush(stdout);
-      }
-      ++n_gen;
-      model.token_logits(next, s.kv, s.pos, logits);
-      dump_logits(dump, logits);
-      ++s.pos;
-      reasoning.observe(next);
-    }
-    const std::string tail = reasoning.in_think() ? std::string{} : utf8.flush();
-    if (!tail.empty()) {
-      std::fwrite(tail.data(), 1, tail.size(), stdout);
-      answer.append(tail);
-    }
-    const double dt =
-        std::chrono::duration<double>(tokshit::Clock::now() - g0).count();
+    DecodeOptions dopt;
+    dopt.check_interrupt = true;
+    const DecodeResult dec =
+        decode(model, tok, s.kv, s.pos, logits, s.params, rng,
+               s.reasoning_budget, dump, dopt);
+    const std::string answer = dec.text;
+    const std::size_t n_gen = dec.generated;
+    const double dt = dec.seconds;
     if (err_tty) std::fputs("\r\x1b[K", stderr);
-    if (g_interrupt != 0) {
+    if (dec.interrupted) {
       g_interrupt = 0;
-      if (tty) {
-        std::fputs(" [прервано]", stdout);
-      } else {
-        std::fputs(" [прервано]", stdout);
-      }
+      std::fputs(" [прервано]", stdout);
     }
     std::fputc('\n', stdout);
     std::fflush(stdout);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,30 @@ struct FreqProfileCfg {
   bool persist = false;
   std::string path;
 };
+
+// Опции одного прохода генерации. max_new = SIZE_MAX означает «до EOG».
+struct DecodeOptions {
+  std::size_t max_new = static_cast<std::size_t>(-1);
+  bool token_debug = false;
+  bool pin_every = false;
+  bool check_interrupt = false;
+};
+
+struct DecodeResult {
+  std::size_t generated = 0;
+  double seconds = 0.0;
+  std::vector<uint32_t> ids;
+  std::string text;
+  bool interrupted = false;
+};
+
+extern volatile std::sig_atomic_t g_interrupt;
+void install_sigint();
+
+DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
+                    std::size_t& pos, std::vector<float>& logits,
+                    const SampleParams& params, Rng& rng, int reasoning_budget,
+                    FILE* dump, const DecodeOptions& options);
 
 // Живой прогресс префилла. Рисуется только на tty, обновляется не чаще 4 Гц.
 struct PrefillBar {
