@@ -174,6 +174,7 @@ build/tokshit --help
 | `TOKSHIT_MAIN_CPU` | 7 | CPU главного потока |
 | `TOKSHIT_MLOCK` | выкл | зарезервировано, не подключено |
 | `TOKSHIT_EXPERT_STATS` | выкл | union и hit-rate |
+| `TOKSHIT_EXPERT_TRACE` | нет | файл трассы роутинга: слой и top-k на каждый проход |
 | `TOKSHIT_DRAFT_TOPK` | 0 | lossy draft top-k |
 | `TOKSHIT_PIN_EXPERTS` | 0 | пиннинг частых экспертов |
 | `TOKSHIT_FREQ_PERSIST` | выкл | писать частотный профиль после генерации |

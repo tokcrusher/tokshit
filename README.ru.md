@@ -171,7 +171,7 @@ scripts/safe_run.sh build/tokshit --hot=0 --cache-mb 256 --io-threads 1 \
 include/tokshit/   публичные заголовки
 src/               рантайм
 src/compute/       скалярные, NEON и батчевые ядра
-src/tools/         qstat, kbench, vcheck, bwbench, pbench, ahbtest
+src/tools/         qstat, kbench, vcheck, bwbench, pbench, ahbtest, densebench
 scripts/           safe_run.sh, device_lock.sh, bench_matrix.sh и другие
 docs/              тематическая документация
 install.sh         установщик Termux/Linux

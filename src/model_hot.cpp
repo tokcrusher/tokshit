@@ -2,19 +2,23 @@
 #include "tokshit/ahb.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #include "tokshit/dequant.hpp"
 #include "tokshit/kernels.hpp"
 
 namespace tokshit {
 
-// копируем все неэкспертные веса в отдельный vector чтобы их не вытеснял
-// поток экспертов из page cache. на андроиде может не спасти (своп)
-void Model::collect_hot() {
+std::vector<Meta*> Model::dense_metas() {
   std::vector<Meta*> list;
   list.reserve(n_layers_ * 11 + 1);
   for (Layer& lt : layers_) {
@@ -31,6 +35,119 @@ void Model::collect_hot() {
     if (lt.down_shexp) list.push_back(&*lt.down_shexp);
   }
   list.push_back(&out_);
+  return list;
+}
+
+// Чистый поток hot-байтов: без matvec, только чтение и редукция.
+// Запускаем несколько потоков, иначе это меряет один ядерный порт, а не LPDDR.
+double Model::bench_hot_read(std::size_t passes) {
+  const std::vector<Meta*> list = dense_metas();
+  uint64_t bytes = 0;
+  for (const Meta* m : list) {
+    bytes += static_cast<uint64_t>(m->out_dim) * m->rb;
+  }
+  const unsigned hw = std::thread::hardware_concurrency();
+  const unsigned nthreads = std::max(1U, std::min(hw == 0 ? 4U : hw, 8U));
+  std::vector<uint64_t> local(nthreads, 0);
+  // Прогрев: поднять частоты и прогреть TLB до замера.
+  for (const Meta* m : list) {
+    const auto span = meta_bytes(*m);
+    (void)span;
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<std::thread> threads;
+  threads.reserve(nthreads);
+  for (unsigned t = 0; t < nthreads; ++t) {
+    threads.emplace_back([&, t] {
+      uint64_t acc = 0;
+      for (std::size_t p = 0; p < passes; ++p) {
+        for (std::size_t i = t; i < list.size(); i += nthreads) {
+          const Meta* m = list[i];
+          const auto span = meta_bytes(*m);
+          const std::size_t n = static_cast<std::size_t>(m->out_dim) * m->rb;
+          const uint8_t* d = span.data();
+          std::size_t k = 0;
+#if defined(__aarch64__)
+          uint32x4_t v0 = vdupq_n_u32(0);
+          uint32x4_t v1 = vdupq_n_u32(0);
+          uint32x4_t v2 = vdupq_n_u32(0);
+          uint32x4_t v3 = vdupq_n_u32(0);
+          for (; k + 64 <= n; k += 64) {
+            v0 = veorq_u32(v0, vreinterpretq_u32_u8(vld1q_u8(d + k)));
+            v1 = veorq_u32(v1, vreinterpretq_u32_u8(vld1q_u8(d + k + 16)));
+            v2 = veorq_u32(v2, vreinterpretq_u32_u8(vld1q_u8(d + k + 32)));
+            v3 = veorq_u32(v3, vreinterpretq_u32_u8(vld1q_u8(d + k + 48)));
+          }
+          for (; k + 16 <= n; k += 16) {
+            v0 = veorq_u32(v0, vreinterpretq_u32_u8(vld1q_u8(d + k)));
+          }
+          acc += vaddvq_u32(veorq_u32(veorq_u32(v0, v1),
+                                      veorq_u32(v2, v3)));
+#endif
+          for (; k + 8 <= n; k += 8) {
+            uint64_t w = 0;
+            std::memcpy(&w, d + k, sizeof(w));
+            acc += w;
+          }
+          for (; k < n; ++k) acc += d[k];
+        }
+      }
+      local[t] = acc;
+    });
+  }
+  for (std::thread& th : threads) th.join();
+  uint64_t sink = 0;
+  for (uint64_t v : local) sink += v;
+  const double sec =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  if (sink == 0xdeadbeefULL) {
+    std::fprintf(stderr, "sink=%llu\n",
+                 static_cast<unsigned long long>(sink));
+  }
+  return sec > 1e-9 ? static_cast<double>(bytes * passes) / sec / 1e9 : 0.0;
+}
+
+// Полный dense matvec: все hot-тензоры через реальные ядра, без экспертов.
+double Model::bench_dense_matvec(std::size_t passes) {
+  const std::vector<Meta*> list = dense_metas();
+  uint64_t bytes = 0;
+  std::size_t max_in = 1;
+  std::size_t max_out = 1;
+  for (const Meta* m : list) {
+    bytes += static_cast<uint64_t>(m->out_dim) * m->rb;
+    max_in = std::max(max_in, m->in_dim);
+    max_out = std::max(max_out, m->out_dim);
+  }
+  std::vector<float> x(max_in, 0.01F);
+  std::vector<float> y(max_out, 0.0F);
+  kernels::ActQ8 act;
+  // Прогрев: первый проход не должен портить среднее.
+  for (const Meta* m : list) {
+    const auto xi = std::span<const float>(x.data(), m->in_dim);
+    auto yi = std::span<float>(y.data(), m->out_dim);
+    kernels::quantize_into(xi, act);
+    matvec_preact(*m, xi, yi, act);
+  }
+  const auto t0 = std::chrono::steady_clock::now();
+  for (std::size_t p = 0; p < passes; ++p) {
+    for (const Meta* m : list) {
+      const auto xi = std::span<const float>(x.data(), m->in_dim);
+      auto yi = std::span<float>(y.data(), m->out_dim);
+      kernels::quantize_into(xi, act);
+      matvec_preact(*m, xi, yi, act);
+    }
+  }
+  const double sec =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  return sec > 1e-9 ? static_cast<double>(bytes * passes) / sec / 1e9 : 0.0;
+}
+
+// копируем все неэкспертные веса в отдельный vector чтобы их не вытеснял
+// поток экспертов из page cache. на андроиде может не спасти (своп)
+void Model::collect_hot() {
+  std::vector<Meta*> list = dense_metas();
 
   const auto mm_bytes = mm_.bytes();
   const auto* mm_data = reinterpret_cast<const uint8_t*>(mm_bytes.data());

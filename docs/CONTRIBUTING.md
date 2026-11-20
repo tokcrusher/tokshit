@@ -49,7 +49,7 @@ build/tokshit_tests
 
 | опция | что делает |
 |---|---|
-| `TOKSHIT_BUILD_TOOLS` | собрать `qstat`, `kbench`, `vcheck`, `bwbench`, `pbench`, `ahbtest` |
+| `TOKSHIT_BUILD_TOOLS` | собрать `qstat`, `kbench`, `vcheck`, `bwbench`, `pbench`, `ahbtest`, `densebench` |
 | `TOKSHIT_NEON` | NEON-ядра на aarch64 |
 | `TOKSHIT_DOTPROD` | dotprod-варианты |
 | `TOKSHIT_NO_EXCEPTIONS` | `-fno-exceptions -fno-rtti` |

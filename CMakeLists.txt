@@ -181,4 +181,8 @@ if(TOKSHIT_BUILD_TOOLS)
   add_executable(ahbtest src/tools/ahbtest.cpp)
   target_link_libraries(ahbtest PRIVATE tokshit_core)
   tokshit_set_warnings(ahbtest)
+
+  add_executable(densebench src/tools/densebench.cpp)
+  target_link_libraries(densebench PRIVATE tokshit_core)
+  tokshit_set_warnings(densebench)
 endif()

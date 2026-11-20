@@ -14,6 +14,8 @@
 #include "tokshit/metrics.hpp"
 #include "tokshit/model.hpp"
 
+#include "model_trace.hpp"
+
 namespace tokshit {
 
 struct Model::BatchBuf {
@@ -267,6 +269,7 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
   }
   for (std::size_t j = 0; j < b; ++j) {
     record_freq(layer, bf.top[j]);
+    trace_experts(layer, bf.top[j]);
   }
 
   std::fill(bf.seen.begin(), bf.seen.end(), uint8_t{0});

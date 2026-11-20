@@ -15,6 +15,7 @@
 #include "tokshit/pool.hpp"
 
 #include "model_internal.hpp"
+#include "model_trace.hpp"
 
 namespace tokshit {
 
@@ -67,6 +68,7 @@ void Model::layer_moe(std::size_t layer, Workspace& ws) {
   for (float w : ws.wts) wsum += w;
   for (float& w : ws.wts) w /= wsum;
   record_freq(layer, ws.top);
+  trace_experts(layer, ws.top);
 
   if (prefetch_enabled() && io_ != nullptr && resident_budget_ != 0) {
     for (std::size_t ahead = 1; ahead <= 2; ++ahead) {

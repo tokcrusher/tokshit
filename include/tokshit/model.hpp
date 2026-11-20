@@ -162,6 +162,13 @@ class Model {
                     std::vector<float>& out);
 
   void collect_hot();
+  // Бенчмарки для диагностики: чистый поток hot-байтов и полный dense matvec
+  // без экспертов и attention. Возвращают ГБ/с.
+  [[nodiscard]] double bench_hot_read(std::size_t passes);
+  [[nodiscard]] double bench_dense_matvec(std::size_t passes);
+  [[nodiscard]] const Meta& out_meta() const noexcept { return out_; }
+  [[nodiscard]] std::size_t hot_bytes() const noexcept { return hot_.size(); }
+  [[nodiscard]] bool hot_on_ahb() const noexcept { return hot_.on_ahb(); }
 
   void set_prefilling(bool v) { prefilling_ = v; }
 
@@ -280,6 +287,7 @@ class Model {
                                  std::size_t expert) const;
   void record_freq(std::size_t layer, std::span<const std::size_t> top);
   void prefetch_experts(std::size_t layer, std::span<const std::size_t> top);
+  [[nodiscard]] std::vector<Meta*> dense_metas();
 
   static void rmsnorm(std::span<float> x, std::span<const float> w, float eps);
   static void rope_apply(std::span<float> x,
