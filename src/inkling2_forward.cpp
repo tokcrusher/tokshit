@@ -24,38 +24,40 @@ struct MvTask {
   const float* x = nullptr;
   float* y = nullptr;
   const kernels::ActQ8* act = nullptr;
+  uint32_t rows_per_task = 32;
 };
 
-void matvec_task(void* ctx, std::size_t r) {
+void matvec_task(void* ctx, std::size_t chunk) {
   const MvTask& t = *static_cast<const MvTask*>(ctx);
-  thread_local std::vector<float> buf;
-  const uint8_t* row = t.data + static_cast<std::size_t>(r) * t.rb;
-  float acc = 0.0F;
-  if (t.quant == QuantType::F32) {
-    const float* w = reinterpret_cast<const float*>(row);
-    for (uint32_t i = 0; i < t.in; ++i) acc += w[i] * t.x[i];
-  } else if (t.quant == QuantType::Bf16) {
-    const uint16_t* w = reinterpret_cast<const uint16_t*>(row);
-    for (uint32_t i = 0; i < t.in; ++i) {
-      const uint32_t bits = static_cast<uint32_t>(w[i]) << 16;
-      float f = 0.0F;
-      std::memcpy(&f, &bits, sizeof(f));
-      acc += f * t.x[i];
-    }
-  } else if (t.act != nullptr) {
-    acc = kernels::dot_row(
-        t.quant, std::span<const uint8_t>(row, t.rb), t.rb,
-        std::span<const float>(t.x, t.in), *t.act, t.in, buf);
-  } else {
-    buf.resize(t.in);
-    const auto deq = dequant_into(t.quant,
-                                  std::span<const uint8_t>(row, t.rb), t.in,
-                                  std::span<float>(buf.data(), buf.size()));
-    if (deq.ok()) {
-      for (uint32_t i = 0; i < t.in; ++i) acc += buf[i] * t.x[i];
-    }
+  const uint32_t r0 = static_cast<uint32_t>(chunk) * t.rows_per_task;
+  if (r0 >= t.rows) return;
+  const uint32_t n = std::min(t.rows_per_task, t.rows - r0);
+  if (t.act != nullptr) {
+    thread_local std::vector<float> scratch;
+    kernels::dot_rows(
+        t.quant, std::span<const uint8_t>(t.data + static_cast<std::size_t>(r0) * t.rb,
+                                          static_cast<std::size_t>(n) * t.rb),
+        t.rb, n, std::span<const float>(t.x, t.in), *t.act, t.in, t.y + r0,
+        scratch);
+    return;
   }
-  t.y[r] = acc;
+  for (uint32_t r = r0; r < r0 + n; ++r) {
+    const uint8_t* row = t.data + static_cast<std::size_t>(r) * t.rb;
+    float acc = 0.0F;
+    if (t.quant == QuantType::F32) {
+      const float* w = reinterpret_cast<const float*>(row);
+      for (uint32_t i = 0; i < t.in; ++i) acc += w[i] * t.x[i];
+    } else {
+      const uint16_t* w = reinterpret_cast<const uint16_t*>(row);
+      for (uint32_t i = 0; i < t.in; ++i) {
+        const uint32_t bits = static_cast<uint32_t>(w[i]) << 16;
+        float f = 0.0F;
+        std::memcpy(&f, &bits, sizeof(f));
+        acc += f * t.x[i];
+      }
+    }
+    t.y[r] = acc;
+  }
 }
 
 inline float sigmoidf(float x) { return 1.0F / (1.0F + std::exp(-x)); }
@@ -90,10 +92,14 @@ void Inkling2::matvec(const InkMeta& m, const float* x, float* y,
     kernels::quantize_into(std::span<const float>(x, m.in_dim), act);
     t.act = &act;
   }
-  if (m.rows >= 64 && std::getenv("TOKSHIT_INK_SERIAL") == nullptr) {
-    pool::run_tasks(m.rows, matvec_task, &t);
+  static const bool serial = std::getenv("TOKSHIT_INK_SERIAL") != nullptr;
+  if (m.rows >= 256 && !serial) {
+    t.rows_per_task = 64;
+    const std::size_t tasks = (m.rows + t.rows_per_task - 1) / t.rows_per_task;
+    pool::run_tasks(tasks, matvec_task, &t);
   } else {
-    for (uint32_t r = 0; r < m.rows; ++r) matvec_task(&t, r);
+    t.rows_per_task = m.rows;
+    matvec_task(&t, 0);
   }
 }
 
@@ -281,48 +287,6 @@ void Inkling2::attention(const InkLayer& L, std::size_t slot, std::size_t pos,
       denom += scores_[i];
     }
     const float inv = 1.0F / denom;
-    if (std::getenv("TOKSHIT_INK_ATTN2") != nullptr && slot == 6 && hh == 0 &&
-        pos == 8) {
-      float k0 = 0.0F, kc = 0.0F;
-      const uint16_t* kr0 = st.k.data() + kh * hd;
-      const uint16_t* krc = st.k.data() + pos * kvd + kh * hd;
-      for (std::size_t i = 0; i < hd; ++i) {
-        k0 += f16_to_f32(kr0[i]) * f16_to_f32(kr0[i]);
-        kc += f16_to_f32(krc[i]) * f16_to_f32(krc[i]);
-      }
-      float v0 = 0.0F, vc = 0.0F;
-      const uint16_t* vr0 = st.v.data() + kh * hd;
-      const uint16_t* vrc = st.v.data() + pos * kvd + kh * hd;
-      for (std::size_t i = 0; i < hd; ++i) {
-        v0 += f16_to_f32(vr0[i]) * f16_to_f32(vr0[i]);
-        vc += f16_to_f32(vrc[i]) * f16_to_f32(vrc[i]);
-      }
-      std::fprintf(stderr, "[attn2] pos=%zu n=%zu k0=%.3f kpos=%.3f v0=%.3f vpos=%.3f w:", pos, n,
-                   std::sqrt(k0), std::sqrt(kc), std::sqrt(v0), std::sqrt(vc));
-      for (std::size_t i = 0; i < n; ++i) {
-        std::fprintf(stderr, " %.3f", scores_[i] * inv);
-      }
-      std::fprintf(stderr, "\n");
-    }
-    if (std::getenv("TOKSHIT_INK_ATTN") != nullptr && hh < 2 && pos >= 3) {
-      float smin = scores_[0], smax = scores_[0];
-      std::size_t arg = 0;
-      for (std::size_t i = 0; i < n; ++i) {
-        if (scores_[i] < smin) smin = scores_[i];
-        if (scores_[i] > smax) {
-          smax = scores_[i];
-          arg = i;
-        }
-      }
-      float qn = 0.0F, on = 0.0F;
-      for (std::size_t i = 0; i < hd; ++i) qn += q[i] * q[i];
-      for (std::size_t i = 0; i < hd; ++i) on += out[hh * hd + i] * out[hh * hd + i];
-      std::fprintf(stderr,
-                   "[attn] slot=%zu pos=%zu h=%zu sink=%.3f qn=%.2f score[%.2f..%.2f] "
-                   "arg=%zu outn=%.3f n=%zu\n",
-                   slot, pos, hh, sink_[hh], std::sqrt(qn), smin, smax, arg,
-                   std::sqrt(on), n);
-    }
     float* o = out + hh * hd;
     std::fill(o, o + hd, 0.0F);
     for (std::size_t i = 0; i < n; ++i) {
@@ -689,7 +653,8 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
     }
     rmsnorm(std::span<float>(mix2_.data(), h),
             std::span<const float>(L.ffn_norm.data(), L.ffn_norm.size()), eps_);
-    if (std::getenv("TOKSHIT_INK_NOFFN") != nullptr) {
+    static const bool noffn = std::getenv("TOKSHIT_INK_NOFFN") != nullptr;
+    if (noffn) {
       std::fill(ffn_.begin(), ffn_.end(), 0.0F);
     } else {
       moe(L, mix2_.data(), ffn_.data());
@@ -705,7 +670,7 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
       }
       dump_vec(ip == 9 ? "router9" : (pos == 0 ? "router" : "router8"), dbg);
     }
-    if (std::getenv("TOKSHIT_INK_NOFFN") == nullptr) {
+    if (!noffn) {
       shortconv(L, L.ffn_conv, nullptr, 2 * kvd + h, h, ffn_.data());
     }
     for (std::size_t i = 0; i < h; ++i) x_[i] = ffn_in[i] + ffn_[i];
@@ -741,8 +706,8 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
       const InkLayer& L = phys(slot);
       const float* mkv = nullptr;
       const float* mres = nullptr;
-      if (p > 0 && !bank.empty() &&
-          std::getenv("TOKSHIT_INK_NOLOOP") == nullptr) {
+      static const bool noloop = std::getenv("TOKSHIT_INK_NOLOOP") != nullptr;
+      if (p > 0 && !bank.empty() && !noloop) {
         std::vector<const float*> st;
         st.reserve(bank.size());
         for (const auto& b : bank) st.push_back(b.data());

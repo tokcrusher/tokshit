@@ -13,10 +13,12 @@
 #include <arm_neon.h>
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
+#include "../dequant_tables.hpp"
 #include "tokshit/dequant.hpp"
 #include "tokshit/gguf_tables.hpp"
 
@@ -71,6 +73,58 @@ constexpr std::array<std::uint64_t, 256> kMask8 = build_mask8();
          (static_cast<std::uint32_t>(p[1]) << 8) |
          (static_cast<std::uint32_t>(p[2]) << 16) |
          (static_cast<std::uint32_t>(p[3]) << 24);
+}
+
+// e8m0 -> float, уже поделённый на два: таблица e2m1 в dequant удвоена.
+// формула ровно как ggml_e8m0_to_fp32_half
+constexpr std::array<float, 256> build_e8m0_half() {
+  std::array<float, 256> out{};
+  for (std::uint32_t x = 0; x < 256; ++x) {
+    const std::uint32_t bits =
+        x < 2 ? (0x00200000U << x) : ((x - 1) << 23);
+    out[x] = std::bit_cast<float>(bits);
+  }
+  return out;
+}
+
+// ue4m3 (4-бит экспонента со сдвигом 7, 3-бит мантисса) -> float, тоже
+// пополам. 0x7f — NaN этого формата, dequant отдаёт для него 0
+constexpr std::array<float, 256> build_ue4m3_half() {
+  std::array<float, 256> out{};
+  for (std::uint32_t x = 0; x < 256; ++x) {
+    const std::uint32_t e = (x >> 3) & 0x0FU;
+    const std::uint32_t m = x & 7U;
+    if (x == 0x7FU) {
+      out[x] = 0.0F;
+      continue;
+    }
+    if (e == 0) {
+      out[x] = static_cast<float>(m) * (1.0F / 1024.0F);
+      continue;
+    }
+    float v = 1.0F + static_cast<float>(m) * 0.125F;
+    for (std::uint32_t i = 7; i < e; ++i) v *= 2.0F;
+    for (std::uint32_t i = e; i < 7; ++i) v *= 0.5F;
+    out[x] = v * 0.5F;
+  }
+  return out;
+}
+
+const std::array<float, 256> kE8m0Half = build_e8m0_half();
+const std::array<float, 256> kUe4m3Half = build_ue4m3_half();
+
+// q2_0: 16 байт = 64 веса, по 4 кода на байт. tbl раскладывает 4 байта в 16
+// значений, signed shift {0,-2,-4,-6} вытаскивает код, маска и -1 дают
+// значение -1..2 (как q - 1 в dequant)
+const std::array<std::uint8_t, 16> kQ2IdxLo = {
+    0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+const std::array<std::uint8_t, 16> kQ2IdxHi = {
+    4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7};
+const std::array<std::int8_t, 16> kQ2Shifts = {
+    0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6};
+
+[[nodiscard]] inline int8x8_t grid8(const std::uint64_t& entry) noexcept {
+  return vld1_s8(reinterpret_cast<const std::int8_t*>(&entry));
 }
 
 }  // namespace
