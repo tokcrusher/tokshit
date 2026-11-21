@@ -37,18 +37,26 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
     result.ids.push_back(next);
 
     // <think/> и </think/> не текст ответа; thinking-блок скрывается целиком.
+    // У inkling2 все спецтокены (id >= 199998) — разметка, кроме end_message,
+    // который печатаем как перевод строки.
+    const bool ink_special = model.is_inkling2() && next >= 199998;
     const bool control =
-        next == kThinkOpen || next == kThinkClose;
+        next == kThinkOpen || next == kThinkClose || ink_special;
     std::string chunk;
-    if (control) {
+    if (ink_special) {
+      utf8 = Utf8Buffer{};
+      if (next == 200010) chunk = "\n";
+    } else if (control) {
       utf8 = Utf8Buffer{};
     } else {
       chunk = utf8.push(tok.token_bytes(next));
     }
-    if (!control && !chunk.empty()) {
-      std::fwrite(chunk.data(), 1, chunk.size(), stdout);
-      std::fflush(stdout);
-      result.text.append(chunk);
+    if (!control || !chunk.empty()) {
+      if (!chunk.empty()) {
+        std::fwrite(chunk.data(), 1, chunk.size(), stdout);
+        std::fflush(stdout);
+        result.text.append(chunk);
+      }
     }
     ++result.generated;
     if (result.generated >= options.max_new) break;

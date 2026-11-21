@@ -32,6 +32,8 @@ set(TOKSHIT_CORE_SOURCES
   src/tokenizer.cpp
   src/sampling.cpp
   src/model_load.cpp
+  src/inkling2_load.cpp
+  src/inkling2_forward.cpp
   src/model_hot.cpp
   src/model_cache.cpp
   src/model_layer.cpp
@@ -161,6 +163,10 @@ if(TOKSHIT_BUILD_TOOLS)
   add_executable(qstat src/tools/qstat.cpp)
   target_link_libraries(qstat PRIVATE tokshit_core)
   tokshit_set_warnings(qstat)
+
+  add_executable(dumptensor src/tools/dumptensor.cpp)
+  target_link_libraries(dumptensor PRIVATE tokshit_core)
+  tokshit_set_warnings(dumptensor)
 
   add_executable(bwbench src/tools/bwbench.cpp)
   target_link_libraries(bwbench PRIVATE tokshit_core)

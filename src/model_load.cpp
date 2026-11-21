@@ -73,6 +73,50 @@ Result<Model> Model::load(const std::string& path,
   TOKSHIT_TRY(mm, gguf.mmap_file());
   if (options.mmap_willneed) mm.advise_willneed();
 
+  // Диспетчеризация по architecture: inkling2 живёт отдельным бэкендом.
+  {
+    std::string arch;
+    if (auto a = gguf.get("general.architecture"); a.ok()) {
+      if (auto s = a.value()->as_str(); s.has_value()) arch = std::string(*s);
+    }
+    if (arch == "inkling2") {
+      const std::size_t kv_ctx = static_cast<std::size_t>(
+          env_u64("TOKSHIT_KV_CTX", 2048));
+      Model model;
+      model.gguf_ = std::move(gguf);
+      model.mm_ = std::move(mm);
+      TOKSHIT_TRY(ink,
+                  Inkling2::load(model.gguf_, model.mm_, kv_ctx));
+      // Модель целиком в RAM: 9.14 ГБ влезают в 15.2 ГБ. Трогаем страницы,
+      // чтобы дальше не было чтения с флеша на каждом токене.
+      const char* pf = std::getenv("TOKSHIT_PREFAULT");
+      if (pf == nullptr || pf[0] != '0') {
+        const auto bytes = model.mm_.bytes();
+        volatile uint8_t sink = 0;
+        for (std::size_t off = 0; off < bytes.size(); off += 4096) {
+          sink = sink ^ static_cast<uint8_t>(bytes[off]);
+        }
+        (void)sink;
+        std::fprintf(stderr, "[tokshit] prefault: %.2f GB в page cache\n",
+                     static_cast<double>(bytes.size()) / 1e9);
+      }
+      model.ink_ = std::move(ink);
+      model.n_layers_ = model.ink_->n_slots();
+      model.hidden_ = 2304;
+      model.n_heads_ = 24;
+      model.n_kv_ = 8;
+      model.head_dim_ = 128;
+      model.n_experts_ = model.ink_->n_experts();
+      model.n_used_ = model.ink_->n_used();
+      model.vocab_ = model.ink_->vocab();
+      model.freq_key_.clear();
+      std::fprintf(stderr,
+                   "[tokshit] arch=inkling2 slots=%zu phys=%zu vocab=%zu\n",
+                   model.n_layers_, model.ink_->n_phys(), model.vocab_);
+      return model;
+    }
+  }
+
   TOKSHIT_TRY(n_layers_v, gguf.u64_kv("flint.block_count"));
   TOKSHIT_TRY(n_dense_v, gguf.u64_kv("flint.leading_dense_block_count"));
   TOKSHIT_TRY(hidden_v, gguf.u64_kv("flint.embedding_length"));

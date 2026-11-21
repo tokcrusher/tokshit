@@ -106,25 +106,45 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   const tokshit::SampleParams params = sample_params_from_env();
   const auto t0 = tokshit::Clock::now();
 
-  std::vector<uint32_t> turn;
-  turn.push_back(kUser);
-  for (uint32_t id : tok.encode(prompt)) turn.push_back(id);
-  turn.push_back(kAssistant);
+  std::vector<uint32_t> turn = tokshit::cli::build_turn(model, tok, prompt, "");
+  if (std::getenv("TOKSHIT_DUMP_TURN") != nullptr) {
+    std::fprintf(stderr, "[turn]");
+    for (uint32_t id : turn) std::fprintf(stderr, " %u", id);
+    std::fprintf(stderr, "\n");
+  }
 
   model.set_prefilling(true);
   {
     PrefillBar bar;
     bar.start();
     std::size_t done = 0;
-    const std::size_t pchunk = dump == nullptr ? prefill_batch_size() : 0;
+    const std::size_t pchunk =
+        (dump == nullptr && !model.is_inkling2()) ? prefill_batch_size() : 0;
     if (pchunk != 0 && !turn.empty()) {
       prefill_batched(model, std::span<const uint32_t>(turn), pos, pchunk, kv,
                       logits);
       pos += turn.size();
     } else {
+      const bool ppl_dbg = std::getenv("TOKSHIT_INK_PPL") != nullptr;
       for (uint32_t id : turn) {
         model.token_logits(id, kv, pos, logits);
         dump_logits(dump, logits);
+        if (ppl_dbg && pos + 1 < turn.size()) {
+          float mx = logits[0];
+          for (float v : logits) mx = std::max(mx, v);
+          double se = 0.0;
+          for (float v : logits) se += std::exp(static_cast<double>(v) - mx);
+          const double lse = mx + std::log(se);
+          const uint32_t tg = turn[pos + 1];
+          std::size_t top = 0;
+          for (std::size_t i = 1; i < logits.size(); ++i) {
+            if (logits[i] > logits[top]) top = i;
+          }
+          std::fprintf(stderr,
+                       "[ppl] p=%zu target=%u logp=%.4f top=%zu top_logp=%.4f\n",
+                       pos, tg, static_cast<double>(logits[tg]) - lse, top,
+                       static_cast<double>(logits[top]) - lse);
+        }
         ++pos;
         ++done;
         bar.tick(done, turn.size(), width, err_tty);
@@ -133,6 +153,75 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     bar.finish(err_tty);
   }
   model.set_prefilling(false);
+  if (std::getenv("TOKSHIT_DUMP_TURN") != nullptr && !logits.empty()) {
+    float mx = logits[0];
+    for (float v : logits) mx = std::max(mx, v);
+    std::fprintf(stderr, "[turn] logits size=%zu max=%.3f first=%.3f\n",
+                 logits.size(), mx, logits[0]);
+  }
+  if (const char* probe = std::getenv("TOKSHIT_INK_PROBE");
+      probe != nullptr && *probe != '\0') {
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < logits.size(); ++i) {
+      if (logits[i] > logits[best]) best = i;
+    }
+    std::fprintf(stderr, "[probe] argmax=%zu '%s'\n", best,
+                 tok.decode(std::vector<uint32_t>{static_cast<uint32_t>(best)})
+                     .c_str());
+    std::vector<uint32_t> pr = tok.encode(probe);
+    if (!pr.empty()) {
+      const uint32_t id = pr[0];
+      std::size_t rank = 0;
+      for (std::size_t i = 0; i < logits.size(); ++i) {
+        if (logits[i] > logits[id]) ++rank;
+      }
+      std::fprintf(stderr, "[probe] '%s' id=%u rank=%zu logit=%.3f top=%.3f\n",
+                   probe, id, rank, logits[id], logits[best]);
+    }
+    // top-5
+    for (int k = 0; k < 5; ++k) {
+      std::size_t bi = 0;
+      for (std::size_t i = 1; i < logits.size(); ++i) {
+        if (logits[i] > logits[bi]) bi = i;
+      }
+      std::fprintf(stderr, "[probe] #%d %.3f %zu '%s'\n", k, logits[bi], bi,
+                   tok.decode(std::vector<uint32_t>{
+                                  static_cast<uint32_t>(bi)}).c_str());
+      logits[bi] = -1e30F;
+    }
+  }
+  if (std::getenv("TOKSHIT_INK_SELFTEST") != nullptr) {
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < logits.size(); ++i) {
+      if (logits[i] > logits[best]) best = i;
+    }
+    const uint32_t t = static_cast<uint32_t>(best);
+    std::vector<float> inc;
+    model.token_logits(t, kv, pos, inc);
+    ++pos;
+    std::vector<float> fresh;
+    std::size_t p2 = 0;
+    for (uint32_t id : turn) model.token_logits(id, kv, p2++, fresh);
+    model.token_logits(t, kv, p2, fresh);
+    double md = 0.0;
+    std::size_t bi = 0;
+    for (std::size_t i = 0; i < inc.size(); ++i) {
+      const double d = std::fabs(static_cast<double>(inc[i]) - fresh[i]);
+      if (d > md) {
+        md = d;
+        bi = i;
+      }
+    }
+    std::fprintf(stderr,
+                 "[selftest] token=%u inc_top=%zu fresh_top=%zu maxdiff=%.4f "
+                 "at %zu (inc=%.3f fresh=%.3f)\n",
+                 t, static_cast<std::size_t>(std::distance(
+                        inc.begin(), std::max_element(inc.begin(), inc.end()))),
+                 static_cast<std::size_t>(std::distance(
+                        fresh.begin(), std::max_element(fresh.begin(), fresh.end()))),
+                 md, bi, inc[bi], fresh[bi]);
+    return;
+  }
   const double prefill =
       std::chrono::duration<double>(tokshit::Clock::now() - t0).count();
   if (tokshit::prefetch_enabled()) model.pin_hot_experts(64);

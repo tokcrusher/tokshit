@@ -48,9 +48,12 @@ int main(int argc, char** argv) {
     model.collect_hot();
     // После копии плотных весов page cache от mmap не нужен: эксперты
     // читаются мимо него. Сбрасываем, чтобы отдать память кэшу экспертов.
-    if (const char* v = std::getenv("TOKSHIT_DROP_CACHE");
-        v == nullptr || *v != '0') {
-      model.gguf().fadvise_dontneed(0, model.gguf().file_len());
+    // Для inkling2 плотные веса остаются в mmap — cache не трогаем.
+    if (!model.is_inkling2()) {
+      if (const char* v = std::getenv("TOKSHIT_DROP_CACHE");
+          v == nullptr || *v != '0') {
+        model.gguf().fadvise_dontneed(0, model.gguf().file_len());
+      }
     }
   }
 

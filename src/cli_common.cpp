@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -14,9 +15,52 @@
 #include "tokshit/model.hpp"
 #include "tokshit/pool.hpp"
 #include "tokshit/sampling.hpp"
+#include "tokshit/special_tokens.hpp"
 #include "tokshit/tui.hpp"
 
 namespace tokshit::cli {
+
+std::vector<uint32_t> build_turn(const Model& model, const BpeTokenizer& tok,
+                                 std::string_view user,
+                                 std::string_view system) {
+  std::vector<uint32_t> turn;
+  if (std::getenv("TOKSHIT_RAW_PROMPT") != nullptr) {
+    return tok.encode(user);
+  }
+  if (model.is_inkling2()) {
+    auto push_special = [&](std::string_view name) {
+      const auto id = tok.token_id(name);
+      if (id.has_value()) turn.push_back(*id);
+    };
+    push_special("<|message_system|>");
+    push_special("<|content_text|>");
+    for (uint32_t id : tok.encode("Thinking effort level: 0.9")) {
+      turn.push_back(id);
+    }
+    push_special("<|end_message|>");
+    if (!system.empty()) {
+      push_special("<|message_system|>");
+      push_special("<|content_text|>");
+      for (uint32_t id : tok.encode(system)) turn.push_back(id);
+      push_special("<|end_message|>");
+    }
+    push_special("<|message_user|>");
+    push_special("<|content_text|>");
+    for (uint32_t id : tok.encode(user)) turn.push_back(id);
+    push_special("<|end_message|>");
+    push_special("<|message_model|>");
+    return turn;
+  }
+  turn.push_back(kUser);
+  if (!system.empty()) {
+    for (uint32_t id : tok.encode(std::string(system) + "\n\n")) {
+      turn.push_back(id);
+    }
+  }
+  for (uint32_t id : tok.encode(user)) turn.push_back(id);
+  turn.push_back(kAssistant);
+  return turn;
+}
 
 volatile std::sig_atomic_t g_interrupt = 0;
 

@@ -40,6 +40,13 @@ struct DecodeResult {
 extern volatile std::sig_atomic_t g_interrupt;
 void install_sigint();
 
+// Собирает ids хода. Для Flint — старый формат USER/text/ASSISTANT, для
+// inkling2 — шаблон Thinking Machines с effort-заголовком.
+[[nodiscard]] std::vector<uint32_t> build_turn(const Model& model,
+                                               const BpeTokenizer& tok,
+                                               std::string_view user,
+                                               std::string_view system);
+
 DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
                     std::size_t& pos, std::vector<float>& logits,
                     const SampleParams& params, Rng& rng, int reasoning_budget,
