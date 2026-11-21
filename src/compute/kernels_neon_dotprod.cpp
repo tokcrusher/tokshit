@@ -1137,6 +1137,130 @@ void dot_rows_iq3xxs(const std::uint8_t* rows, std::size_t rb,
   }
 }
 
+
+// ---- q2_0: блок 64, 2 бита, значения -1,0,1,2; шкала f16 на 64.
+// активация квантована по 32, поэтому блок веса делится на два сабблока.
+float dot_q2_0(const std::uint8_t* row, const ActQ8& act,
+               std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 18;
+  constexpr std::size_t kQk = 64;
+  const std::size_t nb = in_dim / kQk;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float32x4_t acc = vdupq_n_f32(0.0F);
+  const uint8x16_t mask2 = vdupq_n_u8(0x03U);
+  const int8x16_t one = vdupq_n_s8(1);
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = load_f16(row + b * kBs);
+    const uint8x16_t q = vld1q_u8(row + b * kBs + 2);
+    const uint8x16_t a = vandq_u8(q, mask2);
+    const uint8x16_t c =
+        vandq_u8(vshrq_n_u8(q, 2), mask2);
+    const uint8x16_t e =
+        vandq_u8(vshrq_n_u8(q, 4), mask2);
+    const uint8x16_t f = vshrq_n_u8(q, 6);
+    const uint8x16_t ab_lo = vzip1q_u8(a, c);
+    const uint8x16_t ab_hi = vzip2q_u8(a, c);
+    const uint8x16_t ef_lo = vzip1q_u8(e, f);
+    const uint8x16_t ef_hi = vzip2q_u8(e, f);
+    // второй уровень склейки — по 16-битным парам: (a,c) с (e,f), иначе
+    // получается a,e,c,f вместо a,c,e,f
+    const uint16x8_t ab16 = vreinterpretq_u16_u8(ab_lo);
+    const uint16x8_t ef16 = vreinterpretq_u16_u8(ef_lo);
+    const uint16x8_t ab16h = vreinterpretq_u16_u8(ab_hi);
+    const uint16x8_t ef16h = vreinterpretq_u16_u8(ef_hi);
+    const int8x16_t v0 =
+        vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                     vzip1q_u16(ab16, ef16))), one);
+    const int8x16_t v1 =
+        vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                     vzip2q_u16(ab16, ef16))), one);
+    const int8x16_t v2 =
+        vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                     vzip1q_u16(ab16h, ef16h))), one);
+    const int8x16_t v3 =
+        vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                     vzip2q_u16(ab16h, ef16h))), one);
+    int32x4_t s0 = vdotq_s32(vdupq_n_s32(0), v0, vld1q_s8(ap + b * 64));
+    s0 = vdotq_s32(s0, v1, vld1q_s8(ap + b * 64 + 16));
+    int32x4_t s1 = vdotq_s32(vdupq_n_s32(0), v2, vld1q_s8(ap + b * 64 + 32));
+    s1 = vdotq_s32(s1, v3, vld1q_s8(ap + b * 64 + 48));
+    acc = vfmaq_f32(acc, vcvtq_f32_s32(s0),
+                    vdupq_n_f32(d * sp[2 * b]));
+    acc = vfmaq_f32(acc, vcvtq_f32_s32(s1),
+                    vdupq_n_f32(d * sp[2 * b + 1]));
+  }
+  return vaddvq_f32(acc);
+}
+
+[[nodiscard]] inline float e8m0_half(std::uint8_t x) noexcept {
+  const std::uint32_t bits =
+      x < 2 ? (0x00200000u << x) : (static_cast<std::uint32_t>(x - 1) << 23);
+  return std::bit_cast<float>(bits);
+}
+
+[[nodiscard]] inline float ue4m3_half(std::uint8_t x) noexcept {
+  if (x == 0 || x == 0x7F) return 0.0F;
+  const int exp = (x >> 3) & 0xF;
+  const int man = x & 0x7;
+  const float raw =
+      exp == 0 ? std::ldexp(static_cast<float>(man), -9)
+               : std::ldexp(1.0F + static_cast<float>(man) / 8.0F, exp - 7);
+  return raw * 0.5F;
+}
+
+// ---- mxfp4: блок 32, e8m0 + 16 байт e2m1 (кодбук удвоен).
+float dot_mxfp4(const std::uint8_t* row, const ActQ8& act,
+                std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 17;
+  const std::size_t nb = in_dim / 32;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  const int8x16_t tbl = vld1q_s8(
+      reinterpret_cast<const std::int8_t*>(dequant_tables::kvalues_fp4.data()));
+  const uint8x16_t mask4 = vdupq_n_u8(0x0FU);
+  float32x4_t acc = vdupq_n_f32(0.0F);
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = e8m0_half(row[b * kBs]);
+    const uint8x16_t q = vld1q_u8(row + b * kBs + 1);
+    const int8x16_t wlo = vqtbl1q_s8(tbl, vandq_u8(q, mask4));
+    const int8x16_t whi = vqtbl1q_s8(tbl, vshrq_n_u8(q, 4));
+    int32x4_t s = vdotq_s32(vdupq_n_s32(0), wlo, vld1q_s8(ap + b * 32));
+    s = vdotq_s32(s, whi, vld1q_s8(ap + b * 32 + 16));
+    acc = vfmaq_f32(acc, vcvtq_f32_s32(s), vdupq_n_f32(d * sp[b]));
+  }
+  return vaddvq_f32(acc);
+}
+
+// ---- nvfp4: блок 64, 4 ue4m3 сабшкалы на 16 весов, кодбук e2m1.
+float dot_nvfp4(const std::uint8_t* row, const ActQ8& act,
+                std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 36;
+  const std::size_t nb = in_dim / 64;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  const int8x16_t tbl = vld1q_s8(
+      reinterpret_cast<const std::int8_t*>(dequant_tables::kvalues_fp4.data()));
+  const uint8x16_t mask4 = vdupq_n_u8(0x0FU);
+  float32x4_t acc = vdupq_n_f32(0.0F);
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t s = 0; s < 4; ++s) {
+      const std::size_t base = b * kBs + 4 + s * 8;
+      const float d = ue4m3_half(row[b * kBs + s]);
+      const uint8x8_t q = vld1_u8(row + base);
+      const int8x8_t wlo =
+          vqtbl1_s8(tbl, vand_u8(q, vget_low_u8(mask4)));
+      const int8x8_t whi = vqtbl1_s8(tbl, vshr_n_u8(q, 4));
+      const int8x16_t w = vcombine_s8(wlo, whi);
+      const std::size_t a = b * 64 + s * 16;
+      const int32x4_t t = vdotq_s32(vdupq_n_s32(0), w, vld1q_s8(ap + a));
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(t),
+                      vdupq_n_f32(d * sp[a / 32]));
+    }
+  }
+  return vaddvq_f32(acc);
+}
+
 }  // namespace tokshit::kernels::neon
 
 #endif  // __aarch64__ && TOKSHIT_HAVE_NEON_DOTPROD

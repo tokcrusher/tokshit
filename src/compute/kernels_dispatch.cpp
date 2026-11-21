@@ -96,6 +96,9 @@ bool has_neon_dot(QuantType quant) noexcept {
     case QuantType::Iq2S:
     case QuantType::Iq3S:
     case QuantType::Iq3Xxs:
+    case QuantType::Q2_0:
+    case QuantType::Mxfp4:
+    case QuantType::Nvfp4:
       return true;
     default:
       return false;
@@ -141,6 +144,21 @@ float dot_row(QuantType quant, std::span<const uint8_t> row, size_t rb,
       case QuantType::Iq3Xxs:
         if (in_dim % 256 == 0) {
           return neon::dot_iq3xxs(row.data(), act, in_dim);
+        }
+        break;
+      case QuantType::Q2_0:
+        if (in_dim % 64 == 0) {
+          return neon::dot_q2_0(row.data(), act, in_dim);
+        }
+        break;
+      case QuantType::Mxfp4:
+        if (in_dim % 32 == 0) {
+          return neon::dot_mxfp4(row.data(), act, in_dim);
+        }
+        break;
+      case QuantType::Nvfp4:
+        if (in_dim % 64 == 0) {
+          return neon::dot_nvfp4(row.data(), act, in_dim);
         }
         break;
       case QuantType::Q4K:
