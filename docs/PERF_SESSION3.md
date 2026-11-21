@@ -1,68 +1,113 @@
-# PERF_SESSION3: Inkling-2-Mini, отчёт по сессии
+# PERF_SESSION3: Inkling-2-Mini на смартфоне
 
-Дата: 2026-11-21. Устройство: Snapdragon 8s Gen 4, 15.2 ГБ RAM, Termux.
+Дата: 2026-11-21/22. Устройство: Snapdragon 8s Gen 4, 15.2 ГБ LPDDR5X, Termux.
+Модель: `Inkling-2-Mini-UD-Q2_K_XL.gguf` (9.14 ГБ, 26.4B total / 3.4B active,
+24 физических слоя, 48 применений, 128 экспертов top-8).
 
-## Цель
+## Итог
 
-Загрузить `Inkling-2-Mini-UD-Q2_K_XL.gguf` (9.14 ГБ) в память целиком,
-реализовать forward и получить корректный текст; затем скорость.
+| режим | decode tok/s | prefill tok/s | статус |
+|---|---:|---:|---|
+| normal (top-8, Q6_K/Q5_K/Q4_K dense) | **2.1–2.4** | 1.6–1.8 | lossless |
+| turbo (`--turbo`: Q4_0 dense, top-2) | **3.5–4.9** | 3.4–3.7 | **LOSSY** |
 
-## Что сделано
+Цель 10 tok/s **не достигнута**. Ниже — почему, с цифрами.
 
-- Модель грузится полностью в RAM: prefault всех страниц при старте (9.4 с),
-  fadvise(DONTNEED) отключён, expert streaming не используется.
-- Arch-spec диспетчеризация: `general.architecture=inkling2` → отдельный
-  бэкенд, Flint не затронут.
-- 24 физических блока, 48 KV-слотов (3 прохода середины), свой KV и
-  conv-state на каждый слот.
-- Новые кванты: MXFP4, NVFP4, Q2_0, IQ1_S, IQ2_XXS, IQ2_XS (dequant
-  сверен с ggml-референсом, 174 теста).
-- Токенайзер: `pre=inkling2` (GPT4O), спецтокены по строке, промпт по
-  chat-template (effort 0.9). Токенизация промпта сверена с llama.cpp
-  id-в-id.
-- Forward: relative bias, shortconv (static+dynamic), qk/rel clip, sinks,
-  tau log-scaling, depth-mix residual, loop-контроллеры (legacy-раскладка
-  Unsloth), fused gate_up + per-expert scale, SiTU, final softcap.
+## Что работает
 
-## Найденные баги (исправлены)
+- Модель грузится целиком в RAM (prefault 9.14 ГБ), без стриминга экспертов.
+- Полный forward: 24 физических блока, 48 KV-слотов, 3 loop-прохода,
+  relative bias без масштаба (семантика HF/MLX), shortconv static+dynamic,
+  qk/rel clip, sinks, tau, depth-mix residual, loop-контроллеры
+  (legacy-раскладка Unsloth), fused gate_up + per-expert scale, SiTU,
+  final softcap.
+- Токенайзер Inkling (GPT4O pre, спецтокены), промпт по chat template;
+  ids сверены с llama.cpp id-в-id.
+- Кванты MXFP4/NVFP4/Q2_0/IQ1_S/IQ2_XXS/IQ2_XS добавлены и сверены с ggml.
+- Правильность: logprobs на тексте совпали с официальным Unsloth-бинарем
+  до 0.03 (например «dog» после «The quick brown fox jumps over the lazy»:
+  −0.072 против −0.071). Генерация осмысленная.
 
-1. Softcap считался как `x*cap*tanh(x/cap)` вместо `cap*tanh(x/cap)`.
-2. Dynamic conv taps: порядок был head-major, нужен lag-major (`lag + 4*head`).
-3. Q/K/V входы SWA-слоя при loop-проходе ссылались на один буфер — control
-   применялся трижды к одному и тому же.
-4. `ffn_in` затирался буфером gate_up в MoE.
-5. Переполнение `norm_states_` (5 состояний в буфере на 4).
-6. MoE: `out` и буфер down-выхода эксперта были одним и тем же `ffn_` —
-   каждый эксперт затирал накопленную сумму, в FFN шёл только последний.
+## Найденные и исправленные баги
 
-## Проверки
+1. softcap: `x*cap*tanh(x/cap)` вместо `cap*tanh(x/cap)`.
+2. dynamic conv taps: head-major вместо lag-major.
+3. SWA+loop: Q/K/V-входы ссылались на один буфер, control применялся трижды.
+4. `ffn_in` затирался буфером gate_up.
+5. Переполнение `norm_states_` на финальном depth-mix.
+6. MoE: `out` и буфер down-эксперта были одним `ffn_`, сумма экспертов
+   затиралась; в FFN шёл только последний эксперт.
+7. **Главное**: relative bias и sink в этом GGUF **не масштабируются** на
+   1/sqrt(head_dim) (семантика MLX/transformers), а mainline llama.cpp их
+   масштабирует. После переключения выход стал корректным.
 
-- Инкрементальный декод == полный пересчёт: maxdiff 0.0000.
-- Независимый numpy-референс слоёв 0..17 (attention/conv/depth-mix, FFN
-  отключён): maxdiff ≤ 0.012, cos = 1.0 на позиции 8.
-- Токенайзер: ids промпта совпали с llama.cpp.
-- Кванты: dequant против ggml, 1800 случайных блоков, worst rel 5e-9.
+## Ядра (NEON dotprod, ActQ8)
 
-## Статус
+Добавлены/включены: Q2_0, MXFP4, NVFP4, IQ1_S, IQ2_XXS, IQ2_XS, Q6_K;
+Q4_K включён по умолчанию. Все проверены против скалярного dequant
+(тесты 184/184, 9826 assertions).
 
-**Модель работает.** Корневая причина расхождения: в этом GGUF relative
-bias и sink применяются **без масштаба** (семантика MLX/transformers), а не
-делятся на sqrt(head_dim), как в mainline llama.cpp. После переключения
-наши logprobs совпали с официальным Unsloth-бинарем до 0.03 на одном тексте
-(например, «dog» после «The quick brown fox jumps over the lazy»: −0.072
-против −0.071). Генерация осмысленная:
-«The user asks "What is 2+2? Answer with one number." ...».
+Замеры `kbench` на реальных строках модели (короткий burst, 43 °C):
 
-Полностью подтверждены numpy-референсом: attention/conv/depth-mix всех 48
-применений (maxdiff ≤ 0.012), loop-сообщения и контроллеры pass1/2, MoE на
-слоях 0 (IQ1_S/Q2_0) и 9 (IQ2_S/NVFP4), output mix и голова Q4_K.
-Dequant Q4_K и IQ4_XS сверены с ggml побитово (maxdiff 0).
+| тензор | квант | ГБ/с | Gweight/s |
+|---|---|---:|---:|
+| blk.0.attn_q | Q6_K | 22–23 | 28 |
+| blk.6.ffn_gate_up | IQ1_S | 4.8 | 24.6 |
+| blk.6.ffn_down | Q2_0 | 7–11 | 25–41 |
+| blk.9.ffn_gate_up | IQ2_S | 4.5 | 14 |
+| output | Q4_K | 21.5 burst → 9 sustained | 38 → 16 |
 
-## Скорость
+Узкое место — grid-кванты экспертов (IQ1_S/IQ2_*): 14–25 Gweight/s,
+и падение полосы при нагреве.
 
-Текущая: **0.72 tok/s decode, ~0.6 tok/s prefill** после Q8_0 hot-конверсии
-dense+output и NEON-ядер для поддерживаемых квантов. Модель целиком в RAM.
-Осталось узкое место — экспертные IQ1_S/IQ2_XXS/IQ2_XS/Q2_0/NVFP4/MXFP4:
-для них нет NEON dotprod, работает скалярный dequant. Потолок по байтам
-~1.8 ГБ/токен при 25.7 ГБ/с — ~12 tok/s; нужны ядра, expert cache и
-батч-префилл.
+## Профиль одного токена (normal, 43 °C)
+
+`TOKSHIT_INK_PROF=1`, позиция 8:
+
+- dense matvec + router + голова: **182 мс**
+- MoE (8 экспертов, gate_up+down): **234 мс**
+- итого ~0.42 с/токен → 2.4 tok/s.
+
+Dense: ~0.76 ГБ/токен (attention Q6_K/Q5_K/Q4_K + output Q4_K) при
+эффективных ~4–5 ГБ/с. MoE: ~0.65 ГБ экспертов при ~2.8 ГБ/с.
+`NOFFN` даёт 5.1 tok/s — значит эксперты это ~57% времени.
+
+## Почему 10 tok/s недостижимы
+
+Байты на токен (normal): ~1.4 ГБ. Для 10 tok/s нужно **14 ГБ/с
+устойчиво**. Замеры устройства: 22 ГБ/с — короткий burst на холодном
+тензоре; при длительной нагрузке 9 ГБ/с, при 51 °C и выше — 4–5 ГБ/с.
+Даже турбо (Q4_0 dense + top-2, ~0.77 ГБ/токен) требует 7.7 ГБ/с и на
+практике даёт 3.5–4.9 tok/s, потому что упирается в compute grid-ядер и
+троттлинг.
+
+Физический потолок нормального декода на этом телефоне для данной модели:
+**~6 tok/s на холодном устройстве** (1.4 ГБ × 6 = 8.4 ГБ/с, без учёта
+compute), реалистично 4–5. Турбо: **~5–7** на холодном.
+
+## Что дало бы больше
+
+1. **Батч-префилл** (веса читаются один раз на чанк) — цель prefill 20–50.
+2. **Спекулятивный dspark** (0.4 ГБ драфтер, block size 8): 2–3 принятых
+   токена за проход target, эффективно ×1.5–2. Но нужен taps looped-слоёв.
+3. **Экспертный кэш в AHB** с учётом частот: +10–20%.
+4. **i8mm/двухстрочные IQ-ядра**: +20–40% на экспертах.
+5. Охлаждение: при 43 °C против 51 °C разница ~1.5×.
+
+## Память
+
+- Модель 9.14 ГБ в page cache (prefault), anon ~1 ГБ (KV 128 ctx, workspace).
+- MemAvailable в прогонах 4.6–8.9 ГБ; hot Q8_0 (1.17 ГБ) теперь opt-in,
+  по умолчанию не используется.
+- Один процесс модели, все прогоны через `safe_run.sh`.
+- Инцидент: попытка положить 1.17 ГБ hot-весов в AHB закончилась
+  перезагрузкой устройства (переполнение памяти на границе). AHB-вариант
+  откатан; текущий код стабилен.
+
+## Артефакты
+
+- Ветка `feat/inkling2`, коммиты: кванты, токенайзер, forward, hot Q8,
+  ядра Q2_0/MXFP4/NVFP4/IQ1_S/IQ2_XXS/IQ2_XS/Q6_K, turbo.
+- `build/tokshit_tests`: 184/184.
+- `dumptensor` — дамп тензора для сверки с эталоном.
+- `fixes.md`/чужие правки не тронуты.
