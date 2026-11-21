@@ -426,6 +426,8 @@ void Inkling2::attention(const InkLayer& L, std::size_t slot, std::size_t pos,
 void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
   const std::size_t h = hidden_;
   const std::size_t nff = n_ff_exp_;
+  const std::size_t used =
+      router_topk_ != 0 && router_topk_ < n_used_ ? router_topk_ : n_used_;
   matvec(L.gate_inp, x, router_.data());
 
   // sigmoid + bias, top-k
@@ -433,7 +435,7 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     router_[e] = sigmoidf(router_[e]) + L.exp_probs_b[e];
   }
   std::fill(top_.begin(), top_.end(), -1);
-  for (std::size_t k = 0; k < n_used_; ++k) {
+  for (std::size_t k = 0; k < used; ++k) {
     int best = -1;
     float bv = -1e30F;
     for (std::size_t e = 0; e < n_expert_; ++e) {
@@ -449,7 +451,7 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
   }
   // веса из несмещённых sigmoid-вероятностей
   float sum = 0.0F;
-  for (std::size_t k = 0; k < n_used_; ++k) {
+  for (std::size_t k = 0; k < used; ++k) {
     float p = 0.0F;
     if (top_[k] >= 0) {
       const std::size_t e = static_cast<std::size_t>(top_[k]);
@@ -460,7 +462,7 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     sum += p;
   }
   const float inv = 1.0F / (sum + 1e-20F);
-  for (std::size_t k = 0; k < n_used_; ++k) {
+  for (std::size_t k = 0; k < used; ++k) {
     wts_[k] *= inv;
     if (expert_scale_ != 0.0F) wts_[k] *= expert_scale_;
   }
@@ -487,11 +489,11 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     job.x = x;
     job.x_stride = 0;
     job.out = gu_all_.data();
-    const std::size_t tasks = static_cast<std::size_t>(n_used_) * job.chunks;
+    const std::size_t tasks = used * job.chunks;
     pool::run_tasks(tasks, expert_task, &job);
   }
 
-  for (std::size_t k = 0; k < n_used_; ++k) {
+  for (std::size_t k = 0; k < used; ++k) {
     const std::size_t e = static_cast<std::size_t>(top_[k]);
     const float* gu = gu_all_.data() + k * 2 * nff;
     const float gs = L.gate_up_scale.empty() ? 1.0F : L.gate_up_scale[e];
@@ -523,11 +525,11 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     job.x = act_all_.data();
     job.x_stride = static_cast<std::uint32_t>(nff);
     job.out = down_all_.data();
-    const std::size_t tasks = static_cast<std::size_t>(n_used_) * job.chunks;
+    const std::size_t tasks = used * job.chunks;
     pool::run_tasks(tasks, expert_task, &job);
   }
 
-  for (std::size_t k = 0; k < n_used_; ++k) {
+  for (std::size_t k = 0; k < used; ++k) {
     const std::size_t e = static_cast<std::size_t>(top_[k]);
     const float w = wts_[k] * (L.down_scale.empty() ? 1.0F : L.down_scale[e]);
     const float* src = down_all_.data() + k * h;

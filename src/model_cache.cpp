@@ -327,7 +327,10 @@ bool Model::load_freq_profile(const std::string& path) {
 // модели. веса при k_used=1 вырождаются в единицу — черновик читает в n_used
 // раз меньше байтов с диска и считается пропорционально быстрее
 void Model::set_router_topk(std::size_t k) {
-  if (ink_) return;
+  if (ink_) {
+    ink_->set_router_topk(k);
+    return;
+  }
   router_topk_ = k;
 }
 

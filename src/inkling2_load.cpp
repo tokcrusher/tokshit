@@ -414,25 +414,33 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
   w.top_.assign(m->n_used_, 0);
   w.wts_.assign(m->n_used_, 0.0F);
 
-  // Горячие dense-веса и голова — в Q8_0. По умолчанию выключено: для
-  // Q6_K/Q4_K теперь есть NEON-ядра, и исходные кванты занимают меньше
-  // памяти и полосы. TOKSHIT_INK_HOT=1 включает старую конверсию.
-  const bool hot_conv = [] {
-    const char* v = std::getenv("TOKSHIT_INK_HOT");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
-  }();
-  if (hot_conv && kernels::has_neon_dot(QuantType::Q8_0)) {
-    auto rb8_of = [](const InkMeta& meta) -> std::size_t {
-      const auto rb = row_bytes(QuantType::Q8_0, meta.in_dim);
+  // Горячие dense-веса и голова. По умолчанию выключено: Q6_K/Q4_K имеют
+  // NEON-ядра, исходные кванты занимают меньше памяти.
+  //   TOKSHIT_HOT_Q4=1  -> Q4_0 (turbo, LOSSY)
+  //   TOKSHIT_INK_HOT=1 -> Q8_0 (точнее, больше памяти)
+  QuantType hot_target = QuantType::F32;
+  {
+    const char* hq = std::getenv("TOKSHIT_HOT_Q4");
+    const char* hi = std::getenv("TOKSHIT_INK_HOT");
+    if (hq != nullptr && hq[0] != '\0' && hq[0] != '0') {
+      hot_target = QuantType::Q4_0;
+    } else if (hi != nullptr && hi[0] != '\0' && hi[0] != '0') {
+      hot_target = QuantType::Q8_0;
+    }
+  }
+  if (hot_target != QuantType::F32 &&
+      kernels::has_neon_dot(hot_target)) {
+    auto rb_of = [&](const InkMeta& meta) -> std::size_t {
+      const auto rb = row_bytes(hot_target, meta.in_dim);
       return rb.ok() ? static_cast<std::size_t>(rb.value()) : 0;
     };
     std::size_t need = 0;
     auto plan = [&](const InkMeta& meta) {
-      if (meta.base == 0 || meta.quant == QuantType::Q8_0 ||
+      if (meta.base == 0 || meta.quant == hot_target ||
           meta.quant == QuantType::F32 || meta.quant == QuantType::Bf16) {
         return;
       }
-      const std::size_t rb = rb8_of(meta);
+      const std::size_t rb = rb_of(meta);
       if (rb != 0) need += rb * meta.rows;
     };
     for (const auto& L : m->layers_) {
@@ -442,11 +450,11 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
     m->hot_.resize(need);
     std::size_t off = 0;
     auto convert = [&](InkMeta& meta) {
-      if (meta.base == 0 || meta.quant == QuantType::Q8_0 ||
+      if (meta.base == 0 || meta.quant == hot_target ||
           meta.quant == QuantType::F32 || meta.quant == QuantType::Bf16) {
         return;
       }
-      const std::size_t rb = rb8_of(meta);
+      const std::size_t rb = rb_of(meta);
       if (rb == 0) return;
       const std::size_t numel =
           static_cast<std::size_t>(meta.in_dim) * meta.rows;
@@ -456,13 +464,15 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
               static_cast<std::size_t>(meta.rb) * meta.rows), numel,
           std::span<float>(tmp.data(), tmp.size()));
       if (!deq.ok()) return;
-      const auto q = quantize_q8_0_into(
-          std::span<const float>(tmp.data(), tmp.size()),
-          std::span<uint8_t>(m->hot_.data() + off, rb * meta.rows));
+      const std::span<const float> xf(tmp.data(), tmp.size());
+      const std::span<uint8_t> dst(m->hot_.data() + off, rb * meta.rows);
+      const auto q = hot_target == QuantType::Q4_0
+                         ? quantize_q4_0_into(xf, dst)
+                         : quantize_q8_0_into(xf, dst);
       if (!q.ok()) return;
       meta.base = off;
       meta.rb = static_cast<uint32_t>(rb);
-      meta.quant = QuantType::Q8_0;
+      meta.quant = hot_target;
       meta.hot = true;
       off += rb * meta.rows;
     };
@@ -472,7 +482,8 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
     }
     convert(m->out_);
     m->hot_.resize(off);
-    std::fprintf(stderr, "[inkling2] hot Q8_0: %.2f GB\n",
+    std::fprintf(stderr, "[inkling2] hot %s: %.2f GB\n",
+                 hot_target == QuantType::Q4_0 ? "Q4_0" : "Q8_0",
                  static_cast<double>(off) / 1e9);
   }
 

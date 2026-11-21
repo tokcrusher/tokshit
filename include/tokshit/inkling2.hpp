@@ -83,6 +83,7 @@ class Inkling2 {
   [[nodiscard]] std::size_t n_phys() const noexcept { return n_phys_; }
   [[nodiscard]] std::size_t n_experts() const noexcept { return n_expert_; }
   [[nodiscard]] std::size_t n_used() const noexcept { return n_used_; }
+  void set_router_topk(std::size_t k) noexcept { router_topk_ = k; }
   [[nodiscard]] std::size_t kv_ctx() const noexcept { return kv_ctx_; }
 
  private:
@@ -141,6 +142,7 @@ class Inkling2 {
   std::size_t head_dim_ = 0;
   std::size_t n_expert_ = 0;
   std::size_t n_used_ = 0;
+  std::size_t router_topk_ = 0;
   std::size_t n_ff_exp_ = 0;
   std::size_t n_relative_ = 0;
   std::size_t relative_extent_ = 0;
