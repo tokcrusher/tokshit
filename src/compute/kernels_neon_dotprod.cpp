@@ -1261,6 +1261,147 @@ float dot_nvfp4(const std::uint8_t* row, const ActQ8& act,
   return vaddvq_f32(acc);
 }
 
+
+// ---- iq1_s: 256 весов, 8 кодов решётки по 8 значений + дельта 0.125.
+// в отличие от q8_K-версии, активация квантована по 32, поэтому каждый
+// 32-сабблок считает свой bsum и свою шкалу активации.
+float dot_iq1s(const std::uint8_t* row, const ActQ8& act,
+               std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 50;
+  constexpr float kDelta = 0.125F;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float total = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const std::size_t base = b * kBs;
+    const float d = load_f16(row + base);
+    const std::uint8_t* qs = row + base + 2;
+    const std::uint16_t* qh =
+        reinterpret_cast<const std::uint16_t*>(row + base + 34);
+    float acc = 0.0F;
+    for (std::size_t j = 0; j < 8; ++j) {
+      const std::uint32_t q = qh[j];
+      const std::uint32_t idx0 =
+          static_cast<std::uint32_t>(qs[4 * j + 0]) | ((q << 8) & 0x700U);
+      const std::uint32_t idx1 =
+          static_cast<std::uint32_t>(qs[4 * j + 1]) | ((q << 5) & 0x700U);
+      const std::uint32_t idx2 =
+          static_cast<std::uint32_t>(qs[4 * j + 2]) | ((q << 2) & 0x700U);
+      const std::uint32_t idx3 =
+          static_cast<std::uint32_t>(qs[4 * j + 3]) | ((q >> 1) & 0x700U);
+      const int8x8_t g0 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &dequant_tables::iq1s_grid[idx0]));
+      const int8x8_t g1 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &dequant_tables::iq1s_grid[idx1]));
+      const int8x8_t g2 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &dequant_tables::iq1s_grid[idx2]));
+      const int8x8_t g3 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &dequant_tables::iq1s_grid[idx3]));
+      const std::size_t a = b * 256 + j * 32;
+      int32x4_t p = vdotq_s32(vdupq_n_s32(0), vcombine_s8(g0, g1),
+                              vld1q_s8(ap + a));
+      p = vdotq_s32(p, vcombine_s8(g2, g3), vld1q_s8(ap + a + 16));
+      const int psum = vaddvq_s32(p);
+      const int bsum = vaddlvq_s8(vld1q_s8(ap + a)) +
+                       vaddlvq_s8(vld1q_s8(ap + a + 16));
+      const float ls = 2.0F * static_cast<float>((q >> 12) & 7U) + 1.0F;
+      const float sign = (q & 0x8000U) != 0 ? -1.0F : 1.0F;
+      acc += (static_cast<float>(psum) +
+              kDelta * sign * static_cast<float>(bsum)) *
+             ls * sp[a >> 5];
+    }
+    total += d * acc;
+  }
+  return total;
+}
+
+
+// ---- iq2_xxs: 256 весов, 32 кода по 8 значений, знаки — чётные 7-битные
+// маски. шкала 0.5+3bit на 32-сабблок, активация — своя на 32.
+float dot_iq2xxs(const std::uint8_t* row, const ActQ8& act,
+                 std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 66;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float total = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const std::size_t base = b * kBs;
+    const float d = load_f16(row + base);
+    const std::uint8_t* qp = row + base + 2;
+    float acc = 0.0F;
+    for (std::size_t k = 0; k < 4; ++k) {
+      std::uint32_t aux[4];
+      std::memcpy(aux, qp + k * 16, 16);
+      const std::uint8_t* aux8 = reinterpret_cast<const std::uint8_t*>(aux);
+      const std::uint32_t idx[8] = {aux8[0], aux8[1], aux8[2], aux8[3],
+                                    aux8[8], aux8[9], aux8[10], aux8[11]};
+      const std::uint32_t sgn[8] = {(aux[1] >> 0) & 127U, (aux[1] >> 7) & 127U,
+                                    (aux[1] >> 14) & 127U, (aux[1] >> 21) & 127U,
+                                    (aux[3] >> 0) & 127U, (aux[3] >> 7) & 127U,
+                                    (aux[3] >> 14) & 127U, (aux[3] >> 21) & 127U};
+      const float sub1 = 0.5F + static_cast<float>(aux[1] >> 28);
+      const float sub2 = 0.5F + static_cast<float>(aux[3] >> 28);
+      for (std::size_t c = 0; c < 8; ++c) {
+        const int8x8_t g = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq2xxs_grid[idx[c]]));
+        const int8x8_t m = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &kMask8[tables::ksigns_iq2xs[sgn[c]]]));
+        const int8x8_t w = vsub_s8(veor_s8(g, m), m);
+        const std::size_t a = b * 256 + k * 64 + c * 8;
+        const int32x2_t p =
+            vdot_s32(vdup_n_s32(0), w, vld1_s8(ap + a));
+        acc += static_cast<float>(vget_lane_s32(p, 0) + vget_lane_s32(p, 1)) *
+               (c < 4 ? sub1 : sub2) * sp[a >> 5];
+      }
+    }
+    total += d * acc;
+  }
+  return 0.25F * total;
+}
+
+// ---- iq2_xs: 9-битный код решётки + 7-битные знаки в uint16; 4 шкалы
+// (2*4bit+1) на 64 веса.
+float dot_iq2xs(const std::uint8_t* row, const ActQ8& act,
+                std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 74;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float total = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const std::size_t base = b * kBs;
+    const float d = load_f16(row + base);
+    const std::uint16_t* qs =
+        reinterpret_cast<const std::uint16_t*>(row + base + 2);
+    const std::uint8_t* scales = row + base + 66;
+    float acc = 0.0F;
+    for (std::size_t k = 0; k < 4; ++k) {
+      for (std::size_t c = 0; c < 8; ++c) {
+        const std::uint16_t code = qs[k * 8 + c];
+        const int8x8_t g = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq2xs_grid[code & 511U]));
+        const int8x8_t m = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &kMask8[tables::ksigns_iq2xs[code >> 9]]));
+        const int8x8_t w = vsub_s8(veor_s8(g, m), m);
+        const std::size_t a = b * 256 + k * 64 + c * 8;
+        const int32x2_t p =
+            vdot_s32(vdup_n_s32(0), w, vld1_s8(ap + a));
+        const std::size_t si = 4 * k + c / 2;
+        const std::uint8_t sc = scales[si / 2];
+        const float ws = 2.0F * static_cast<float>(
+                                    (sc >> (4 * (si % 2))) & 0x0F) +
+                         1.0F;
+        acc += static_cast<float>(vget_lane_s32(p, 0) + vget_lane_s32(p, 1)) *
+               ws * sp[a >> 5];
+      }
+    }
+    total += d * acc;
+  }
+  return 0.125F * total;
+}
+
 }  // namespace tokshit::kernels::neon
 
 #endif  // __aarch64__ && TOKSHIT_HAVE_NEON_DOTPROD
