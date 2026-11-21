@@ -9,6 +9,7 @@
 
 #include "tokshit/dequant.hpp"
 #include "tokshit/gguf.hpp"
+#include "tokshit/kernels.hpp"
 #include "tokshit/mmap.hpp"
 
 namespace tokshit {
@@ -408,6 +409,63 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
   w.router_.assign(m->n_expert_, 0.0F);
   w.top_.assign(m->n_used_, 0);
   w.wts_.assign(m->n_used_, 0.0F);
+
+  // Горячие dense-веса и голова — в Q8_0: у него есть NEON-ядро, а исходные
+  // Q6_K/Q5_K/Q4_K/IQ3_XXS деквантуются скалярно на каждом токене.
+  if (kernels::has_neon_dot(QuantType::Q8_0)) {
+    auto rb8_of = [](const InkMeta& meta) -> std::size_t {
+      const auto rb = row_bytes(QuantType::Q8_0, meta.in_dim);
+      return rb.ok() ? static_cast<std::size_t>(rb.value()) : 0;
+    };
+    std::size_t need = 0;
+    auto plan = [&](const InkMeta& meta) {
+      if (meta.base == 0 || meta.quant == QuantType::Q8_0 ||
+          meta.quant == QuantType::F32 || meta.quant == QuantType::Bf16) {
+        return;
+      }
+      const std::size_t rb = rb8_of(meta);
+      if (rb != 0) need += rb * meta.rows;
+    };
+    for (const auto& L : m->layers_) {
+      plan(L.q); plan(L.k); plan(L.v); plan(L.o); plan(L.gate); plan(L.rel);
+    }
+    plan(m->out_);
+    m->hot_.resize(need);
+    std::size_t off = 0;
+    auto convert = [&](InkMeta& meta) {
+      if (meta.base == 0 || meta.quant == QuantType::Q8_0 ||
+          meta.quant == QuantType::F32 || meta.quant == QuantType::Bf16) {
+        return;
+      }
+      const std::size_t rb = rb8_of(meta);
+      if (rb == 0) return;
+      const std::size_t numel =
+          static_cast<std::size_t>(meta.in_dim) * meta.rows;
+      std::vector<float> tmp(numel);
+      const auto deq = dequant_into(
+          meta.quant, std::span<const uint8_t>(m->data_ + meta.base,
+              static_cast<std::size_t>(meta.rb) * meta.rows), numel,
+          std::span<float>(tmp.data(), tmp.size()));
+      if (!deq.ok()) return;
+      const auto q = quantize_q8_0_into(
+          std::span<const float>(tmp.data(), tmp.size()),
+          std::span<uint8_t>(m->hot_.data() + off, rb * meta.rows));
+      if (!q.ok()) return;
+      meta.base = off;
+      meta.rb = static_cast<uint32_t>(rb);
+      meta.quant = QuantType::Q8_0;
+      meta.hot = true;
+      off += rb * meta.rows;
+    };
+    for (auto& L : m->layers_) {
+      convert(L.q); convert(L.k); convert(L.v); convert(L.o); convert(L.gate);
+      convert(L.rel);
+    }
+    convert(m->out_);
+    m->hot_.resize(off);
+    std::fprintf(stderr, "[inkling2] hot Q8_0: %.2f GB\n",
+                 static_cast<double>(off) / 1e9);
+  }
 
   std::fprintf(stderr,
                "[inkling2] phys=%zu slots=%zu passes=%zu core=[%zu,%zu) "

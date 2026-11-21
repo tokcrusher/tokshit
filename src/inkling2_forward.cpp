@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "tokshit/dequant.hpp"
+#include "tokshit/kernels.hpp"
 #include "tokshit/pool.hpp"
 
 namespace tokshit {
@@ -22,6 +23,7 @@ struct MvTask {
   QuantType quant = QuantType::F32;
   const float* x = nullptr;
   float* y = nullptr;
+  const kernels::ActQ8* act = nullptr;
 };
 
 void matvec_task(void* ctx, std::size_t r) {
@@ -40,6 +42,10 @@ void matvec_task(void* ctx, std::size_t r) {
       std::memcpy(&f, &bits, sizeof(f));
       acc += f * t.x[i];
     }
+  } else if (t.act != nullptr) {
+    acc = kernels::dot_row(
+        t.quant, std::span<const uint8_t>(row, t.rb), t.rb,
+        std::span<const float>(t.x, t.in), *t.act, t.in, buf);
   } else {
     buf.resize(t.in);
     const auto deq = dequant_into(t.quant,
@@ -72,13 +78,18 @@ void Inkling2::matvec(const InkMeta& m, const float* x, float* y) {
 void Inkling2::matvec(const InkMeta& m, const float* x, float* y,
                       float*) {
   MvTask t;
-  t.data = data_ + m.base;
+  t.data = (m.hot ? hot_.data() : data_) + m.base;
   t.rows = m.rows;
   t.rb = m.rb;
   t.in = m.in_dim;
   t.quant = m.quant;
   t.x = x;
   t.y = y;
+  kernels::ActQ8 act;
+  if (m.quant != QuantType::F32 && m.quant != QuantType::Bf16) {
+    kernels::quantize_into(std::span<const float>(x, m.in_dim), act);
+    t.act = &act;
+  }
   if (m.rows >= 64 && std::getenv("TOKSHIT_INK_SERIAL") == nullptr) {
     pool::run_tasks(m.rows, matvec_task, &t);
   } else {

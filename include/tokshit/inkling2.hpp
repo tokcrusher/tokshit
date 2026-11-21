@@ -22,6 +22,7 @@ struct InkMeta {
   uint32_t rows = 0;
   uint32_t rb = 0;
   QuantType quant = QuantType::F32;
+  bool hot = false;  // base — смещение в hot_ (Q8_0), а не в файле
 };
 
 // Один физический блок Inkling-2. Луп-поля заполняются только у core-блоков.
@@ -163,6 +164,7 @@ class Inkling2 {
   std::vector<int> top_;
   std::vector<float> wts_;
   std::vector<float> router_;
+  std::vector<uint8_t> hot_;  // Q8_0 dense + output, один буфер
   std::size_t cur_slot_ = 0;
 };
 
