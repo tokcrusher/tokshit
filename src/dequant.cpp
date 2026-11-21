@@ -1,12 +1,14 @@
 #include "tokshit/dequant.hpp"
 
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <string>
 
+#include "dequant_tables.hpp"
 #include "tokshit/gguf_tables.hpp"
 
 namespace tokshit {
@@ -24,6 +26,28 @@ namespace {
          (static_cast<uint32_t>(src[off + 3]) << 24);
 }
 
+// ggml_e8m0_to_fp32_half. The E2M1 table is doubled, so the scale is half of
+// the E8M0 value: e=127 -> 0.5, e=128 -> 1.0.
+[[nodiscard]] float e8m0_to_fp32_half(uint8_t x) noexcept {
+  const uint32_t bits =
+      x < 2 ? (0x00200000u << x) : (static_cast<uint32_t>(x - 1) << 23);
+  return std::bit_cast<float>(bits);
+}
+
+// ggml_ue4m3_to_fp32: unsigned 4-bit exponent (bias 7), 3-bit mantissa.
+// Returns value * 0.5 to match the doubled kvalues_fp4 table.
+[[nodiscard]] float ue4m3_to_fp32(uint8_t x) noexcept {
+  if (x == 0 || x == 0x7F) {
+    return 0.0F;
+  }
+  const int exp = (x >> 3) & 0xF;
+  const int man = x & 0x7;
+  const float raw =
+      exp == 0 ? std::ldexp(static_cast<float>(man), -9)
+               : std::ldexp(1.0F + static_cast<float>(man) / 8.0F, exp - 7);
+  return raw * 0.5F;
+}
+
 [[nodiscard]] bool dequant_supported(QuantType quant) noexcept {
   switch (quant) {
     case QuantType::F32:
@@ -38,6 +62,12 @@ namespace {
     case QuantType::Iq3Xxs:
     case QuantType::Iq3S:
     case QuantType::Iq4Xs:
+    case QuantType::Mxfp4:
+    case QuantType::Nvfp4:
+    case QuantType::Q2_0:
+    case QuantType::Iq1S:
+    case QuantType::Iq2Xxs:
+    case QuantType::Iq2Xs:
       return true;
     default:
       return false;
@@ -80,6 +110,154 @@ void dequant_bf16(const uint8_t* src, size_t numel, float* out) noexcept {
   for (size_t i = 0; i < numel; ++i) {
     out[i] = std::bit_cast<float>(static_cast<uint32_t>(read_u16(src, i * 2))
                                   << 16);
+  }
+}
+
+void dequant_q2_0(const uint8_t* src, size_t numel, float* out) noexcept {
+  constexpr size_t kQk = 64;
+  constexpr size_t kBs = 18;
+  const size_t nb = numel / kQk;
+  size_t y = 0;
+  for (size_t b = 0; b < nb; ++b) {
+    const size_t base = b * kBs;
+    const float d = f16_to_f32(read_u16(src, base));
+    for (size_t j = 0; j < kQk; ++j) {
+      const uint8_t q =
+          (src[base + 2 + j / 4] >> ((j % 4) * 2)) & 0x03u;
+      // 00=-1, 01=0, 10=+1, 11=+2
+      out[y++] = static_cast<float>(static_cast<int32_t>(q) - 1) * d;
+    }
+  }
+}
+
+void dequant_mxfp4(const uint8_t* src, size_t numel, float* out) noexcept {
+  constexpr size_t kQk = 32;
+  constexpr size_t kBs = 17;
+  const size_t nb = numel / kQk;
+  size_t y = 0;
+  for (size_t b = 0; b < nb; ++b) {
+    const size_t base = b * kBs;
+    const float d = e8m0_to_fp32_half(src[base]);
+    for (size_t j = 0; j < kQk / 2; ++j) {
+      const int8_t v0 =
+          dequant_tables::kvalues_fp4[src[base + 1 + j] & 0x0Fu];
+      const int8_t v1 = dequant_tables::kvalues_fp4[src[base + 1 + j] >> 4];
+      out[y + j] = static_cast<float>(v0) * d;
+      out[y + j + kQk / 2] = static_cast<float>(v1) * d;
+    }
+    y += kQk;
+  }
+}
+
+void dequant_nvfp4(const uint8_t* src, size_t numel, float* out) noexcept {
+  constexpr size_t kQk = 64;
+  constexpr size_t kBs = 36;
+  constexpr size_t kQkSub = 16;
+  const size_t nb = numel / kQk;
+  size_t y = 0;
+  for (size_t b = 0; b < nb; ++b) {
+    const size_t base = b * kBs;
+    for (size_t s = 0; s < kQk / kQkSub; ++s) {
+      const float d = ue4m3_to_fp32(src[base + s]);
+      for (size_t j = 0; j < kQkSub / 2; ++j) {
+        const uint8_t q = src[base + 4 + s * (kQkSub / 2) + j];
+        const int8_t v0 = dequant_tables::kvalues_fp4[q & 0x0Fu];
+        const int8_t v1 = dequant_tables::kvalues_fp4[q >> 4];
+        out[y + s * kQkSub + j] = static_cast<float>(v0) * d;
+        out[y + s * kQkSub + j + kQkSub / 2] = static_cast<float>(v1) * d;
+      }
+    }
+    y += kQk;
+  }
+}
+
+void dequant_iq1_s(const uint8_t* src, size_t numel, float* out) noexcept {
+  constexpr size_t kQk = 256;
+  constexpr size_t kBs = 50;
+  constexpr float kDelta = 0.125F;
+  const size_t nb = numel / kQk;
+  size_t y = 0;
+  for (size_t b = 0; b < nb; ++b) {
+    const size_t base = b * kBs;
+    const float d = f16_to_f32(read_u16(src, base));
+    const uint8_t* qs = src + base + 2;
+    for (size_t ib = 0; ib < kQk / 32; ++ib) {
+      const uint16_t qh = read_u16(src, base + 34 + ib * 2);
+      const float dl = d * static_cast<float>(2 * ((qh >> 12) & 7u) + 1);
+      const float delta = (qh & 0x8000u) != 0 ? -kDelta : kDelta;
+      for (size_t l = 0; l < 4; ++l) {
+        const uint32_t idx = static_cast<uint32_t>(qs[ib * 4 + l]) |
+                             (((static_cast<uint32_t>(qh) >> (3 * l)) & 7u)
+                              << 8);
+        const uint64_t grid = dequant_tables::iq1s_grid[idx];
+        for (size_t j = 0; j < 8; ++j) {
+          const int8_t g =
+              static_cast<int8_t>(static_cast<uint8_t>(grid >> (8 * j)));
+          out[y++] = dl * (static_cast<float>(g) + delta);
+        }
+      }
+    }
+  }
+}
+
+void dequant_iq2_xxs(const uint8_t* src, size_t numel, float* out) noexcept {
+  constexpr size_t kQk = 256;
+  constexpr size_t kBs = 66;
+  const size_t nb = numel / kQk;
+  size_t y = 0;
+  for (size_t b = 0; b < nb; ++b) {
+    const size_t base = b * kBs;
+    const float d = f16_to_f32(read_u16(src, base));
+    for (size_t ib32 = 0; ib32 < kQk / 32; ++ib32) {
+      const uint32_t aux0 = read_u32(src, base + 2 + 8 * ib32);
+      const uint32_t aux1 = read_u32(src, base + 2 + 8 * ib32 + 4);
+      const float db =
+          d * (0.5F + static_cast<float>(aux1 >> 28)) * 0.25F;
+      for (size_t l = 0; l < 4; ++l) {
+        const uint8_t idx = static_cast<uint8_t>(aux0 >> (8 * l));
+        const uint64_t grid = dequant_tables::iq2xxs_grid[idx];
+        const uint8_t signs =
+            tables::ksigns_iq2xs[(aux1 >> (7 * l)) & 127u];
+        for (size_t j = 0; j < 8; ++j) {
+          const float g =
+              static_cast<float>((grid >> (8 * j)) & 0xFFu);
+          const float sign =
+              (signs & tables::kmask_iq2xs[j]) != 0 ? -1.0F : 1.0F;
+          out[y++] = db * g * sign;
+        }
+      }
+    }
+  }
+}
+
+void dequant_iq2_xs(const uint8_t* src, size_t numel, float* out) noexcept {
+  constexpr size_t kQk = 256;
+  constexpr size_t kBs = 74;
+  const size_t nb = numel / kQk;
+  size_t y = 0;
+  for (size_t b = 0; b < nb; ++b) {
+    const size_t base = b * kBs;
+    const float d = f16_to_f32(read_u16(src, base));
+    const uint8_t* scales = src + base + 66;
+    for (size_t ib32 = 0; ib32 < kQk / 32; ++ib32) {
+      const float db0 =
+          d * (0.5F + static_cast<float>(scales[ib32] & 0x0Fu)) * 0.25F;
+      const float db1 =
+          d * (0.5F + static_cast<float>(scales[ib32] >> 4)) * 0.25F;
+      for (size_t l = 0; l < 4; ++l) {
+        const uint16_t q = read_u16(src, base + 2 + (4 * ib32 + l) * 2);
+        const uint64_t grid = dequant_tables::iq2xs_grid[q & 511u];
+        const uint8_t signs = tables::ksigns_iq2xs[q >> 9];
+        const float dl = l < 2 ? db0 : db1;
+        for (size_t j = 0; j < 8; ++j) {
+          const float g =
+              static_cast<float>((grid >> (8 * j)) & 0xFFu);
+          const float sign =
+              (signs & tables::kmask_iq2xs[j]) != 0 ? -1.0F : 1.0F;
+          out[y++] = dl * g * sign;
+        }
+      }
+    }
   }
 }
 
@@ -539,6 +717,15 @@ Result<void> dequant_into(QuantType quant, std::span<const uint8_t> src,
     case QuantType::Q4_0:
       dequant_q4_0(s, n, o);
       break;
+    case QuantType::Mxfp4:
+      dequant_mxfp4(s, n, o);
+      break;
+    case QuantType::Nvfp4:
+      dequant_nvfp4(s, n, o);
+      break;
+    case QuantType::Q2_0:
+      dequant_q2_0(s, n, o);
+      break;
     case QuantType::Q4K:
       dequant_q4_k(s, n, o);
       break;
@@ -547,6 +734,15 @@ Result<void> dequant_into(QuantType quant, std::span<const uint8_t> src,
       break;
     case QuantType::Q6K:
       dequant_q6_k(s, n, o);
+      break;
+    case QuantType::Iq1S:
+      dequant_iq1_s(s, n, o);
+      break;
+    case QuantType::Iq2Xxs:
+      dequant_iq2_xxs(s, n, o);
+      break;
+    case QuantType::Iq2Xs:
+      dequant_iq2_xs(s, n, o);
       break;
     case QuantType::Iq2S:
       dequant_iq2_s(s, n, o);
