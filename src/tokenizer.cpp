@@ -252,6 +252,8 @@ BpeTokenizer::BpeTokenizer(const TokenizerMeta& meta) {
   }
 
   eog_tokens_ = meta.eog_tokens;
+  pre_ = meta.pre;
+  gpt4o_pre_ = pre_ == "inkling2" || pre_ == "gpt4o";
   bos_token_ = meta.bos_token;
   eos_token_ = meta.eos_token;
   add_bos_ = meta.add_bos;
@@ -291,6 +293,12 @@ bool BpeTokenizer::is_eog(uint32_t id) const {
   return false;
 }
 
+std::optional<uint32_t> BpeTokenizer::token_id(std::string_view token) const {
+  const auto it = tokens_.find(std::string(token));
+  if (it == tokens_.end()) return std::nullopt;
+  return it->second;
+}
+
 std::vector<uint32_t> BpeTokenizer::encode_full(std::string_view text) const {
   std::vector<uint32_t> ids = encode(text);
   if (add_bos_) ids.insert(ids.begin(), bos_token_);
@@ -307,6 +315,8 @@ BpeTokenizer::Cls BpeTokenizer::classify(char32_t c) {
 
 std::pair<size_t, size_t> BpeTokenizer::next_word(
     const std::vector<char32_t>& cpts, size_t pos) const {
+  if (gpt4o_pre_) return next_word_gpt4o(cpts, pos);
+
   const size_t n = cpts.size();
   const char32_t cp = cpts[pos];
   const Cls cls = classify(cp);
@@ -371,6 +381,118 @@ std::pair<size_t, size_t> BpeTokenizer::next_word(
   if (end == n) return {pos, end};
   if (run_len >= 2) return {pos, end - 1};
   return {pos, end};
+}
+
+// ASCII subset of the GPT-4o (inkling2) pre-tokenizer regex:
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+
+//     (?i:'s|'t|'re|'ve|'m|'ll|'d)?
+// | [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*
+//     (?i:'s|'t|'re|'ve|'m|'ll|'d)?
+// | \p{N}{1,3}
+// | ?[^\s\p{L}\p{N}]+[\r\n/]*
+// | \s*[\r\n]+
+// | \s+(?!\S)
+// | \s+
+// Multibyte letters are treated as lower-case-ish so non-ASCII words are not
+// torn apart.
+std::pair<size_t, size_t> BpeTokenizer::next_word_gpt4o(
+    const std::vector<char32_t>& cpts, size_t pos) const {
+  const size_t n = cpts.size();
+  const char32_t cp = cpts[pos];
+
+  auto is_letter = [](char32_t c) {
+    return BpeTokenizer::classify(c) == Cls::Letter;
+  };
+  auto is_number = [](char32_t c) {
+    return BpeTokenizer::classify(c) == Cls::Number;
+  };
+  auto is_newline = [](char32_t c) { return c == U'\r' || c == U'\n'; };
+  auto is_upper = [](char32_t c) { return c >= U'A' && c <= U'Z'; };
+  auto is_lower = [](char32_t c) {
+    return (c >= U'a' && c <= U'z') ||
+           (c >= 0x80 && BpeTokenizer::classify(c) == Cls::Letter);
+  };
+
+  auto with_contraction = [&](size_t end) {
+    if (end >= n || cpts[end] != U'\'') return end;
+    if (end + 1 < n) {
+      const char32_t c1 = to_ascii_lower(cpts[end + 1]);
+      if (c1 == U's' || c1 == U't' || c1 == U'm' || c1 == U'd') {
+        return end + 2;
+      }
+      if (end + 2 < n) {
+        const char32_t c2 = to_ascii_lower(cpts[end + 2]);
+        if ((c1 == U'r' && c2 == U'e') || (c1 == U'v' && c2 == U'e') ||
+            (c1 == U'l' && c2 == U'l')) {
+          return end + 3;
+        }
+      }
+    }
+    return end;
+  };
+
+  // Optional prefix is anything but CR/LF, a letter or a digit. That keeps
+  // " Hello", "(foo", "'s" in one pre-token, matching the regex alternatives.
+  const bool prefixed = !is_letter(cp) && !is_number(cp) && !is_newline(cp) &&
+                        pos + 1 < n && is_letter(cpts[pos + 1]);
+  if (is_letter(cp) || prefixed) {
+    const size_t start = is_letter(cp) ? pos : pos + 1;
+
+    // upper* lower+ -- lowercase and TitleCase words.
+    size_t end = start;
+    while (end < n && is_upper(cpts[end])) ++end;
+    if (end < n && is_lower(cpts[end])) {
+      do {
+        ++end;
+      } while (end < n && is_lower(cpts[end]));
+      return {pos, with_contraction(end)};
+    }
+
+    // upper+ lower* -- ALLCAPS and lone capitals.
+    end = start;
+    if (is_upper(cpts[end])) {
+      do {
+        ++end;
+      } while (end < n && is_upper(cpts[end]));
+      while (end < n && is_lower(cpts[end])) ++end;
+      return {pos, with_contraction(end)};
+    }
+  }
+
+  if (is_number(cp)) {
+    size_t end = pos + 1;
+    while (end < n && end - pos < 3 && is_number(cpts[end])) ++end;
+    return {pos, end};
+  }
+
+  auto is_punct = [](char32_t c) {
+    return !is_unicode_space(c) && BpeTokenizer::classify(c) == Cls::Other;
+  };
+  if (is_punct(cp) ||
+      (cp == U' ' && pos + 1 < n && is_punct(cpts[pos + 1]))) {
+    size_t end = cp == U' ' ? pos + 1 : pos;
+    while (end < n && is_punct(cpts[end])) ++end;
+    while (end < n && (is_newline(cpts[end]) || cpts[end] == U'/')) ++end;
+    return {pos, end};
+  }
+
+  size_t run_end = pos;
+  while (run_end < n && is_unicode_space(cpts[run_end])) ++run_end;
+
+  // \s*[\r\n]+ -- whitespace up to and including the last newline in the run.
+  size_t last_newline = pos;
+  for (size_t i = run_end; i > pos; --i) {
+    if (is_newline(cpts[i - 1])) {
+      last_newline = i;
+      break;
+    }
+  }
+  if (last_newline > pos) return {pos, last_newline};
+
+  // \s+(?!\S) leaves one space for the next word; \s+ eats trailing runs.
+  if (run_end == n) return {pos, run_end};
+  if (run_end - pos >= 2) return {pos, run_end - 1};
+  return {pos, run_end};
 }
 
 std::vector<uint32_t> BpeTokenizer::encode_word(std::string_view word) const {
@@ -480,15 +602,31 @@ Result<BpeTokenizer> build_tokenizer(const Gguf& gguf) {
   }
   if (eog.empty()) eog.push_back(eos);
 
+  std::string pre;
+  if (auto r = gguf.get("tokenizer.ggml.pre"); r.ok()) {
+    if (const auto s = r.value()->as_str(); s.has_value()) {
+      pre = std::string(*s);
+    }
+  }
+  bool add_bos = false;
+  if (auto r = gguf.get("tokenizer.ggml.add_bos_token"); r.ok()) {
+    if (const auto b = r.value()->as_bool(); b.has_value()) add_bos = *b;
+  }
+  bool add_eos = false;
+  if (auto r = gguf.get("tokenizer.ggml.add_eos_token"); r.ok()) {
+    if (const auto b = r.value()->as_bool(); b.has_value()) add_eos = *b;
+  }
+
   TokenizerMeta meta;
   meta.tokens = std::move(tokens);
   meta.merges = std::move(merges);
   meta.token_types = std::move(token_types);
   meta.eog_tokens = std::move(eog);
+  meta.pre = std::move(pre);
   meta.bos_token = bos;
   meta.eos_token = eos;
-  meta.add_bos = false;
-  meta.add_eos = false;
+  meta.add_bos = add_bos;
+  meta.add_eos = add_eos;
   return BpeTokenizer(meta);
 }
 
