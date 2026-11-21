@@ -6,6 +6,8 @@
 #include <span>
 #include <vector>
 
+#include "tokshit/ahb.hpp"
+#include "tokshit/kernels.hpp"
 #include "tokshit/quant.hpp"
 #include "tokshit/result.hpp"
 
@@ -99,6 +101,13 @@ class Inkling2 {
   void moe(const InkLayer& L, const float* x, float* out);
   void matvec(const InkMeta& m, const float* x, float* y);
   void matvec(const InkMeta& m, const float* x, float* y, float* scratch);
+  struct MatvecSeg {
+    const InkMeta* meta = nullptr;
+    const float* x = nullptr;
+    float* y = nullptr;
+    const kernels::ActQ8* act = nullptr;
+  };
+  void matvec_multi(std::span<const MatvecSeg> segs);
   void depth_mix(std::span<const float* const> states, const float* cur,
                  const float* query, std::size_t nq, float* out);
   void shortconv(const InkLayer& L, const InkMeta& w, const float* dyn,
@@ -164,7 +173,13 @@ class Inkling2 {
   std::vector<int> top_;
   std::vector<float> wts_;
   std::vector<float> router_;
+  std::vector<float> gu_all_, act_all_, down_all_;
+  kernels::ActQ8 act_q8_;
+  kernels::ActQ8 act_in_[3];
+  std::vector<kernels::ActQ8> act_all_q8_;
   std::vector<uint8_t> hot_;  // Q8_0 dense + output, один буфер
+  double prof_mv_ns_ = 0.0;
+  double prof_moe_ns_ = 0.0;
   std::size_t cur_slot_ = 0;
 };
 

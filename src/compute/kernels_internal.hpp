@@ -33,6 +33,7 @@ float dot_nvfp4(const uint8_t* row, const ActQ8& act, size_t in_dim) noexcept;
 // q4_k (6-бит шкалы + min на сабблок). dot считается точно против
 // скалярного эталона через sum(v*q) и sum(q) на 32-блоке активации
 float dot_q4k(const uint8_t* row, const ActQ8& act, size_t in_dim) noexcept;
+float dot_q6k(const uint8_t* row, const ActQ8& act, size_t in_dim) noexcept;
 void dot_rows_q4k(const uint8_t* rows, size_t rb, size_t nrows,
                   const ActQ8& act, size_t in_dim, float* out) noexcept;
 

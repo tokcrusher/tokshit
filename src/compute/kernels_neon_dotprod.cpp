@@ -1402,6 +1402,56 @@ float dot_iq2xs(const std::uint8_t* row, const ActQ8& act,
   return 0.125F * total;
 }
 
+
+// ---- q6_k: 256 весов, 6 бит; шкала int8 на 16 весов, d на блок.
+// раскладка: две половины по 128, в каждой q1/q2/q3/q4 по 32 значения.
+float dot_q6k(const std::uint8_t* row, const ActQ8& act,
+              std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 210;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float total = 0.0F;
+  const int8x16_t k32 = vdupq_n_s8(32);
+  const uint8x16_t low4 = vdupq_n_u8(0x0F);
+  for (std::size_t b = 0; b < nb; ++b) {
+    const std::size_t base = b * kBs;
+    const float d = load_f16(row + base + 208);
+    float acc = 0.0F;
+    for (std::size_t h = 0; h < 2; ++h) {
+      const std::uint8_t* ql = row + base + h * 64;
+      const std::uint8_t* qh = row + base + 128 + h * 32;
+      const std::int8_t* sc =
+          reinterpret_cast<const std::int8_t*>(row + base + 192 + h * 8);
+      for (std::size_t part = 0; part < 4; ++part) {
+        const std::size_t ql_off = (part & 1) ? 32 : 0;
+        const std::size_t sh = 2 * part;
+        for (std::size_t half = 0; half < 2; ++half) {
+          const std::uint8_t* qlb = ql + ql_off + half * 16;
+          const uint8x16_t qv =
+              vld1q_u8(qlb);
+          const uint8x16_t nib =
+              (part < 2) ? vandq_u8(qv, low4) : vshrq_n_u8(qv, 4);
+          const uint8x16_t hi = vandq_u8(
+              vshlq_u8(vld1q_u8(qh + half * 16),
+                       vdupq_n_s8(static_cast<std::int8_t>(-static_cast<int>(sh)))),
+              vdupq_n_u8(0x03));
+          const int8x16_t q = vsubq_s8(
+              vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(hi, 4))), k32);
+          const std::size_t a =
+              b * 256 + h * 128 + part * 32 + half * 16;
+          const int32x4_t p =
+              vdotq_s32(vdupq_n_s32(0), q, vld1q_s8(ap + a));
+          acc += static_cast<float>(vaddvq_s32(p)) *
+                 static_cast<float>(sc[part * 2 + half]) * sp[a >> 5];
+        }
+      }
+    }
+    total += d * acc;
+  }
+  return total;
+}
+
 }  // namespace tokshit::kernels::neon
 
 #endif  // __aarch64__ && TOKSHIT_HAVE_NEON_DOTPROD

@@ -393,6 +393,10 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
   w.mix2_.assign(m->hidden_, 0.0F);
   w.ffn_in_.assign(m->hidden_, 0.0F);
   w.down_buf_.assign(m->hidden_, 0.0F);
+  w.gu_all_.assign(m->n_used_ * 2 * m->n_ff_exp_, 0.0F);
+  w.act_all_.assign(m->n_used_ * m->n_ff_exp_, 0.0F);
+  w.down_all_.assign(m->n_used_ * m->hidden_, 0.0F);
+  w.act_all_q8_.resize(m->n_used_);
   w.msg_.assign(4 * m->hidden_, 0.0F);
   w.norm_states_.assign(9 * m->hidden_, 0.0F);
   w.ctrl_z_.assign(64, 0.0F);
@@ -410,9 +414,14 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
   w.top_.assign(m->n_used_, 0);
   w.wts_.assign(m->n_used_, 0.0F);
 
-  // Горячие dense-веса и голова — в Q8_0: у него есть NEON-ядро, а исходные
-  // Q6_K/Q5_K/Q4_K/IQ3_XXS деквантуются скалярно на каждом токене.
-  if (kernels::has_neon_dot(QuantType::Q8_0)) {
+  // Горячие dense-веса и голова — в Q8_0. По умолчанию выключено: для
+  // Q6_K/Q4_K теперь есть NEON-ядра, и исходные кванты занимают меньше
+  // памяти и полосы. TOKSHIT_INK_HOT=1 включает старую конверсию.
+  const bool hot_conv = [] {
+    const char* v = std::getenv("TOKSHIT_INK_HOT");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+  }();
+  if (hot_conv && kernels::has_neon_dot(QuantType::Q8_0)) {
     auto rb8_of = [](const InkMeta& meta) -> std::size_t {
       const auto rb = row_bytes(QuantType::Q8_0, meta.in_dim);
       return rb.ok() ? static_cast<std::size_t>(rb.value()) : 0;

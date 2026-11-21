@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -60,7 +61,92 @@ void matvec_task(void* ctx, std::size_t chunk) {
   }
 }
 
+struct ExpertJob {
+  const std::uint8_t* data = nullptr;
+  std::size_t stride = 0;
+  std::uint32_t rows = 0;
+  std::uint32_t rb = 0;
+  std::uint32_t in = 0;
+  std::uint32_t out_stride = 0;
+  std::uint32_t chunk_rows = 64;
+  std::uint32_t chunks = 0;
+  tokshit::QuantType quant = tokshit::QuantType::F32;
+  const tokshit::kernels::ActQ8* act = nullptr;
+  const tokshit::kernels::ActQ8* act_block = nullptr;
+  const int* ids = nullptr;
+  const float* x = nullptr;
+  std::uint32_t x_stride = 0;
+  float* out = nullptr;
+};
+
+void expert_task(void* ctx, std::size_t t) {
+  const ExpertJob& j = *static_cast<const ExpertJob*>(ctx);
+  const std::size_t slot = t / j.chunks;
+  const std::size_t e = j.ids != nullptr ? static_cast<std::size_t>(j.ids[slot]) : slot;
+  const std::uint32_t r0 =
+      static_cast<std::uint32_t>(t % j.chunks) * j.chunk_rows;
+  if (r0 >= j.rows) return;
+  const std::uint32_t n = std::min(j.chunk_rows, j.rows - r0);
+  const std::uint8_t* base = j.data + e * j.stride;
+  const float* xv = j.x + slot * j.x_stride;
+  float* yv = j.out + slot * j.out_stride + r0;
+  const tokshit::kernels::ActQ8& a =
+      j.act_block != nullptr ? j.act_block[slot] : *j.act;
+  thread_local std::vector<float> scratch;
+  for (std::uint32_t r = 0; r < n; ++r) {
+    yv[r] = tokshit::kernels::dot_row(
+        j.quant, std::span<const std::uint8_t>(base + (r0 + r) * j.rb, j.rb),
+        j.rb, std::span<const float>(xv, j.in), a, j.in, scratch);
+  }
+}
+
+struct MultiJob {
+  struct Seg {
+    const std::uint8_t* data = nullptr;
+    std::uint32_t rows = 0;
+    std::uint32_t rb = 0;
+    std::uint32_t in = 0;
+    std::uint32_t chunks = 0;
+    tokshit::QuantType quant = tokshit::QuantType::F32;
+    const tokshit::kernels::ActQ8* act = nullptr;
+    const float* x = nullptr;
+    float* y = nullptr;
+  };
+  std::vector<Seg> segs;
+  std::vector<std::uint32_t> starts;
+  std::uint32_t chunk_rows = 64;
+};
+
+void multi_task(void* ctx, std::size_t task) {
+  const MultiJob& j = *static_cast<const MultiJob*>(ctx);
+  std::size_t s = 0;
+  while (s + 1 < j.starts.size() && task >= j.starts[s + 1]) ++s;
+  const MultiJob::Seg& seg = j.segs[s];
+  const std::uint32_t r0 =
+      static_cast<std::uint32_t>(task - j.starts[s]) * j.chunk_rows;
+  if (r0 >= seg.rows) return;
+  const std::uint32_t n = std::min(j.chunk_rows, seg.rows - r0);
+  thread_local std::vector<float> scratch;
+  for (std::uint32_t r = 0; r < n; ++r) {
+    seg.y[r0 + r] = tokshit::kernels::dot_row(
+        seg.quant,
+        std::span<const std::uint8_t>(seg.data + (r0 + r) * seg.rb, seg.rb),
+        seg.rb, std::span<const float>(seg.x, seg.in), *seg.act, seg.in,
+        scratch);
+  }
+}
+
 inline float sigmoidf(float x) { return 1.0F / (1.0F + std::exp(-x)); }
+
+void dump_vec(const char* name, const std::vector<float>& v) {
+  const char* dir = std::getenv("TOKSHIT_INK_DUMP_DIR");
+  if (dir == nullptr || *dir == '\0') return;
+  const std::string path = std::string(dir) + "/" + name + ".bin";
+  if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+    std::fwrite(v.data(), sizeof(float), v.size(), f);
+    std::fclose(f);
+  }
+}
 
 }  // namespace
 
@@ -79,6 +165,7 @@ void Inkling2::matvec(const InkMeta& m, const float* x, float* y) {
 
 void Inkling2::matvec(const InkMeta& m, const float* x, float* y,
                       float*) {
+  const auto t0 = std::chrono::steady_clock::now();
   MvTask t;
   t.data = (m.hot ? hot_.data() : data_) + m.base;
   t.rows = m.rows;
@@ -100,6 +187,43 @@ void Inkling2::matvec(const InkMeta& m, const float* x, float* y,
   } else {
     t.rows_per_task = m.rows;
     matvec_task(&t, 0);
+  }
+  if (std::getenv("TOKSHIT_INK_PROF") != nullptr) {
+    prof_mv_ns_ += std::chrono::duration<double, std::nano>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
+  }
+}
+
+void Inkling2::matvec_multi(std::span<const MatvecSeg> segs) {
+  const auto t0 = std::chrono::steady_clock::now();
+  MultiJob job;
+  job.segs.reserve(segs.size());
+  job.starts.reserve(segs.size() + 1);
+  job.starts.push_back(0);
+  std::uint32_t total = 0;
+  for (const MatvecSeg& s : segs) {
+    MultiJob::Seg seg;
+    seg.data = s.meta->hot ? (hot_.data() + s.meta->base)
+                           : (data_ + s.meta->base);
+    seg.rows = s.meta->rows;
+    seg.rb = s.meta->rb;
+    seg.in = s.meta->in_dim;
+    seg.chunks = (seg.rows + job.chunk_rows - 1) / job.chunk_rows;
+    seg.quant = s.meta->quant;
+    seg.act = s.act;
+    seg.x = s.x;
+    seg.y = s.y;
+    total += seg.chunks;
+    job.segs.push_back(seg);
+    job.starts.push_back(total);
+  }
+  if (total == 0) return;
+  pool::run_tasks(total, multi_task, &job);
+  if (std::getenv("TOKSHIT_INK_PROF") != nullptr) {
+    prof_mv_ns_ += std::chrono::duration<double, std::nano>(
+                       std::chrono::steady_clock::now() - t0)
+                       .count();
   }
 }
 
@@ -346,51 +470,70 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
                               L.gate_up_exps.rows;
   const std::size_t dn_size =
       static_cast<std::size_t>(L.down_exps.rb) * L.down_exps.rows;
+  kernels::quantize_into(std::span<const float>(x, h), act_q8_);
+
+  {
+    ExpertJob job;
+    job.data = data_ + L.gate_up_exps.base;
+    job.stride = gu_size;
+    job.rows = L.gate_up_exps.rows;
+    job.rb = L.gate_up_exps.rb;
+    job.in = L.gate_up_exps.in_dim;
+    job.out_stride = static_cast<std::uint32_t>(2 * nff);
+    job.chunks = (job.rows + job.chunk_rows - 1) / job.chunk_rows;
+    job.quant = L.gate_up_exps.quant;
+    job.act = &act_q8_;
+    job.ids = top_.data();
+    job.x = x;
+    job.x_stride = 0;
+    job.out = gu_all_.data();
+    const std::size_t tasks = static_cast<std::size_t>(n_used_) * job.chunks;
+    pool::run_tasks(tasks, expert_task, &job);
+  }
+
   for (std::size_t k = 0; k < n_used_; ++k) {
-    const int ei = top_[k];
-    if (ei < 0) continue;
-    const std::size_t e = static_cast<std::size_t>(ei);
-    InkMeta gu = L.gate_up_exps;
-    gu.base += e * gu_size;
-    matvec(gu, x, tmp_.data());
-    if (!L.gate_up_scale.empty()) {
-      const float s = L.gate_up_scale[e];
-      for (std::size_t i = 0; i < gu.rows; ++i) tmp_[i] *= s;
-    }
-    float* g = tmp_.data();
-    float* u = tmp_.data() + nff;
+    const std::size_t e = static_cast<std::size_t>(top_[k]);
+    const float* gu = gu_all_.data() + k * 2 * nff;
+    const float gs = L.gate_up_scale.empty() ? 1.0F : L.gate_up_scale[e];
+    float* dst = act_all_.data() + k * nff;
     for (std::size_t i = 0; i < nff; ++i) {
-      const float gi = g[i];
+      const float gi = gu[i] * gs;
+      const float ui = gu[nff + i] * gs;
       float act = situ_beta_ * std::tanh(gi / situ_beta_) * sigmoidf(gi);
-      const float ui = u[i];
       act *= situ_linear_beta_ > 0.0F
                  ? situ_linear_beta_ * std::tanh(ui / situ_linear_beta_)
                  : ui;
-      g[i] = act;
+      dst[i] = act;
     }
-    InkMeta dn = L.down_exps;
-    dn.base += e * dn_size;
-    matvec(dn, g, down_buf_.data());
-    if (!L.down_scale.empty()) {
-      const float s = L.down_scale[e];
-      for (std::size_t i = 0; i < h; ++i) down_buf_[i] *= s;
-    }
-    const float w = wts_[k];
-    for (std::size_t i = 0; i < h; ++i) out[i] += w * down_buf_[i];
+    kernels::quantize_into(std::span<const float>(dst, nff), act_all_q8_[k]);
   }
-}
 
-namespace {
-void dump_vec(const char* name, const std::vector<float>& v) {
-  const char* dir = std::getenv("TOKSHIT_INK_DUMP_DIR");
-  if (dir == nullptr || *dir == '\0') return;
-  std::string path = std::string(dir) + "/" + name + ".bin";
-  if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
-    std::fwrite(v.data(), sizeof(float), v.size(), f);
-    std::fclose(f);
+  {
+    ExpertJob job;
+    job.data = data_ + L.down_exps.base;
+    job.stride = dn_size;
+    job.rows = L.down_exps.rows;
+    job.rb = L.down_exps.rb;
+    job.in = L.down_exps.in_dim;
+    job.out_stride = static_cast<std::uint32_t>(h);
+    job.chunks = (job.rows + job.chunk_rows - 1) / job.chunk_rows;
+    job.quant = L.down_exps.quant;
+    job.act_block = act_all_q8_.data();
+    job.ids = top_.data();
+    job.x = act_all_.data();
+    job.x_stride = static_cast<std::uint32_t>(nff);
+    job.out = down_all_.data();
+    const std::size_t tasks = static_cast<std::size_t>(n_used_) * job.chunks;
+    pool::run_tasks(tasks, expert_task, &job);
+  }
+
+  for (std::size_t k = 0; k < n_used_; ++k) {
+    const std::size_t e = static_cast<std::size_t>(top_[k]);
+    const float w = wts_[k] * (L.down_scale.empty() ? 1.0F : L.down_scale[e]);
+    const float* src = down_all_.data() + k * h;
+    for (std::size_t i = 0; i < h; ++i) out[i] += w * src[i];
   }
 }
-}  // namespace
 
 void Inkling2::embed(uint32_t token) {
   const std::size_t rb = tok_embd_.rb;
@@ -494,10 +637,20 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
     const float* in1 = nrm3_.data() + h;
     const float* in2 = nrm3_.data() + 2 * h;
 
-    matvec(L.q, in0, q_.data());
-    matvec(L.k, in1, k_.data());
-    matvec(L.v, in2, v_.data());
-    matvec(L.rel, in0, r_.data());
+    kernels::quantize_into(std::span<const float>(in0, h), act_in_[0]);
+    kernels::quantize_into(std::span<const float>(in1, h), act_in_[1]);
+    kernels::quantize_into(std::span<const float>(in2, h), act_in_[2]);
+    {
+      const MatvecSeg segs[] = {
+          {&L.q, in0, q_.data(), &act_in_[0]},
+          {&L.k, in1, k_.data(), &act_in_[1]},
+          {&L.v, in2, v_.data(), &act_in_[2]},
+          {&L.rel, in0, r_.data(), &act_in_[0]},
+          {&L.gate, in0, gate_.data(), &act_in_[0]},
+          {&L.sink_proj, in0, sink_.data(), &act_in_[0]},
+      };
+      matvec_multi(std::span<const MatvecSeg>(segs));
+    }
     if (ip == 0 && (pos == 0 || pos == 8) && std::getenv("TOKSHIT_INK_DUMP_DIR") != nullptr) {
       dump_vec("xin", std::vector<float>(nrm3_.begin(), nrm3_.begin() + h));
       dump_vec("q_raw", q_);
@@ -574,7 +727,6 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
       for (float& rv : r_) rv *= tau;
     }
 
-    matvec(L.sink_proj, in0, sink_.data());
     if (ip == 0 && (pos == 0 || pos == 8) && std::getenv("TOKSHIT_INK_DUMP_DIR") != nullptr) {
       dump_vec("q", q_);
       dump_vec("k", k_);
@@ -618,7 +770,6 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
               attn_.data());
 
     // gated attention output
-    matvec(L.gate, in0, gate_.data());
     for (std::size_t i = 0; i < attn_.size(); ++i) {
       attn_[i] *= sigmoidf(gate_[i]);
     }
@@ -657,7 +808,13 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
     if (noffn) {
       std::fill(ffn_.begin(), ffn_.end(), 0.0F);
     } else {
+      const auto tm0 = std::chrono::steady_clock::now();
       moe(L, mix2_.data(), ffn_.data());
+      if (std::getenv("TOKSHIT_INK_PROF") != nullptr) {
+        prof_moe_ns_ += std::chrono::duration<double, std::nano>(
+                            std::chrono::steady_clock::now() - tm0)
+                            .count();
+      }
     }
     if ((ip == 0 && (pos == 0 || pos == 8)) ||
         (ip == 9 && pass == 0 && pos == 8)) {
@@ -840,6 +997,12 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
       logits_[i] =
           final_softcap_ * std::tanh(logits_[i] / final_softcap_);
     }
+  }
+  if (std::getenv("TOKSHIT_INK_PROF") != nullptr) {
+    std::fprintf(stderr, "[prof] token=%u pos=%zu mv=%.0fms moe=%.0fms\n",
+                 token, pos, prof_mv_ns_ / 1e6, prof_moe_ns_ / 1e6);
+    prof_mv_ns_ = 0.0;
+    prof_moe_ns_ = 0.0;
   }
   out.resize(vocab_unpadded_);
   std::copy(logits_.begin(), logits_.begin() + vocab_unpadded_, out.begin());

@@ -70,7 +70,8 @@ bool use_i8mm() noexcept {
 // K-квант ядра (q4_k): TOKSHIT_KQK=1, дефолт — старое поведение
 bool use_kquant() noexcept {
 #if defined(TOKSHIT_HAVE_NEON_DOTPROD)
-  return have_dotprod() && env_flag("TOKSHIT_KQK") != 0;
+  const char* v = std::getenv("TOKSHIT_KQK");
+  return have_dotprod() && (v == nullptr || v[0] != '0');
 #else
   return false;
 #endif
@@ -102,6 +103,8 @@ bool has_neon_dot(QuantType quant) noexcept {
     case QuantType::Iq1S:
     case QuantType::Iq2Xxs:
     case QuantType::Iq2Xs:
+    case QuantType::Q6K:
+    case QuantType::Q4K:
       return true;
     default:
       return false;
@@ -177,6 +180,11 @@ float dot_row(QuantType quant, std::span<const uint8_t> row, size_t rb,
       case QuantType::Nvfp4:
         if (in_dim % 64 == 0) {
           return neon::dot_nvfp4(row.data(), act, in_dim);
+        }
+        break;
+      case QuantType::Q6K:
+        if (in_dim % 256 == 0) {
+          return neon::dot_q6k(row.data(), act, in_dim);
         }
         break;
       case QuantType::Q4K:
