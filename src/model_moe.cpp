@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include <span>
 #include <string>
 #include <utility>
@@ -16,6 +18,72 @@
 
 #include "model_internal.hpp"
 #include "model_trace.hpp"
+
+namespace tokshit {
+
+// TOKSHIT_EXPERT_LOCALITY=1: accumulate the per-layer router top-k sets on
+// every layer_moe() invocation and print pass-to-pass Jaccard overlap in
+// expert_loc_report().  For the Model path an invocation == one pass over the
+// layer; for Inkling2 the same signal would live in Inkling2::moe (see
+// report note).
+namespace {
+
+struct LocAcc {
+  std::mutex mu;
+  // per layer: list of top-sets, one per invocation ("pass")
+  std::vector<std::vector<std::set<std::size_t>>> passes;
+};
+
+LocAcc& loc_acc() {
+  static LocAcc a;
+  return a;
+}
+
+bool loc_enabled() {
+  static const bool e = std::getenv("TOKSHIT_EXPERT_LOCALITY") != nullptr;
+  return e;
+}
+
+double jaccard(const std::set<std::size_t>& a,
+               const std::set<std::size_t>& b) {
+  if (a.empty() && b.empty()) return 1.0;
+  if (a.empty() || b.empty()) return 0.0;
+  const std::size_t inter =
+      static_cast<std::size_t>(std::count_if(a.begin(), a.end(), [&](auto e) {
+        return b.count(e) != 0;
+      }));
+  return static_cast<double>(inter) /
+         static_cast<double>(a.size() + b.size() - inter);
+}
+
+}  // namespace
+
+void expert_loc_report() {
+  LocAcc& a = loc_acc();
+  std::lock_guard<std::mutex> lock(a.mu);
+  double total = 0.0;
+  std::size_t pairs = 0;
+  for (std::size_t l = 0; l < a.passes.size(); ++l) {
+    const auto& v = a.passes[l];
+    if (v.size() < 2) continue;
+    double j01 = 0.0, j12 = 0.0;
+    const bool has01 = v.size() >= 2;
+    const bool has12 = v.size() >= 3;
+    if (has01) j01 = jaccard(v[0], v[1]);
+    if (has12) j12 = jaccard(v[1], v[2]);
+    const double mean = has01 ? j01 : 0.0;
+    total += mean;
+    ++pairs;
+    std::fprintf(stderr, "[loc] layer %2zu passes=%zu j01=%.3f j12=%.3f mean=%.3f\n",
+                 l, v.size(), has01 ? j01 : 0.0, has12 ? j12 : 0.0, mean);
+  }
+  if (pairs != 0) {
+    std::fprintf(stderr, "[loc] mean overlap over %zu layers: %.3f\n", pairs,
+                 total / static_cast<double>(pairs));
+  }
+}
+
+}  // namespace tokshit
 
 namespace tokshit {
 
@@ -69,6 +137,14 @@ void Model::layer_moe(std::size_t layer, Workspace& ws) {
   for (float& w : ws.wts) w /= wsum;
   record_freq(layer, ws.top);
   trace_experts(layer, ws.top);
+  if (loc_enabled()) {
+    LocAcc& a = loc_acc();
+    std::lock_guard<std::mutex> lock(a.mu);
+    if (a.passes.size() <= layer) a.passes.resize(layer + 1);
+    std::set<std::size_t> s(ws.top.begin(), ws.top.end());
+    auto& v = a.passes[layer];
+    if (v.size() < 64) v.push_back(std::move(s));
+  }
 
   if (prefetch_enabled() && io_ != nullptr && resident_budget_ != 0) {
     for (std::size_t ahead = 1; ahead <= 2; ++ahead) {

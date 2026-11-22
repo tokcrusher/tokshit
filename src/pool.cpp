@@ -183,6 +183,12 @@ struct TaskPool::Impl {
   }
 };
 
+namespace {
+// snap-to-4 по умолчанию на арме; определение ниже (после конструктора),
+// но вызывается из него
+std::size_t default_workers();
+}  // namespace
+
 TaskPool::TaskPool() {
   impl_ = new Impl();
   const std::size_t total =
@@ -270,7 +276,9 @@ void TaskPool::run(std::size_t n, TaskFn fn, void* ctx) {
   // Гетерогенные ядра: быстрые чистить спином, но периодически спать —
   // на 2.8 ГГц-ядрах ждать на YIELD забивает опропорциональную тепловую разницу.
   {
-    const uint64_t target = st.workers;
+    // ждём, пока все workers воркеры отметили done (exec_main + exec_workers
+    // равны workers)
+    const uint64_t target = impl_->workers;
     uint64_t spins = 0;
     while (st.done.load(std::memory_order_acquire) < target) {
       if (spins >= 32) {

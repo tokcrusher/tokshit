@@ -319,6 +319,9 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   if (std::getenv("TOKSHIT_EXPERT_STATS") != nullptr) {
     print_expert_stats(m);
   }
+  if (std::getenv("TOKSHIT_EXPERT_LOCALITY") != nullptr) {
+    expert_loc_report();
+  }
   tokshit::pool::set_active(false);
 }
 

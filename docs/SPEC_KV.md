@@ -82,10 +82,12 @@ Backbone draft-блока считает все 8 позиций паралле�
 Verify умеет два режима: последовательный (`--dspark-batch=0`) и
 батчевый (`Inkling2::token_logits_batch()`, по умолчанию). Батч
 переиспользует плотные веса на K кандидатов и подтверждён паритетом
-(`TOKSHIT_INK_BATCH_TEST`, max|dlogit|=0). Acceptance: sequentially 30.8 %,
-batched 47.6 %; скорость (16 токенов, warm): plain 1.65, sequential 1.53,
-batched 1.13–1.23 tok/s — выигрыша над plain нет. Детали — в
-[DSPARK.md](DSPARK.md).
+(`TOKSHIT_INK_BATCH_TEST`, max|dlogit|=0; `moe_timing` layer 0:
+`moe_batch` b=3 = 17.6 мс vs `moe` = 36.3 мс, `max|dout| = 0`). Acceptance
+2026-11-22: sequential 47.6 % chain (10/21), batched 47.6 % chain (10/21);
+скорость (16 токенов, warm, 2026-11-22): plain 1.61–1.72, sequential
+0.72, batched 0.52 tok/s — выигрыша над plain нет ни в одном режиме. Детали
+— в [DSPARK.md](DSPARK.md).
 
 ## 6. Что проверено
 
@@ -111,15 +113,22 @@ batched 1.13–1.23 tok/s — выигрыша над plain нет. Детали
 нет. Полный verify остаётся lossless, но на этом устройстве медленнее
 обычного декода.
 
-DSpark на Inkling-2-Mini не даёт ускорения: sequential 1.53 tok/s,
-batched 1.13–1.23 против plain 1.65 (16 токенов, warm, K=3); acceptance
-30.8 % / 47.6 %. Batched-MoE и batched-attention не реализованы.
+DSpark на Inkling-2-Mini не даёт ускорения (2026-11-22 замеры):
+sequential 0.72, batched 0.52 против plain 1.61–1.72 (16 токенов, warm,
+K=3, coding-промпт, замеры на 63–74 °C, модель не resident); acceptance
+47.6 % / 47.6 % (10/21). Batched-MoE и batched-attention не реализованы.
 
 ## 8. Ограничения
 
 - DSpark-verify: батч переиспользует dense matvec, но attention,
   shortconv и MoE всё равно по токенам; union-эксперты по top-8
   повышают трафик на B=3.
+- Оптимизация 2026-11-22 (деквант из батч-роутера): F32/BF16 `gate_inp`
+  теперь через `matvec()` — деквант-стайп `run_bsegs` роутера ушёл
+  (паритет `max|dout| = 0`; `moe_timing`: `moe_batch` b=3 = 17.6 мс vs
+  `moe` = 36.3 мс). Доля декванта роутера — 0: kbench
+  `blk.0.ffn_gate_inp` F32 128×2304 — 1.2 МБ/токен, доставка ~6.5 ГБ/с
+  ≈ 0.19 мс.
 - Batched head (`lm_head @ corr`) ещё не сделан — head считает LM head
   на каждый шаг головы.
 - Lossy levers (`--topk-experts 2`, `--passes 2`) не хватило, чтобы

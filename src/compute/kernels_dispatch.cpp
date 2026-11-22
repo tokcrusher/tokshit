@@ -236,6 +236,30 @@ void dot_row_multi(QuantType quant, std::span<const uint8_t> row, size_t rb,
           for (size_t j = 0; j < n; ++j)
             out[j] = neon::dot_iq2s(row.data(), acts[j], in_dim);
         break;
+      case QuantType::Iq2Xxs:
+        if (in_dim % 256 != 0) handled = false;
+        else
+          for (size_t j = 0; j < n; ++j)
+            out[j] = neon::dot_iq2xxs(row.data(), acts[j], in_dim);
+        break;
+      case QuantType::Iq1S:
+        if (in_dim % 256 != 0) handled = false;
+        else
+          for (size_t j = 0; j < n; ++j)
+            out[j] = neon::dot_iq1s(row.data(), acts[j], in_dim);
+        break;
+      case QuantType::Mxfp4:
+        if (in_dim % 32 != 0) handled = false;
+        else
+          for (size_t j = 0; j < n; ++j)
+            out[j] = neon::dot_mxfp4(row.data(), acts[j], in_dim);
+        break;
+      case QuantType::Q6K:
+        if (in_dim % 256 != 0) handled = false;
+        else
+          for (size_t j = 0; j < n; ++j)
+            out[j] = neon::dot_q6k(row.data(), acts[j], in_dim);
+        break;
       case QuantType::Iq3S:
         if (in_dim % 256 != 0) handled = false;
         else
@@ -247,12 +271,6 @@ void dot_row_multi(QuantType quant, std::span<const uint8_t> row, size_t rb,
         else
           for (size_t j = 0; j < n; ++j)
             out[j] = neon::dot_iq3xxs(row.data(), acts[j], in_dim);
-        break;
-      case QuantType::Q6K:
-        if (in_dim % 256 != 0) handled = false;
-        else
-          for (size_t j = 0; j < n; ++j)
-            out[j] = neon::dot_q6k(row.data(), acts[j], in_dim);
         break;
       case QuantType::Q4K:
         if (in_dim % 256 != 0) handled = false;
@@ -266,29 +284,11 @@ void dot_row_multi(QuantType quant, std::span<const uint8_t> row, size_t rb,
           for (size_t j = 0; j < n; ++j)
             out[j] = neon::dot_q2_0(row.data(), acts[j], in_dim);
         break;
-      case QuantType::Mxfp4:
-        if (in_dim % 32 != 0) handled = false;
-        else
-          for (size_t j = 0; j < n; ++j)
-            out[j] = neon::dot_mxfp4(row.data(), acts[j], in_dim);
-        break;
       case QuantType::Nvfp4:
         if (in_dim % 64 != 0) handled = false;
         else
           for (size_t j = 0; j < n; ++j)
             out[j] = neon::dot_nvfp4(row.data(), acts[j], in_dim);
-        break;
-      case QuantType::Iq1S:
-        if (in_dim % 256 != 0) handled = false;
-        else
-          for (size_t j = 0; j < n; ++j)
-            out[j] = neon::dot_iq1s(row.data(), acts[j], in_dim);
-        break;
-      case QuantType::Iq2Xxs:
-        if (in_dim % 256 != 0) handled = false;
-        else
-          for (size_t j = 0; j < n; ++j)
-            out[j] = neon::dot_iq2xxs(row.data(), acts[j], in_dim);
         break;
       case QuantType::Iq2Xs:
         if (in_dim % 256 != 0) handled = false;
@@ -375,6 +375,14 @@ void dot_rows(QuantType quant, std::span<const uint8_t> rows, size_t rb,
     }
     if (quant == QuantType::Iq2S && in_dim % 256 == 0) {
       neon::dot_rows_iq2s(rows.data(), rb, nrows, act, in_dim, out);
+      return;
+    }
+    if (quant == QuantType::Iq1S && in_dim % 256 == 0) {
+      neon::dot_rows_iq1s(rows.data(), rb, nrows, act, in_dim, out);
+      return;
+    }
+    if (quant == QuantType::Mxfp4 && in_dim % 32 == 0) {
+      neon::dot_rows_mxfp4(rows.data(), rb, nrows, act, in_dim, out);
       return;
     }
     if (use_iq2row() && in_dim % 256 == 0) {

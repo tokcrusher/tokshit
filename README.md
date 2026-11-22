@@ -53,12 +53,13 @@ Measured on the target device: 8 cores (1× Cortex-X4 + 7× Cortex-A720),
 At 60 °C the dense stream drops from 12.6 to 4.2 GB/s. Run with
 `termux-wake-lock`, watch the temperature, let the phone cool between runs.
 
-Inkling-2-Mini is a second target. Plain greedy there is noisy too: roughly
-1.6–3.0 tok/s depending on thermals and cache (2.1–2.4 in the session-3
-runs). Experimental DSpark: 1.53 sequential vs 1.13–1.23 batched vs 1.65 plain on
-a 16-token coding prompt (warm, K=3, acceptance 47.6 %); still not a win on
-this phone. **LOSSY** knobs `--passes 2` and `--topk-experts 2` are measured
-up to ~5.2 tok/s in short runs and degrade the output. Details:
+Inkling-2-Mini is a second target. Measured now (2026-11-22, hot phone):
+plain greedy top-8 ≈ 1.6–1.7 tok/s; top-2 plain 2.28. Experimental DSpark:
+0.72 sequential vs 0.52 batched vs 1.61–1.72 plain on a 16-token coding
+prompt (warm, K=3, acceptance 47.6 %) — still not a win on this phone;
+`--turbo` measures 0.26–0.30. **LOSSY** knobs `--passes 2` and
+`--topk-experts 2` are measured up to ~5.2 tok/s in short runs and degrade
+the output. Details:
 [docs/PERF_SESSION3.md](docs/PERF_SESSION3.md).
 
 Flint token budget: about 1.74 GB of dense weights after Q8_0 conversion

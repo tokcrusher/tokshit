@@ -192,6 +192,22 @@ if(TOKSHIT_BUILD_TOOLS)
   tokshit_set_warnings(ahbtest)
 
   add_executable(densebench src/tools/densebench.cpp)
+
+  add_executable(deweightbench src/tools/deweightbench.cpp)
+  target_link_libraries(deweightbench PRIVATE tokshit_core)
+  tokshit_set_warnings(deweightbench)
+
+  add_executable(gather_bwbench src/tools/gather_bwbench.cpp)
+  target_link_libraries(gather_bwbench PRIVATE tokshit_core)
+  tokshit_set_warnings(gather_bwbench)
+
+  add_executable(expert_loc src/tools/expert_loc.cpp)
+  target_link_libraries(expert_loc PRIVATE tokshit_core)
+  tokshit_set_warnings(expert_loc)
+
+  add_executable(kparity src/tools/kparity.cpp)
+  target_link_libraries(kparity PRIVATE tokshit_core)
+  tokshit_set_warnings(kparity)
   target_link_libraries(densebench PRIVATE tokshit_core)
   tokshit_set_warnings(densebench)
 endif()

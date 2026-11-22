@@ -53,6 +53,19 @@ void dot_rows_iq3s(const uint8_t* rows, size_t rb, size_t nrows,
 void dot_rows_iq3xxs(const uint8_t* rows, size_t rb, size_t nrows,
                      const ActQ8& act, size_t in_dim, float* out) noexcept;
 
+// четыре строки за проход (активации загружаются один раз):
+// iq2_s, iq2_xxs, iq1_s, mxfp4, q6_k
+void dot_rows_iq2s(const uint8_t* rows, size_t rb, size_t nrows,
+                   const ActQ8& act, size_t in_dim, float* out) noexcept;
+void dot_rows_iq2xxs(const uint8_t* rows, size_t rb, size_t nrows,
+                     const ActQ8& act, size_t in_dim, float* out) noexcept;
+void dot_rows_iq1s(const uint8_t* rows, size_t rb, size_t nrows,
+                   const ActQ8& act, size_t in_dim, float* out) noexcept;
+void dot_rows_mxfp4(const uint8_t* rows, size_t rb, size_t nrows,
+                    const ActQ8& act, size_t in_dim, float* out) noexcept;
+void dot_rows_q6k(const uint8_t* rows, size_t rb, size_t nrows,
+                  const ActQ8& act, size_t in_dim, float* out) noexcept;
+
 // i8mm (SMMLA), отдельный TU с -march=armv8.2-a+dotprod+i8mm
 void dot_rows_q8_0_i8mm(const uint8_t* rows, size_t rb, size_t nrows,
                         const ActQ8& act, size_t in_dim, float* out) noexcept;

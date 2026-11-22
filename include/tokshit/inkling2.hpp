@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "tokshit/ahb.hpp"
+#include "tokshit/batch.hpp"
 #include "tokshit/kernels.hpp"
 #include "tokshit/quant.hpp"
 #include "tokshit/result.hpp"
@@ -240,6 +241,8 @@ class Inkling2 {
   std::vector<float> act_b_;             // total × nff: SiTU (входы down)
   std::vector<kernels::ActQ8> moe_act_b_;  // total: кванты SiTU → down
   std::vector<float> dn_b_;              // total × h: выходы down
+  std::vector<BatchSeg> moe_gu_segs_;    // segs gate_up (один проход)
+  std::vector<BatchSeg> moe_dn_segs_;    // segs down (овторный проход)
   std::vector<uint32_t> tap_slots_;
   std::vector<float> tap_buf_;
   std::vector<kernels::ActQ8> lm_acts_;

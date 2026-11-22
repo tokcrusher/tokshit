@@ -141,6 +141,10 @@ struct FreqState {
                                      std::size_t n_experts,
                                      const std::string& path);
 
+// expert-locality report (TOKSHIT_EXPERT_LOCALITY): prints per-layer
+// Jaccard overlap between consecutive router top-k sets; no-op otherwise.
+void expert_loc_report();
+
 class Model {
  public:
   Model();

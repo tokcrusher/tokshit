@@ -15,10 +15,12 @@ LRU-кэш.
 | батчевый префилл, T=224 | **4.53 tok/s** |
 | prefill-bulk, T=224 | 2.32 tok/s |
 | спекуляция, полный verify | 0.93–1.0 tok/s, acceptance 50–78 % |
-| Inkling-2-Mini, plain greedy | 1.6–3.0 tok/s (шумно; 2.1–2.4 в сессии 3) |
+| Inkling-2-Mini, plain greedy | 1.61–1.72 tok/s (2026-11-22, шумно) |
+| Inkling-2-Mini, top-2 plain | 2.28 tok/s (2026-11-22) |
 | Inkling-2-Mini top-2/passes=2 | ≈5.2 tok/s, одиночный прогон, **LOSSY** |
-| DSpark, sequential verify (Inkling-2-Mini) | 1.53 против 1.65 tok/s plain |
-| DSpark, batched verify (Inkling-2-Mini) | 1.13–1.23 tok/s; acceptance 47.6 % |
+| Inkling-2-Mini, `--turbo` | 0.26–0.30 tok/s (63–74 °C, 2026-11-22) |
+| DSpark, sequential verify (Inkling-2-Mini) | 0.72 против plain 1.61–1.72 (2026-11-22) |
+| DSpark, batched verify (Inkling-2-Mini) | 0.52 tok/s, acceptance 47.6 % (2026-11-22) |
 | hot-веса | 52 сегмента по 32 МБ |
 | поток hot-весов через AHB | 5.2 ГБ/с |
 | тесты | 186 кейсов / 9951 проверка |
@@ -71,8 +73,8 @@ LRU-кэш.
 
 Полный verify lossless, но расширяет union экспертов и проигрывает
 обычному декоду. DSpark для Inkling-2-Mini: greedy-ids совпадают с plain
-greedy; sequential 1.53 tok/s, batched 1.13–1.23 (16 токенов, warm,
-acceptance 30.8 % / 47.6 %). Остаток:
+greedy; sequential 0.72, batched 0.52 (2026-11-22, 16 токенов, warm,
+acceptance 47.6 %). Выигрыша над plain нет. Остаток:
 
 - batched MoE по union-экспертов; сейчас токенами;
 - acceptance и MoE-union на батче: нужна высокая цепочка, иначе экономии нет;

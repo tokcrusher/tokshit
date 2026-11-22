@@ -665,14 +665,21 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
   };
   constexpr std::size_t kNoPair = std::numeric_limits<std::size_t>::max();
 
-  // ── роутер: gate_inp на B токенов через run_bsegs ────────────────────
+  // ── роутер: gate_inp на B токенов ────────────────────────────────────
+  // F32/BF16 gate_inp: matvec() без квантованной активации — ровно как в
+  // moe(), чтобы роутер был тот же; квантованный gate_inp — run_bsegs (одна
+  // полоса на все токены).
   router_b_.resize(b * n_expert_);
-  router_acts_.resize(b);
-  for (std::size_t j = 0; j < b; ++j) {
-    kernels::quantize_into(std::span<const float>(x + j * h, h),
-                           router_acts_[j]);
-  }
-  {
+  if (L.gate_inp.quant == QuantType::F32 || L.gate_inp.quant == QuantType::Bf16) {
+    for (std::size_t j = 0; j < b; ++j) {
+      matvec(L.gate_inp, x + j * h, router_b_.data() + j * n_expert_);
+    }
+  } else {
+    router_acts_.resize(b);
+    for (std::size_t j = 0; j < b; ++j) {
+      kernels::quantize_into(std::span<const float>(x + j * h, h),
+                             router_acts_[j]);
+    }
     const BatchSeg seg{bytes_of(L.gate_inp), L.gate_inp.rb, L.gate_inp.quant,
                        L.gate_inp.in_dim, x, router_acts_.data(), b,
                        router_b_.data(), n_expert_};
@@ -802,20 +809,27 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
                            moe_in_b_[at]);
   }
 
-  // ── per expert: gate_up (batched) → SiTU + quantize → down (batched) ─
+  // ── per expert: gate_up — один pass на все эксперты ────────────────────
+  moe_gu_segs_.clear();
+  moe_gu_segs_.reserve(nu);
   for (std::size_t u = 0; u < nu; ++u) {
     const std::size_t off = moff_b_[u];
     const std::size_t cnt =
         (u + 1 < nu ? moff_b_[u + 1] : total) - off;
     if (cnt == 0) continue;
-    {
-      const BatchSeg seg{expert_bytes(L.gate_up_exps, utop_b_[u]),
-                         L.gate_up_exps.rb, L.gate_up_exps.quant,
-                         L.gate_up_exps.in_dim, gx_b_.data() + off * h,
-                         moe_in_b_.data() + off, cnt,
-                         gu_b_.data() + off * 2 * nff, 2 * nff};
-      batchlib::run_bsegs(std::span<const BatchSeg>(&seg, 1), 32);
-    }
+    moe_gu_segs_.push_back(BatchSeg{
+        expert_bytes(L.gate_up_exps, utop_b_[u]), L.gate_up_exps.rb,
+        L.gate_up_exps.quant, L.gate_up_exps.in_dim, gx_b_.data() + off * h,
+        moe_in_b_.data() + off, cnt, gu_b_.data() + off * 2 * nff, 2 * nff});
+  }
+  batchlib::run_bsegs(moe_gu_segs_, 32);
+
+  // SiTU + quantize per pair
+  for (std::size_t u = 0; u < nu; ++u) {
+    const std::size_t off = moff_b_[u];
+    const std::size_t cnt =
+        (u + 1 < nu ? moff_b_[u + 1] : total) - off;
+    if (cnt == 0) continue;
     const float gs = L.gate_up_scale.empty() ? 1.0F
                                              : L.gate_up_scale[utop_b_[u]];
     for (std::size_t mi = 0; mi < cnt; ++mi) {
@@ -833,15 +847,22 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
       kernels::quantize_into(std::span<const float>(dst, nff),
                              moe_act_b_[off + mi]);
     }
-    {
-      const BatchSeg seg{expert_bytes(L.down_exps, utop_b_[u]),
-                         L.down_exps.rb, L.down_exps.quant,
-                         L.down_exps.in_dim, act_b_.data() + off * nff,
-                         moe_act_b_.data() + off, cnt, dn_b_.data() + off * h,
-                         h};
-      batchlib::run_bsegs(std::span<const BatchSeg>(&seg, 1), 32);
-    }
   }
+
+  // ── down — второй pass на все эксперты ────────────────────────────────
+  moe_dn_segs_.clear();
+  moe_dn_segs_.reserve(nu);
+  for (std::size_t u = 0; u < nu; ++u) {
+    const std::size_t off = moff_b_[u];
+    const std::size_t cnt =
+        (u + 1 < nu ? moff_b_[u + 1] : total) - off;
+    if (cnt == 0) continue;
+    moe_dn_segs_.push_back(BatchSeg{
+        expert_bytes(L.down_exps, utop_b_[u]), L.down_exps.rb,
+        L.down_exps.quant, L.down_exps.in_dim, act_b_.data() + off * nff,
+        moe_act_b_.data() + off, cnt, dn_b_.data() + off * h, h});
+  }
+  batchlib::run_bsegs(moe_dn_segs_, 32);
 
   // ── накопление out[j] += w_k · down[k] в порядке k, как в moe() ─────
   for (std::size_t j = 0; j < b; ++j) {
