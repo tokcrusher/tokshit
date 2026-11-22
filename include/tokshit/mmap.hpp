@@ -30,6 +30,9 @@ class Mmap {
   void advise_range(size_t off, size_t len) const noexcept;
   void advise_cold(size_t off, size_t len) const noexcept;
   [[nodiscard]] bool lock_range(size_t off, size_t len) const noexcept;
+  // MADV_HUGEPAGE: резерв поддержки 2MB-страниц для gather-доступа к
+  // экспертам; ошибку не фиксируем, обязательное ограничение.
+  [[nodiscard]] bool advise_hugepage() const noexcept;
 
  private:
   Mmap(std::byte* ptr, size_t len) noexcept : ptr_(ptr), len_(len) {}

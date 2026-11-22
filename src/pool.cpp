@@ -5,11 +5,13 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <time.h>
 #include <vector>
 
 namespace tokshit::pool {
@@ -42,6 +44,40 @@ void pin_to_cpu(std::size_t cpu) {
 #pragma GCC diagnostic pop
 #endif
   (void)::sched_setaffinity(0, sizeof(set), &set);
+}
+
+// cpu max frequency in kHz, 0 if sysfs is unavailable
+unsigned long cpu_max_freq(std::size_t cpu) {
+  char path[128];
+  std::snprintf(path, sizeof(path),
+                "/sys/devices/system/cpu/cpu%zu/cpufreq/cpuinfo_max_freq",
+                cpu);
+  FILE* f = std::fopen(path, "r");
+  if (f == nullptr) return 0;
+  unsigned long v = 0;
+  if (std::fscanf(f, "%lu", &v) != 1) v = 0;
+  std::fclose(f);
+  return v;
+}
+
+// CPUs sorted by max frequency, fastest first. Falls back to the natural
+// order when sysfs is missing. This keeps 7 spinning workers off the two
+// 2.0 GHz little cores on a 3.2+3.0+2.8 GHz phone.
+std::vector<std::size_t> cpus_by_freq(std::size_t total) {
+  std::vector<std::size_t> order(total);
+  for (std::size_t i = 0; i < total; ++i) order[i] = i;
+  std::vector<unsigned long> freq(total, 0);
+  bool any = false;
+  for (std::size_t i = 0; i < total; ++i) {
+    freq[i] = cpu_max_freq(i);
+    any = any || freq[i] != 0;
+  }
+  if (!any) return order;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](std::size_t a, std::size_t b) {
+                     return freq[a] > freq[b];
+                   });
+  return order;
 }
 
 // просим sched_fifo и отрицательный nice, обычно в отказ но попытка не пытка
@@ -147,28 +183,39 @@ struct TaskPool::Impl {
   }
 };
 
+namespace {
+// snap-to-4 по умолчанию на арме; определение ниже (после конструктора),
+// но вызывается из него
+std::size_t default_workers();
+}  // namespace
+
 TaskPool::TaskPool() {
   impl_ = new Impl();
   const std::size_t total =
       std::max<std::size_t>(1, std::thread::hardware_concurrency());
-  impl_->workers = env_usize("TOKSHIT_POOL_WORKERS", total - 1);
+  impl_->workers = env_usize("TOKSHIT_POOL_WORKERS", default_workers());
+  if (impl_->workers > total) impl_->workers = total;
   if (impl_->workers > 1024) impl_->workers = 1024;
 
   const bool pin = std::getenv("TOKSHIT_POOL_PIN") != nullptr;
   const bool rt = std::getenv("TOKSHIT_POOL_RT") != nullptr;
   const bool stats = std::getenv("TOKSHIT_POOL_STATS") != nullptr;
+  const std::vector<std::size_t> order = cpus_by_freq(total);
 
   impl_->threads.reserve(impl_->workers);
   for (std::size_t i = 0; i < impl_->workers; ++i) {
-    impl_->threads.emplace_back([this, i, pin, rt, stats, total]() {
-      if (rt) try_realtime();
-      const int rc = boost_uclamp();
-      if (i == 0 && stats) {
-        std::fprintf(stderr, "[pool] uclamp.min=1024 -> %d\n", rc);
-      }
-      if (pin) pin_to_cpu((total - 1 - impl_->workers + i) % total);
-      impl_->worker_loop();
-    });
+    impl_->threads.emplace_back(
+        [this, i, pin, rt, stats, order]() {
+          if (rt) try_realtime();
+          const int rc = boost_uclamp();
+          if (i == 0 && stats) {
+            std::fprintf(stderr, "[pool] uclamp.min=1024 -> %d\n", rc);
+          }
+          if (pin && !order.empty()) {
+            pin_to_cpu(order[i % order.size()]);
+          }
+          impl_->worker_loop();
+        });
   }
 }
 
@@ -186,6 +233,19 @@ TaskPool& TaskPool::instance() {
   static TaskPool pool;
   return pool;
 }
+
+// Snap-to-4 threads: decode is GEMV (memory-bound), prefill is GEMM. Four
+// big cores is the sweet spot on a modern phone; more threads mostly spin on
+// the heterogeneous little cores and heat the fast ones.
+namespace {
+std::size_t default_workers() {
+#if defined(__aarch64__)
+  return 4;
+#else
+  return std::max<std::size_t>(1, std::thread::hardware_concurrency() - 1);
+#endif
+}
+}  // namespace
 
 void TaskPool::run(std::size_t n, TaskFn fn, void* ctx) {
   if (n == 0 || fn == nullptr) return;
@@ -213,8 +273,23 @@ void TaskPool::run(std::size_t n, TaskFn fn, void* ctx) {
     fn(ctx, i);
     ++mine;
   }
-  while (st.done.load(std::memory_order_acquire) < impl_->workers) {
-    std::this_thread::yield();
+  // Гетерогенные ядра: быстрые чистить спином, но периодически спать —
+  // на 2.8 ГГц-ядрах ждать на YIELD забивает опропорциональную тепловую разницу.
+  {
+    // ждём, пока все workers воркеры отметили done (exec_main + exec_workers
+    // равны workers)
+    const uint64_t target = impl_->workers;
+    uint64_t spins = 0;
+    while (st.done.load(std::memory_order_acquire) < target) {
+      if (spins >= 32) {
+        const timespec ts{0, 1000000};
+        ::nanosleep(&ts, nullptr);
+        spins = 0;
+      } else {
+        ++spins;
+        std::this_thread::yield();
+      }
+    }
   }
   st.exec_main.fetch_add(mine, std::memory_order_relaxed);
 }
@@ -230,7 +305,13 @@ void TaskPool::set_active(bool active) {
       std::fprintf(stderr, "[pool] main uclamp.min=1024 -> %d\n", rc);
     }
     if (std::getenv("TOKSHIT_POOL_PIN") != nullptr) {
-      const std::size_t main_cpu = env_usize("TOKSHIT_MAIN_CPU", 7);
+      static const std::size_t fastest = [] {
+        const std::size_t total =
+            std::max<std::size_t>(1, std::thread::hardware_concurrency());
+        const std::vector<std::size_t> order = cpus_by_freq(total);
+        return order.empty() ? std::size_t{0} : order.front();
+      }();
+      const std::size_t main_cpu = env_usize("TOKSHIT_MAIN_CPU", fastest);
       pin_to_cpu(main_cpu);
     }
   }

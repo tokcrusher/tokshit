@@ -2,7 +2,8 @@
 
 Target: decode ≥ 15 tok/s, prefill ≥ 50 tok/s for Flint-40B-A2.5B, top-6,
 lossless, on the target phone. The target is not reached. Current numbers,
-method and limits: [PERFORMANCE.ru.md](PERFORMANCE.ru.md).
+method and limits: [PERFORMANCE.ru.md](PERFORMANCE.ru.md). A second model,
+Inkling-2-Mini, is measured separately below.
 
 ## Current numbers
 
@@ -16,7 +17,19 @@ method and limits: [PERFORMANCE.ru.md](PERFORMANCE.ru.md).
 | prefill-bulk, T=224 | 2.32 |
 | speculation, full verify (lossless) | 0.93–1.0 |
 
-## Token budget
+### Inkling-2-Mini
+
+The second target is Inkling-2-Mini UD-Q2_K_XL (9.14 GB): 24 physical
+blocks, 48 KV slots, 3 loop passes, 128 experts top-8, hidden 2304. Plain
+greedy is noisy: roughly 1.6–3.0 tok/s depending on thermals and cache
+(2.1–2.4 in the session-3 runs). The experimental DSpark draft
+(`--dspark`) is greedy-only and lossless on tested prompts, but sequential
+verify measured 1.23 tok/s against 1.65 tok/s plain on a coding prompt
+(24 tokens, K=3). A batched verify path exists and is the default, but it
+has no measured tok/s yet, so DSpark is not a speed win. Details:
+[PERF_SESSION3.md](PERF_SESSION3.md), [DSPARK.md](DSPARK.md).
+
+## Flint token budget
 
 - dense weights after Q8_0: 1.74 GB;
 - experts on a full miss: 0.377 GB;
@@ -47,6 +60,6 @@ layout, i8mm GEMM for prefill, external cooling. Without one of them the
 
 ## Tests
 
-`build/tokshit_tests`: 161 cases, 7715 assertions. NEON kernels are checked
+`build/tokshit_tests`: 186 cases, 9951 assertions. NEON kernels are checked
 against the scalar path. Documentation links are checked by
 `scripts/check_links.sh`.

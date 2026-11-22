@@ -12,6 +12,9 @@
 #ifndef MADV_COLD
 #define MADV_COLD 20
 #endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 36
+#endif
 
 namespace tokshit {
 namespace {
@@ -93,6 +96,11 @@ void Mmap::advise_cold(size_t off, size_t len) const noexcept {
 bool Mmap::lock_range(size_t off, size_t len) const noexcept {
   if (ptr_ == nullptr || len == 0 || !valid_range(off, len, len_)) return false;
   return ::mlock(ptr_ + off, len) == 0;
+}
+
+bool Mmap::advise_hugepage() const noexcept {
+  if (ptr_ == nullptr || len_ == 0) return false;
+  return ::madvise(ptr_, len_, MADV_HUGEPAGE) == 0;
 }
 
 }  // namespace tokshit

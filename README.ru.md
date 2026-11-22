@@ -1,8 +1,9 @@
 # tokshit
 
 Специализированный инференс-движок на C++20 для ARM64/Snapdragon. Запускает
-MoE-модели, которые больше оперативной памяти устройства. Целевая связка:
-Flint-40B-A2.5B (GGUF, 18.5 ГБ) на телефоне с 15.2 ГБ RAM.
+MoE-модели, которые больше оперативной памяти устройства. Две целевые модели:
+Flint-40B-A2.5B (GGUF, 18.5 ГБ) и Inkling-2-Mini (UD-Q2_K_XL, 9.14 ГБ) на
+телефоне с 15.2 ГБ RAM.
 
 Универсальные движки платят кроссплатформенный налог: динамическая
 диспетчеризация, общие аллокаторы, компромиссы под x86 и CUDA. `tokshit`
@@ -16,6 +17,8 @@ English entry point: [README.md](README.md).
 
 - **MoE больше RAM.** 256 экспертов на слой, top-6. Эксперты читаются с
   флеша в кэш; плотные веса закреплены в AHB и не уходят в ZRAM.
+- **Inkling-2-Mini.** 24 физических блока, 48 KV-слотов, 3 loop-прохода,
+  128 экспертов top-8, hidden 2304. Модель грузится в RAM целиком.
 - **NEON dot-product.** Ядра для Q8_0, Q4_0 и IQ-форматов. i8mm-путь
   собирается, но на этом устройстве проигрывает и включается вручную
   (`TOKSHIT_I8MM=1`). Двухстрочные IQ-ядра (`TOKSHIT_IQ2ROW=1`) тоже
@@ -23,6 +26,10 @@ English entry point: [README.md](README.md).
 - **Спекулятивный декод.** Черновик на урезанном роутере, батч-verify,
   откат KV. Полный verify сохраняет жадный выход; на замерах медленнее
   обычного декода.
+- **DSpark (эксперимент).** Draft для Inkling-2-Mini: `dflash` GGUF на
+  402 МБ, block size 8, флаги `--dspark FILE` / `--dspark-k K`. Только
+  greedy, на проверенных промптах lossless, но пока медленнее обычного
+  декода и по умолчанию выключен.
 - **Частотный профиль роутинга.** Профиль хранится на диске и прогревает
   кэш экспертов до первого токена (`TOKSHIT_FREQ_PERSIST=1`).
 - **Батчевый префилл.** Веса читаются один раз на чанк, эксперты — union
@@ -54,15 +61,26 @@ English entry point: [README.md](README.md).
 `termux-wake-lock`, проверяйте температуру и давайте телефону остыть.
 `--turbo` меняет выход модели и не заменяет обычный декод.
 
+Вторая цель — Inkling-2-Mini. Замеры 2026-11-22 (телефон горячий):
+обычный greedy top-8 — примерно 1.6–1.7 tok/s; top-2 plain — 2.28.
+Экспериментальный DSpark: sequential 0.72, batched 0.52 против plain
+1.61–1.72 на coding-промпте 16 токенов (warm, K=3, acceptance 47.6 %) —
+выигрыша над plain на этом телефоне пока нет; `--turbo` измеряется
+0.26–0.30. **LOSSY**-ручки `--passes 2` и `--topk-experts 2` дают до ~5.2
+tok/s в коротких прогонах и меняют выход.
+Подробности — в [docs/PERF_SESSION3.md](docs/PERF_SESSION3.md).
+
 Микробенчмарки: Q8_0 matvec на сегментах — 25–35 ГБ/с; поток hot-весов
 1.74 ГБ через AHB — 5.2 ГБ/с; последовательное чтение с флеша — около
 1.4 ГБ/с. Узкое место декода — полный поток плотных весов.
 
-Бюджет токена: плотные веса около 1.74 ГБ (после переквантовки в Q8_0),
+Бюджет токена Flint: плотные веса около 1.74 ГБ (после переквантовки в Q8_0),
 эксперты при полном промахе около 0.38 ГБ (6 из 256 × 3 проекции ×
 47 слоёв). Методика и прогоны — в [docs/PERFORMANCE.ru.md](docs/PERFORMANCE.ru.md).
 
-## Модель
+## Модели
+
+### Flint-40B-A2.5B
 
 | параметр | значение |
 |---|---|
@@ -73,6 +91,18 @@ English entry point: [README.md](README.md).
 | внимание | 32 q-головы, 4 kv, head_dim 128, SWA 513 |
 | словарь / контекст | 150144 / 262144 |
 | кванты | эксперты IQ3_S/XXS и IQ4_XS; внимание Q8_0; роутер BF16 |
+
+### Inkling-2-Mini
+
+| параметр | значение |
+|---|---|
+| квант / размер | UD-Q2_K_XL, 9.14 ГБ |
+| параметры | 26.4B total, 3.4B active |
+| блоки | 24 физических, 48 KV-слотов |
+| loop | 3 прохода по core-слотам 6..17 |
+| эксперты | 128 на слой, top-8 |
+| hidden | 2304 |
+| словарь | 200058 используемых, 201024 с паддингом |
 
 ## Быстрый старт
 
@@ -86,7 +116,7 @@ cd tokshit
 Release/Ninja и кладёт бинарь в `$PREFIX/bin` (Termux) или
 `/usr/local/bin` (Linux).
 
-Модель в комплект не входит. Положите GGUF рядом и укажите путь:
+Модели в комплект не входят. Положите GGUF рядом и укажите путь:
 
 ```sh
 # один ответ
@@ -96,6 +126,15 @@ scripts/safe_run.sh build/tokshit --temperature 0 --cache-mb 512 \
 # интерактивный чат
 scripts/safe_run.sh build/tokshit --cache-mb 512 \
   ~/models/flint-UD-Q3_K_XL.gguf
+
+# Inkling-2-Mini
+scripts/safe_run.sh build/tokshit --temperature 0 \
+  ~/models/Inkling-2-Mini-UD-Q2_K_XL.gguf "привет" 24
+
+# Inkling-2-Mini с экспериментальным DSpark (только greedy)
+scripts/safe_run.sh build/tokshit --temperature 0 \
+  --dspark ~/models/dspark-Inkling-2-Mini-Q8_0.gguf --dspark-k 3 \
+  ~/models/Inkling-2-Mini-UD-Q2_K_XL.gguf "привет" 24
 
 # справка по флагам
 build/tokshit --help
@@ -133,7 +172,14 @@ build/tokshit [флаги] <model.gguf> "<промпт>" [max_new]
 | `--io-threads N` | фоновые читатели диска |
 | `--temperature/--top-k/--top-p` | сэмплинг |
 | `--turbo` | top-2 + Q4_0 dense, быстрее и **LOSSY** |
+| `--passes N` | core-проходы Inkling-2-Mini, 1..3; меньше — быстрее и **LOSSY** |
+| `--topk-experts K` | экспертов на токен; 2 = turbo-роутер, **LOSSY** |
+| `--kv-ctx N` | KV-позиции Inkling-2-Mini (по умолчанию 2048); 512 экономит ~300 МБ |
+| `--prefault=0` | demand paging вместо обхода всех страниц модели |
 | `--spec --spec-k N` | спекулятивный декод (lossless с полным verify) |
+| `--dspark FILE` | экспериментальный DSpark draft для Inkling-2-Mini, только greedy |
+| `--dspark-k K` | кандидатов DSpark за раунд, 1..7 (по умолчанию 3) |
+| `--dspark-batch 0\|1` | батч-verify DSpark (по умолчанию 1); 0 = последовательный |
 | `--expert-stats` | hit/miss кэша экспертов в конце прогона |
 
 Пресеты:
@@ -157,6 +203,12 @@ scripts/safe_run.sh build/tokshit --spec --spec-k 3 --temperature 0 \
 hot-веса и кэш экспертов. Hot-веса пакуются в сегменты по 32 МБ
 (`TOKSHIT_HOT_SEG_MB`); 512 МБ кэша — рабочая точка, 2 ГБ добавляют
 попадания, но уходят в reclaim.
+
+У Inkling-2-Mini префолт включён по умолчанию: загрузчик трогает все
+страницы и печатает `prefault: X GB touched, rss=..., MemAvailable=...`.
+Если RSS больше чем на 512 МБ ниже размера модели, будет WARNING: модель
+не resident, page cache будет thrash. Тогда освободите память,
+`--drop-siblings`, `--kv-ctx 512` или `--prefault=0`.
 
 Если памяти мало:
 
@@ -193,6 +245,8 @@ LICENSE            кастомная WTF 1.2
 | [docs/GGUF.md](docs/GGUF.md) | парсинг, метаданные, mmap/pread |
 | [docs/TOKENIZER.md](docs/TOKENIZER.md) | BPE и сэмплинг |
 | [docs/PERFORMANCE.ru.md](docs/PERFORMANCE.ru.md) | замеры и методика |
+| [docs/PERF_SESSION3.md](docs/PERF_SESSION3.md) | Inkling-2-Mini и попытка DSpark |
+| [docs/DSPARK.md](docs/DSPARK.md) | устройство DSpark, tap-маппинг, замеры |
 | [docs/SPEC_KV.md](docs/SPEC_KV.md) | KV, батч-матвек, спекуляция |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | ограничения и следующие шаги |
 | [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) | сборка и правила разработки |

@@ -18,6 +18,7 @@
 #include "tokshit/attn_batch.hpp"
 #include "tokshit/expert_io.hpp"
 #include "tokshit/gguf.hpp"
+#include "tokshit/inkling2.hpp"
 #include "tokshit/kernels.hpp"
 #include "tokshit/kv.hpp"
 #include "tokshit/mmap.hpp"
@@ -140,6 +141,10 @@ struct FreqState {
                                      std::size_t n_experts,
                                      const std::string& path);
 
+// expert-locality report (TOKSHIT_EXPERT_LOCALITY): prints per-layer
+// Jaccard overlap between consecutive router top-k sets; no-op otherwise.
+void expert_loc_report();
+
 class Model {
  public:
   Model();
@@ -195,6 +200,8 @@ class Model {
   [[nodiscard]] std::size_t n_used() const noexcept { return n_used_; }
 
   [[nodiscard]] const Gguf& gguf() const noexcept { return gguf_; }
+  [[nodiscard]] bool is_inkling2() const noexcept { return ink_ != nullptr; }
+  [[nodiscard]] Inkling2* inkling2() const noexcept { return ink_.get(); }
   [[nodiscard]] std::size_t n_layers() const noexcept { return n_layers_; }
   [[nodiscard]] std::size_t hidden() const noexcept { return hidden_; }
   [[nodiscard]] std::size_t n_heads() const noexcept { return n_heads_; }
@@ -331,6 +338,7 @@ class Model {
   std::unique_ptr<FreqState> freq_;
   std::unique_ptr<Workspace> ws_;
   std::unique_ptr<BatchBuf> batch_buf_;
+  std::unique_ptr<Inkling2> ink_;
   // Плотные веса: AHB-буферы (pinned dma-buf), а не std::vector. Иначе Android
   // кладёт их в zram, и каждый matvec платит за распаковку.
   ahb::HotWeights hot_;

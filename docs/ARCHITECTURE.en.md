@@ -27,6 +27,12 @@ and from the loader code.
 
 "47 layers" in older notes means 47 MoE layers; there are 49 blocks in total.
 
+The second target is Inkling-2-Mini (`general.architecture = inkling2`):
+24 physical blocks, 48 KV slots, 3 loop passes over core layers 6..17,
+128 experts top-8, hidden 2304, 9.14 GB in UD-Q2_K_XL. It has its own
+backend and loader; the Flint numbers above do not apply to it.
+Measurements: [PERF_SESSION3.md](PERF_SESSION3.md).
+
 ## modules
 
 - `gguf.cpp` — parses the header, metadata and tensor table. The file is
@@ -43,6 +49,12 @@ and from the loader code.
   for the speculative path.
 - `model.cpp` — load, forward, MoE, hot weights, cache, metrics.
 - `model_batch.cpp` — batched forward (`token_logits_batch`).
+- `inkling2_load.cpp`, `inkling2_forward.cpp` — Inkling-2-Mini backend:
+  loop slots, conv/depth-mix, DSpark taps.
+- `inkling2_batch.cpp` — batched slot-major forward: dense weights once per
+  B tokens, K/V and conv rollback for verify.
+- `dspark_load.cpp`, `dspark_forward.cpp` — `dflash` draft for DSpark:
+  tap injection, parallel backbone, Markov head.
 - `expert_io.cpp` — background expert reads, `O_DIRECT`, deduplication.
 - `ahb.cpp` — AHardwareBuffer: hot weights and the expert-cache slot pool.
 - `pool.cpp` — persistent worker pool with a spin barrier.
@@ -205,6 +217,8 @@ workers spinning instead of sleeping. `TOKSHIT_POOL_PIN` pins workers to cores;
 - `Q4_K`, `Q5_K`, `Q6_K`, `BF16` use the fallback; dense weights are
   requantized to `Q8_0` at load (`TOKSHIT_HOT_CONV`);
 - dispatch selects NEON via `HWCAP_ASIMDDP`, with no virtual calls;
+- 4-row `dot_rows` for `Q8_0`, `Q4_0`, `Q2_0` and `NVFP4` (`Q4_K` with
+  `TOKSHIT_KQK=1`); `expert_task` uses `dot_rows`;
 - batched kernels (`dot_row_multi`, `run_bsegs`) reuse a weight row for several
   activations;
 - a new NEON kernel is accepted only together with a scalar comparison.
@@ -238,6 +252,17 @@ Known issues:
   these are slower than normal top-6 with a 512 MB cache: 2.40 tok/s on a
   cool phone, 0.96 tok/s at 60 °C.
 
+Inkling-2-Mini has a separate path: DSpark (`--dspark FILE`). The draft is
+a 402 MB `dflash` GGUF with block size 8 and target taps `[5,23,41,48]`.
+The draft backbone processes all 8 positions in parallel; only the Markov
+head is chained. Greedy ids match plain greedy on tested prompts. Verify has
+a sequential mode and a batched mode
+(`inkling2_batch.cpp`, default), but only the sequential mode is measured:
+1.23 vs 1.65 tok/s plain greedy on a coding prompt (24 tokens, K=3, chain
+acceptance 30.8%). The batched path has parity checks but no measured win
+yet. It is experimental, not a replacement for `--spec`; details in
+[DSPARK.md](DSPARK.md).
+
 ## errors
 
 No exceptions. `Result<T>` is a variant of value or `Error`, `TOKSHIT_TRY` is
@@ -247,9 +272,9 @@ and tokenizer do.
 ## tests
 
 doctest, one file per area: quants, dequant, GGUF, mmap, cache, expert I/O,
-pool, sampling, tokenizer, KV, attention, batched kernels. The current line
-is 161 cases / 7715 assertions. Kernel and layer code is checked against the
-scalar reference in `compute/kernels_scalar.cpp`.
+pool, sampling, tokenizer, KV, attention, batched kernels, Inkling2. The
+current line is 186 cases / 9951 assertions. Kernel and layer code is checked
+against the scalar reference in `compute/kernels_scalar.cpp`.
 
 ## invariants
 

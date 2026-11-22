@@ -496,6 +496,16 @@ void Model::layer_batch(std::size_t layer, Kv& kv, std::size_t pos,
 
 void Model::token_logits_batch(std::span<const uint32_t> tokens, Kv& kv,
                                std::size_t pos, std::span<float> outs) {
+  if (ink_) {
+    const std::size_t v = vocab_;
+    std::vector<float> row(v);
+    for (std::size_t j = 0; j < tokens.size(); ++j) {
+      ink_->token_logits(tokens[j], pos + j, row);
+      std::copy(row.begin(), row.end(),
+                outs.begin() + static_cast<std::ptrdiff_t>(j * v));
+    }
+    return;
+  }
   const std::size_t b = tokens.size();
   if (b == 0) return;
   ensure_batch_buf(b);

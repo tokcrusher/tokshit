@@ -24,6 +24,18 @@
 namespace tokshit {
 namespace {
 
+uint64_t mem_available_mb() {
+  FILE* f = std::fopen("/proc/meminfo", "r");
+  if (f == nullptr) return 0;
+  char line[256];
+  unsigned long long kb = 0;
+  while (std::fgets(line, sizeof(line), f) != nullptr) {
+    if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+  }
+  std::fclose(f);
+  return static_cast<uint64_t>(kb) / 1024;
+}
+
 [[nodiscard]] Result<std::vector<float>> read_f32_tensor(const Gguf& gguf,
                                                          std::string_view name) {
   TOKSHIT_TRY(t, gguf.tensor(name));
@@ -72,6 +84,66 @@ Result<Model> Model::load(const std::string& path,
 
   TOKSHIT_TRY(mm, gguf.mmap_file());
   if (options.mmap_willneed) mm.advise_willneed();
+
+  // Диспетчеризация по architecture: inkling2 живёт отдельным бэкендом.
+  {
+    std::string arch;
+    if (auto a = gguf.get("general.architecture"); a.ok()) {
+      if (auto s = a.value()->as_str(); s.has_value()) arch = std::string(*s);
+    }
+    if (arch == "inkling2") {
+      const std::size_t kv_ctx = static_cast<std::size_t>(
+          env_u64("TOKSHIT_KV_CTX", 2048));
+      Model model;
+      model.gguf_ = std::move(gguf);
+      model.mm_ = std::move(mm);
+      TOKSHIT_TRY(ink,
+                  Inkling2::load(model.gguf_, model.mm_, kv_ctx));
+      // Модель целиком в RAM: 9.14 ГБ влезают в 15.2 ГБ. Трогаем страницы,
+      // чтобы дальше не было чтения с флеша на каждом токене.
+      const char* pf = std::getenv("TOKSHIT_PREFAULT");
+      if (pf == nullptr || pf[0] != '0') {
+        const auto bytes = model.mm_.bytes();
+        volatile uint8_t sink = 0;
+        for (std::size_t off = 0; off < bytes.size(); off += 4096) {
+          sink = sink ^ static_cast<uint8_t>(bytes[off]);
+        }
+        (void)sink;
+        const uint64_t rss = rss_mb();
+        const uint64_t avail = mem_available_mb();
+        std::fprintf(stderr,
+                     "[tokshit] prefault: %.2f GB touched, rss=%llu MB, "
+                     "MemAvailable=%llu MB\n",
+                     static_cast<double>(bytes.size()) / 1e9,
+                     static_cast<unsigned long long>(rss),
+                     static_cast<unsigned long long>(avail));
+        const uint64_t model_mb = bytes.size() / (1024 * 1024);
+        if (rss + 512 < model_mb) {
+          std::fprintf(stderr,
+                       "[tokshit] WARNING: model is not resident "
+                       "(rss %llu < %llu MB); page cache will thrash. "
+                       "Free memory, use --drop-siblings, or lower "
+                       "TOKSHIT_KV_CTX.\n",
+                       static_cast<unsigned long long>(rss),
+                       static_cast<unsigned long long>(model_mb));
+        }
+      }
+      model.ink_ = std::move(ink);
+      model.n_layers_ = model.ink_->n_slots();
+      model.hidden_ = 2304;
+      model.n_heads_ = 24;
+      model.n_kv_ = 8;
+      model.head_dim_ = 128;
+      model.n_experts_ = model.ink_->n_experts();
+      model.n_used_ = model.ink_->n_used();
+      model.vocab_ = model.ink_->vocab();
+      model.freq_key_.clear();
+      std::fprintf(stderr,
+                   "[tokshit] arch=inkling2 slots=%zu phys=%zu vocab=%zu\n",
+                   model.n_layers_, model.ink_->n_phys(), model.vocab_);
+      return model;
+    }
+  }
 
   TOKSHIT_TRY(n_layers_v, gguf.u64_kv("flint.block_count"));
   TOKSHIT_TRY(n_dense_v, gguf.u64_kv("flint.leading_dense_block_count"));

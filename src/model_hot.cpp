@@ -41,6 +41,7 @@ std::vector<Meta*> Model::dense_metas() {
 // Чистый поток hot-байтов: без matvec, только чтение и редукция.
 // Запускаем несколько потоков, иначе это меряет один ядерный порт, а не LPDDR.
 double Model::bench_hot_read(std::size_t passes) {
+  if (ink_) return 0.0;
   const std::vector<Meta*> list = dense_metas();
   uint64_t bytes = 0;
   for (const Meta* m : list) {
@@ -110,6 +111,7 @@ double Model::bench_hot_read(std::size_t passes) {
 
 // Полный dense matvec: все hot-тензоры через реальные ядра, без экспертов.
 double Model::bench_dense_matvec(std::size_t passes) {
+  if (ink_) return 0.0;
   const std::vector<Meta*> list = dense_metas();
   uint64_t bytes = 0;
   std::size_t max_in = 1;
@@ -147,6 +149,7 @@ double Model::bench_dense_matvec(std::size_t passes) {
 // копируем все неэкспертные веса в отдельный vector чтобы их не вытеснял
 // поток экспертов из page cache. на андроиде может не спасти (своп)
 void Model::collect_hot() {
+  if (ink_) return;
   std::vector<Meta*> list = dense_metas();
 
   const auto mm_bytes = mm_.bytes();

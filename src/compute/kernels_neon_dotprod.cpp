@@ -13,10 +13,12 @@
 #include <arm_neon.h>
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
+#include "../dequant_tables.hpp"
 #include "tokshit/dequant.hpp"
 #include "tokshit/gguf_tables.hpp"
 
@@ -71,6 +73,58 @@ constexpr std::array<std::uint64_t, 256> kMask8 = build_mask8();
          (static_cast<std::uint32_t>(p[1]) << 8) |
          (static_cast<std::uint32_t>(p[2]) << 16) |
          (static_cast<std::uint32_t>(p[3]) << 24);
+}
+
+// e8m0 -> float, уже поделённый на два: таблица e2m1 в dequant удвоена.
+// формула ровно как ggml_e8m0_to_fp32_half
+constexpr std::array<float, 256> build_e8m0_half() {
+  std::array<float, 256> out{};
+  for (std::uint32_t x = 0; x < 256; ++x) {
+    const std::uint32_t bits =
+        x < 2 ? (0x00200000U << x) : ((x - 1) << 23);
+    out[x] = std::bit_cast<float>(bits);
+  }
+  return out;
+}
+
+// ue4m3 (4-бит экспонента со сдвигом 7, 3-бит мантисса) -> float, тоже
+// пополам. 0x7f — NaN этого формата, dequant отдаёт для него 0
+constexpr std::array<float, 256> build_ue4m3_half() {
+  std::array<float, 256> out{};
+  for (std::uint32_t x = 0; x < 256; ++x) {
+    const std::uint32_t e = (x >> 3) & 0x0FU;
+    const std::uint32_t m = x & 7U;
+    if (x == 0x7FU) {
+      out[x] = 0.0F;
+      continue;
+    }
+    if (e == 0) {
+      out[x] = static_cast<float>(m) * (1.0F / 1024.0F);
+      continue;
+    }
+    float v = 1.0F + static_cast<float>(m) * 0.125F;
+    for (std::uint32_t i = 7; i < e; ++i) v *= 2.0F;
+    for (std::uint32_t i = e; i < 7; ++i) v *= 0.5F;
+    out[x] = v * 0.5F;
+  }
+  return out;
+}
+
+const std::array<float, 256> kE8m0Half = build_e8m0_half();
+const std::array<float, 256> kUe4m3Half = build_ue4m3_half();
+
+// q2_0: 16 байт = 64 веса, по 4 кода на байт. tbl раскладывает 4 байта в 16
+// значений, signed shift {0,-2,-4,-6} вытаскивает код, маска и -1 дают
+// значение -1..2 (как q - 1 в dequant)
+const std::array<std::uint8_t, 16> kQ2IdxLo = {
+    0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
+const std::array<std::uint8_t, 16> kQ2IdxHi = {
+    4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7};
+const std::array<std::int8_t, 16> kQ2Shifts = {
+    0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6, 0, -2, -4, -6};
+
+[[nodiscard]] inline int8x8_t grid8(const std::uint64_t& entry) noexcept {
+  return vld1_s8(reinterpret_cast<const std::int8_t*>(&entry));
 }
 
 }  // namespace
@@ -337,6 +391,104 @@ float dot_iq2s(const std::uint8_t* row, const ActQ8& act,
     }
   }
   return vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+}
+
+// iq2_s, четыре строки: решётка/знаки/шкалы так же как в dot_iq2s, входные
+// активации (a0/a1) загружаются один раз на сабблок и делятся между строками —
+// независимые пары vdot+fmla закрывают латентность vdot
+void dot_rows_iq2s(const std::uint8_t* rows, std::size_t rb, std::size_t nrows,
+                   const ActQ8& act, std::size_t in_dim, float* out) noexcept {
+  constexpr std::size_t kBs = 82;
+  const std::size_t nb = in_dim >> 8;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+
+  std::size_t r = 0;
+  for (; r + 4 <= nrows; r += 4) {
+    const std::uint8_t* p0 = rows + (r + 0) * rb;
+    const std::uint8_t* p1 = rows + (r + 1) * rb;
+    const std::uint8_t* p2 = rows + (r + 2) * rb;
+    const std::uint8_t* p3 = rows + (r + 3) * rb;
+    float32x4_t acc0 = vdupq_n_f32(0.0F);
+    float32x4_t acc1 = vdupq_n_f32(0.0F);
+    float32x4_t acc2 = vdupq_n_f32(0.0F);
+    float32x4_t acc3 = vdupq_n_f32(0.0F);
+
+    // одна строка: решётка/знаки/шкалы как в dot_iq2s
+    auto row_dot = [&](const std::uint8_t* p, float32x4_t& acc, std::size_t b,
+                       std::size_t ib, const int8x16_t& a0,
+                       const int8x16_t& a1) {
+      const std::size_t base = b * kBs;
+      const std::size_t a = b * 256 + ib * 32;
+      const float d4 = load_f16(p + base) * 0.25F;
+      const std::uint8_t qhb = p[base + 66 + ib];
+      const std::uint8_t* qsb = p + base + 2 + ib * 4;
+      const std::uint8_t* sgb = p + base + 34 + ib * 4;
+      const float spa = sp[a >> 5];
+      const std::uint32_t i00 =
+          static_cast<std::uint32_t>(qsb[0]) |
+          ((static_cast<std::uint32_t>(qhb) & 0x03U) << 8);
+      const std::uint32_t i01 =
+          static_cast<std::uint32_t>(qsb[1]) |
+          ((static_cast<std::uint32_t>(qhb) & 0x0CU) << 6);
+      const std::uint32_t i02 =
+          static_cast<std::uint32_t>(qsb[2]) |
+          ((static_cast<std::uint32_t>(qhb) & 0x30U) << 4);
+      const std::uint32_t i03 =
+          static_cast<std::uint32_t>(qsb[3]) |
+          ((static_cast<std::uint32_t>(qhb) & 0xC0U) << 2);
+      const int8x8_t g00 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &tables::iq2s_grid[i00]));
+      const int8x8_t g01 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &tables::iq2s_grid[i01]));
+      const int8x8_t g02 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &tables::iq2s_grid[i02]));
+      const int8x8_t g03 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &tables::iq2s_grid[i03]));
+      const int8x8_t m00 =
+          vld1_s8(reinterpret_cast<const std::int8_t*>(&kMask8[sgb[0]]));
+      const int8x8_t m01 =
+          vld1_s8(reinterpret_cast<const std::int8_t*>(&kMask8[sgb[1]]));
+      const int8x8_t m02 =
+          vld1_s8(reinterpret_cast<const std::int8_t*>(&kMask8[sgb[2]]));
+      const int8x8_t m03 =
+          vld1_s8(reinterpret_cast<const std::int8_t*>(&kMask8[sgb[3]]));
+      const int8x16_t w01 =
+          vcombine_s8(vsub_s8(veor_s8(g00, m00), m00),
+                      vsub_s8(veor_s8(g01, m01), m01));
+      const int8x16_t w23 =
+          vcombine_s8(vsub_s8(veor_s8(g02, m02), m02),
+                      vsub_s8(veor_s8(g03, m03), m03));
+      const float s01 =
+          d4 * (0.5F + static_cast<float>(p[base + 74 + ib] & 0x0Fu)) * spa;
+      const float s23 =
+          d4 * (0.5F + static_cast<float>((p[base + 74 + ib] >> 4) & 0x0Fu)) *
+          spa;
+      const int32x4_t q0 = vdotq_s32(vdupq_n_s32(0), w01, a0);
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(q0), vdupq_n_f32(s01));
+      const int32x4_t q1 = vdotq_s32(vdupq_n_s32(0), w23, a1);
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(q1), vdupq_n_f32(s23));
+    };
+
+    for (std::size_t b = 0; b < nb; ++b) {
+      for (std::size_t ib = 0; ib < 8; ++ib) {
+        const std::size_t a = b * 256 + ib * 32;
+        const int8x16_t a0 = vld1q_s8(ap + a);
+        const int8x16_t a1 = vld1q_s8(ap + a + 16);
+        row_dot(p0, acc0, b, ib, a0, a1);
+        row_dot(p1, acc1, b, ib, a0, a1);
+        row_dot(p2, acc2, b, ib, a0, a1);
+        row_dot(p3, acc3, b, ib, a0, a1);
+      }
+    }
+    out[r + 0] = vaddvq_f32(acc0);
+    out[r + 1] = vaddvq_f32(acc1);
+    out[r + 2] = vaddvq_f32(acc2);
+    out[r + 3] = vaddvq_f32(acc3);
+  }
+  for (; r < nrows; ++r) {
+    out[r] = dot_iq2s(rows + r * rb, act, in_dim);
+  }
 }
 
 // iq3_s: без промежуточного wbuf на стеке, считаем сразу по распакованным int8.
@@ -1080,6 +1232,852 @@ void dot_rows_iq3xxs(const std::uint8_t* rows, std::size_t rb,
   }
   for (; r < nrows; ++r) {
     out[r] = dot_iq3xxs(rows + r * rb, act, in_dim);
+  }
+}
+
+
+// ---- q2_0: блок 64, 2 бита, значения -1,0,1,2; шкала f16 на 64.
+// активация квантована по 32, поэтому блок веса делится на два сабблока.
+float dot_q2_0(const std::uint8_t* row, const ActQ8& act,
+               std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 18;
+  constexpr std::size_t kQk = 64;
+  const std::size_t nb = in_dim / kQk;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float32x4_t acc = vdupq_n_f32(0.0F);
+  const uint8x16_t mask2 = vdupq_n_u8(0x03U);
+  const int8x16_t one = vdupq_n_s8(1);
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = load_f16(row + b * kBs);
+    const uint8x16_t q = vld1q_u8(row + b * kBs + 2);
+    const uint8x16_t a = vandq_u8(q, mask2);
+    const uint8x16_t c =
+        vandq_u8(vshrq_n_u8(q, 2), mask2);
+    const uint8x16_t e =
+        vandq_u8(vshrq_n_u8(q, 4), mask2);
+    const uint8x16_t f = vshrq_n_u8(q, 6);
+    const uint8x16_t ab_lo = vzip1q_u8(a, c);
+    const uint8x16_t ab_hi = vzip2q_u8(a, c);
+    const uint8x16_t ef_lo = vzip1q_u8(e, f);
+    const uint8x16_t ef_hi = vzip2q_u8(e, f);
+    // второй уровень склейки — по 16-битным парам: (a,c) с (e,f), иначе
+    // получается a,e,c,f вместо a,c,e,f
+    const uint16x8_t ab16 = vreinterpretq_u16_u8(ab_lo);
+    const uint16x8_t ef16 = vreinterpretq_u16_u8(ef_lo);
+    const uint16x8_t ab16h = vreinterpretq_u16_u8(ab_hi);
+    const uint16x8_t ef16h = vreinterpretq_u16_u8(ef_hi);
+    const int8x16_t v0 =
+        vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                     vzip1q_u16(ab16, ef16))), one);
+    const int8x16_t v1 =
+        vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                     vzip2q_u16(ab16, ef16))), one);
+    const int8x16_t v2 =
+        vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                     vzip1q_u16(ab16h, ef16h))), one);
+    const int8x16_t v3 =
+        vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                     vzip2q_u16(ab16h, ef16h))), one);
+    int32x4_t s0 = vdotq_s32(vdupq_n_s32(0), v0, vld1q_s8(ap + b * 64));
+    s0 = vdotq_s32(s0, v1, vld1q_s8(ap + b * 64 + 16));
+    int32x4_t s1 = vdotq_s32(vdupq_n_s32(0), v2, vld1q_s8(ap + b * 64 + 32));
+    s1 = vdotq_s32(s1, v3, vld1q_s8(ap + b * 64 + 48));
+    acc = vfmaq_f32(acc, vcvtq_f32_s32(s0),
+                    vdupq_n_f32(d * sp[2 * b]));
+    acc = vfmaq_f32(acc, vcvtq_f32_s32(s1),
+                    vdupq_n_f32(d * sp[2 * b + 1]));
+  }
+  return vaddvq_f32(acc);
+}
+
+void dot_rows_q2_0(const std::uint8_t* rows, std::size_t rb,
+                   std::size_t nrows, const ActQ8& act,
+                   std::size_t in_dim, float* out) noexcept {
+  constexpr std::size_t kBs = 18;
+  constexpr std::size_t kQk = 64;
+  const std::size_t nb = in_dim / kQk;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  const uint8x16_t mask2 = vdupq_n_u8(0x03U);
+  const int8x16_t one = vdupq_n_s8(1);
+  std::size_t r = 0;
+  for (; r + 4 <= nrows; r += 4) {
+    const std::uint8_t* r0 = rows + (r + 0) * rb;
+    const std::uint8_t* r1 = rows + (r + 1) * rb;
+    const std::uint8_t* r2 = rows + (r + 2) * rb;
+    const std::uint8_t* r3 = rows + (r + 3) * rb;
+    float32x4_t a0 = vdupq_n_f32(0.0F);
+    float32x4_t a1 = vdupq_n_f32(0.0F);
+    float32x4_t a2 = vdupq_n_f32(0.0F);
+    float32x4_t a3 = vdupq_n_f32(0.0F);
+    for (std::size_t b = 0; b < nb; ++b) {
+      const int8x16_t x0 = vld1q_s8(ap + b * 64);
+      const int8x16_t x1 = vld1q_s8(ap + b * 64 + 16);
+      const int8x16_t x2 = vld1q_s8(ap + b * 64 + 32);
+      const int8x16_t x3 = vld1q_s8(ap + b * 64 + 48);
+      const float s0 = sp[2 * b];
+      const float s1 = sp[2 * b + 1];
+      auto acc_row = [&](const std::uint8_t* row, float32x4_t& acc) {
+        const float d = load_f16(row + b * kBs);
+        const uint8x16_t q = vld1q_u8(row + b * kBs + 2);
+        const uint8x16_t a = vandq_u8(q, mask2);
+        const uint8x16_t c = vandq_u8(vshrq_n_u8(q, 2), mask2);
+        const uint8x16_t e = vandq_u8(vshrq_n_u8(q, 4), mask2);
+        const uint8x16_t f = vshrq_n_u8(q, 6);
+        const uint8x16_t ab_lo = vzip1q_u8(a, c);
+        const uint8x16_t ab_hi = vzip2q_u8(a, c);
+        const uint8x16_t ef_lo = vzip1q_u8(e, f);
+        const uint8x16_t ef_hi = vzip2q_u8(e, f);
+        const uint16x8_t ab16 = vreinterpretq_u16_u8(ab_lo);
+        const uint16x8_t ef16 = vreinterpretq_u16_u8(ef_lo);
+        const uint16x8_t ab16h = vreinterpretq_u16_u8(ab_hi);
+        const uint16x8_t ef16h = vreinterpretq_u16_u8(ef_hi);
+        const int8x16_t v0 =
+            vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                         vzip1q_u16(ab16, ef16))), one);
+        const int8x16_t v1 =
+            vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                         vzip2q_u16(ab16, ef16))), one);
+        const int8x16_t v2 =
+            vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                         vzip1q_u16(ab16h, ef16h))), one);
+        const int8x16_t v3 =
+            vsubq_s8(vreinterpretq_s8_u8(vreinterpretq_u8_u16(
+                         vzip2q_u16(ab16h, ef16h))), one);
+        int32x4_t p0 = vdotq_s32(vdupq_n_s32(0), v0, x0);
+        p0 = vdotq_s32(p0, v1, x1);
+        int32x4_t p1 = vdotq_s32(vdupq_n_s32(0), v2, x2);
+        p1 = vdotq_s32(p1, v3, x3);
+        acc = vfmaq_f32(acc, vcvtq_f32_s32(p0),
+                        vdupq_n_f32(d * s0));
+        acc = vfmaq_f32(acc, vcvtq_f32_s32(p1),
+                        vdupq_n_f32(d * s1));
+      };
+      acc_row(r0, a0);
+      acc_row(r1, a1);
+      acc_row(r2, a2);
+      acc_row(r3, a3);
+    }
+    out[r + 0] = vaddvq_f32(a0);
+    out[r + 1] = vaddvq_f32(a1);
+    out[r + 2] = vaddvq_f32(a2);
+    out[r + 3] = vaddvq_f32(a3);
+  }
+  for (; r < nrows; ++r) {
+    out[r] = dot_q2_0(rows + r * rb, act, in_dim);
+  }
+}
+
+[[nodiscard]] inline float e8m0_half(std::uint8_t x) noexcept {
+  const std::uint32_t bits =
+      x < 2 ? (0x00200000u << x) : (static_cast<std::uint32_t>(x - 1) << 23);
+  return std::bit_cast<float>(bits);
+}
+
+[[nodiscard]] inline float ue4m3_half(std::uint8_t x) noexcept {
+  if (x == 0 || x == 0x7F) return 0.0F;
+  const int exp = (x >> 3) & 0xF;
+  const int man = x & 0x7;
+  const float raw =
+      exp == 0 ? std::ldexp(static_cast<float>(man), -9)
+               : std::ldexp(1.0F + static_cast<float>(man) / 8.0F, exp - 7);
+  return raw * 0.5F;
+}
+
+// ---- mxfp4: блок 32, e8m0 + 16 байт e2m1 (кодбук удвоен).
+float dot_mxfp4(const std::uint8_t* row, const ActQ8& act,
+                std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 17;
+  const std::size_t nb = in_dim / 32;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  const int8x16_t tbl = vld1q_s8(
+      reinterpret_cast<const std::int8_t*>(dequant_tables::kvalues_fp4.data()));
+  const uint8x16_t mask4 = vdupq_n_u8(0x0FU);
+  float32x4_t acc = vdupq_n_f32(0.0F);
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = e8m0_half(row[b * kBs]);
+    const uint8x16_t q = vld1q_u8(row + b * kBs + 1);
+    const int8x16_t wlo = vqtbl1q_s8(tbl, vandq_u8(q, mask4));
+    const int8x16_t whi = vqtbl1q_s8(tbl, vshrq_n_u8(q, 4));
+    int32x4_t s = vdotq_s32(vdupq_n_s32(0), wlo, vld1q_s8(ap + b * 32));
+    s = vdotq_s32(s, whi, vld1q_s8(ap + b * 32 + 16));
+    acc = vfmaq_f32(acc, vcvtq_f32_s32(s), vdupq_n_f32(d * sp[b]));
+  }
+  return vaddvq_f32(acc);
+}
+
+// ---- nvfp4: блок 64, 4 ue4m3 сабшкалы на 16 весов, кодбук e2m1.
+float dot_nvfp4(const std::uint8_t* row, const ActQ8& act,
+                std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 36;
+  const std::size_t nb = in_dim / 64;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  const int8x16_t tbl = vld1q_s8(
+      reinterpret_cast<const std::int8_t*>(dequant_tables::kvalues_fp4.data()));
+  const uint8x16_t mask4 = vdupq_n_u8(0x0FU);
+  float32x4_t acc = vdupq_n_f32(0.0F);
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t s = 0; s < 4; ++s) {
+      const std::size_t base = b * kBs + 4 + s * 8;
+      const float d = ue4m3_half(row[b * kBs + s]);
+      const uint8x8_t q = vld1_u8(row + base);
+      const int8x8_t wlo =
+          vqtbl1_s8(tbl, vand_u8(q, vget_low_u8(mask4)));
+      const int8x8_t whi = vqtbl1_s8(tbl, vshr_n_u8(q, 4));
+      const int8x16_t w = vcombine_s8(wlo, whi);
+      const std::size_t a = b * 64 + s * 16;
+      const int32x4_t t = vdotq_s32(vdupq_n_s32(0), w, vld1q_s8(ap + a));
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(t),
+                      vdupq_n_f32(d * sp[a / 32]));
+    }
+  }
+  return vaddvq_f32(acc);
+}
+
+
+void dot_rows_nvfp4(const std::uint8_t* rows, std::size_t rb,
+                    std::size_t nrows, const ActQ8& act,
+                    std::size_t in_dim, float* out) noexcept {
+  constexpr std::size_t kBs = 36;
+  const std::size_t nb = in_dim / 64;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  const int8x16_t tbl = vld1q_s8(
+      reinterpret_cast<const std::int8_t*>(dequant_tables::kvalues_fp4.data()));
+  const uint8x16_t mask4 = vdupq_n_u8(0x0FU);
+  std::size_t r = 0;
+  for (; r + 4 <= nrows; r += 4) {
+    const std::uint8_t* r0 = rows + (r + 0) * rb;
+    const std::uint8_t* r1 = rows + (r + 1) * rb;
+    const std::uint8_t* r2 = rows + (r + 2) * rb;
+    const std::uint8_t* r3 = rows + (r + 3) * rb;
+    float32x4_t a0 = vdupq_n_f32(0.0F);
+    float32x4_t a1 = vdupq_n_f32(0.0F);
+    float32x4_t a2 = vdupq_n_f32(0.0F);
+    float32x4_t a3 = vdupq_n_f32(0.0F);
+    for (std::size_t b = 0; b < nb; ++b) {
+      for (std::size_t s = 0; s < 4; ++s) {
+        const std::size_t base = b * kBs + 4 + s * 8;
+        const std::size_t a = b * 64 + s * 16;
+        const int8x16_t x = vld1q_s8(ap + a);
+        const float as = sp[a / 32];
+        auto acc_row = [&](const std::uint8_t* row, float32x4_t& acc) {
+          const float d = ue4m3_half(row[b * kBs + s]);
+          const uint8x8_t q = vld1_u8(row + base);
+          const int8x8_t wlo =
+              vqtbl1_s8(tbl, vand_u8(q, vget_low_u8(mask4)));
+          const int8x8_t whi = vqtbl1_s8(tbl, vshr_n_u8(q, 4));
+          const int8x16_t w = vcombine_s8(wlo, whi);
+          const int32x4_t t = vdotq_s32(vdupq_n_s32(0), w, x);
+          acc = vfmaq_f32(acc, vcvtq_f32_s32(t),
+                          vdupq_n_f32(d * as));
+        };
+        acc_row(r0, a0);
+        acc_row(r1, a1);
+        acc_row(r2, a2);
+        acc_row(r3, a3);
+      }
+    }
+    out[r + 0] = vaddvq_f32(a0);
+    out[r + 1] = vaddvq_f32(a1);
+    out[r + 2] = vaddvq_f32(a2);
+    out[r + 3] = vaddvq_f32(a3);
+  }
+  for (; r < nrows; ++r) {
+    out[r] = dot_nvfp4(rows + r * rb, act, in_dim);
+  }
+}
+
+// ---- iq1_s: 256 весов, 8 кодов решётки по 8 значений + дельта 0.125.
+// в отличие от q8_K-версии, активация квантована по 32, поэтому каждый
+// 32-сабблок считает свой bsum и свою шкалу активации.
+float dot_iq1s(const std::uint8_t* row, const ActQ8& act,
+               std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 50;
+  constexpr float kDelta = 0.125F;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float total = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const std::size_t base = b * kBs;
+    const float d = load_f16(row + base);
+    const std::uint8_t* qs = row + base + 2;
+    const std::uint16_t* qh =
+        reinterpret_cast<const std::uint16_t*>(row + base + 34);
+    float acc = 0.0F;
+    for (std::size_t j = 0; j < 8; ++j) {
+      const std::uint32_t q = qh[j];
+      const std::uint32_t idx0 =
+          static_cast<std::uint32_t>(qs[4 * j + 0]) | ((q << 8) & 0x700U);
+      const std::uint32_t idx1 =
+          static_cast<std::uint32_t>(qs[4 * j + 1]) | ((q << 5) & 0x700U);
+      const std::uint32_t idx2 =
+          static_cast<std::uint32_t>(qs[4 * j + 2]) | ((q << 2) & 0x700U);
+      const std::uint32_t idx3 =
+          static_cast<std::uint32_t>(qs[4 * j + 3]) | ((q >> 1) & 0x700U);
+      const int8x8_t g0 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &dequant_tables::iq1s_grid[idx0]));
+      const int8x8_t g1 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &dequant_tables::iq1s_grid[idx1]));
+      const int8x8_t g2 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &dequant_tables::iq1s_grid[idx2]));
+      const int8x8_t g3 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &dequant_tables::iq1s_grid[idx3]));
+      const std::size_t a = b * 256 + j * 32;
+      int32x4_t p = vdotq_s32(vdupq_n_s32(0), vcombine_s8(g0, g1),
+                              vld1q_s8(ap + a));
+      p = vdotq_s32(p, vcombine_s8(g2, g3), vld1q_s8(ap + a + 16));
+      const int psum = vaddvq_s32(p);
+      const int bsum = vaddlvq_s8(vld1q_s8(ap + a)) +
+                       vaddlvq_s8(vld1q_s8(ap + a + 16));
+      const float ls = 2.0F * static_cast<float>((q >> 12) & 7U) + 1.0F;
+      const float sign = (q & 0x8000U) != 0 ? -1.0F : 1.0F;
+      acc += (static_cast<float>(psum) +
+              kDelta * sign * static_cast<float>(bsum)) *
+             ls * sp[a >> 5];
+    }
+    total += d * acc;
+  }
+  return total;
+}
+
+
+// ---- iq2_xxs: 256 весов, 32 кода по 8 значений, знаки — чётные 7-битные
+// маски. шкала 0.5+3bit на 32-сабблок, активация — своя на 32.
+float dot_iq2xxs(const std::uint8_t* row, const ActQ8& act,
+                 std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 66;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float total = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const std::size_t base = b * kBs;
+    const float d = load_f16(row + base);
+    const std::uint8_t* qp = row + base + 2;
+    float acc = 0.0F;
+    for (std::size_t k = 0; k < 4; ++k) {
+      std::uint32_t aux[4];
+      std::memcpy(aux, qp + k * 16, 16);
+      const std::uint8_t* aux8 = reinterpret_cast<const std::uint8_t*>(aux);
+      const std::uint32_t idx[8] = {aux8[0], aux8[1], aux8[2], aux8[3],
+                                    aux8[8], aux8[9], aux8[10], aux8[11]};
+      const std::uint32_t sgn[8] = {(aux[1] >> 0) & 127U, (aux[1] >> 7) & 127U,
+                                    (aux[1] >> 14) & 127U, (aux[1] >> 21) & 127U,
+                                    (aux[3] >> 0) & 127U, (aux[3] >> 7) & 127U,
+                                    (aux[3] >> 14) & 127U, (aux[3] >> 21) & 127U};
+      const float sub1 = 0.5F + static_cast<float>(aux[1] >> 28);
+      const float sub2 = 0.5F + static_cast<float>(aux[3] >> 28);
+      for (std::size_t c = 0; c < 8; ++c) {
+        const int8x8_t g = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq2xxs_grid[idx[c]]));
+        const int8x8_t m = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &kMask8[tables::ksigns_iq2xs[sgn[c]]]));
+        const int8x8_t w = vsub_s8(veor_s8(g, m), m);
+        const std::size_t a = b * 256 + k * 64 + c * 8;
+        const int32x2_t p =
+            vdot_s32(vdup_n_s32(0), w, vld1_s8(ap + a));
+        acc += static_cast<float>(vget_lane_s32(p, 0) + vget_lane_s32(p, 1)) *
+               (c < 4 ? sub1 : sub2) * sp[a >> 5];
+      }
+    }
+    total += d * acc;
+  }
+  return 0.25F * total;
+}
+
+// ---- iq2_xs: 9-битный код решётки + 7-битные знаки в uint16; 4 шкалы
+// (2*4bit+1) на 64 веса.
+float dot_iq2xs(const std::uint8_t* row, const ActQ8& act,
+                std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 74;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float total = 0.0F;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const std::size_t base = b * kBs;
+    const float d = load_f16(row + base);
+    const std::uint16_t* qs =
+        reinterpret_cast<const std::uint16_t*>(row + base + 2);
+    const std::uint8_t* scales = row + base + 66;
+    float acc = 0.0F;
+    for (std::size_t k = 0; k < 4; ++k) {
+      for (std::size_t c = 0; c < 8; ++c) {
+        const std::uint16_t code = qs[k * 8 + c];
+        const int8x8_t g = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq2xs_grid[code & 511U]));
+        const int8x8_t m = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &kMask8[tables::ksigns_iq2xs[code >> 9]]));
+        const int8x8_t w = vsub_s8(veor_s8(g, m), m);
+        const std::size_t a = b * 256 + k * 64 + c * 8;
+        const int32x2_t p =
+            vdot_s32(vdup_n_s32(0), w, vld1_s8(ap + a));
+        const std::size_t si = 4 * k + c / 2;
+        const std::uint8_t sc = scales[si / 2];
+        const float ws = 2.0F * static_cast<float>(
+                                    (sc >> (4 * (si % 2))) & 0x0F) +
+                         1.0F;
+        acc += static_cast<float>(vget_lane_s32(p, 0) + vget_lane_s32(p, 1)) *
+               ws * sp[a >> 5];
+      }
+    }
+    total += d * acc;
+  }
+  return 0.125F * total;
+}
+
+
+// ---- iq2_xxs, четыре строки: тот же layout, что в dot_iq2xxs; входные
+// активации загружаются один раз на код — латентность vdot закрыта
+// независимыми цепочками. каждый код: 8 весов из решётки (iq2xxs_grid) +
+// 7-битный знак (ksigns_iq2xs), шкала 0.5+3bit на 32-сабблок
+void dot_rows_iq2xxs(const std::uint8_t* rows, std::size_t rb,
+                     std::size_t nrows, const ActQ8& act, std::size_t in_dim,
+                     float* out) noexcept {
+  constexpr std::size_t kBs = 66;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+
+  std::size_t r = 0;
+  for (; r + 4 <= nrows; r += 4) {
+    const std::uint8_t* p0 = rows + (r + 0) * rb;
+    const std::uint8_t* p1 = rows + (r + 1) * rb;
+    const std::uint8_t* p2 = rows + (r + 2) * rb;
+    const std::uint8_t* p3 = rows + (r + 3) * rb;
+    float32x4_t f0 = vdupq_n_f32(0.0F);
+    float32x4_t f1 = vdupq_n_f32(0.0F);
+    float32x4_t f2 = vdupq_n_f32(0.0F);
+    float32x4_t f3 = vdupq_n_f32(0.0F);
+    out[r + 0] = 0.0F;
+    out[r + 1] = 0.0F;
+    out[r + 2] = 0.0F;
+    out[r + 3] = 0.0F;
+    for (std::size_t b = 0; b < nb; ++b) {
+      const std::size_t base = b * kBs;
+      const float d0 = load_f16(p0 + base);
+      const float d1 = load_f16(p1 + base);
+      const float d2 = load_f16(p2 + base);
+      const float d3 = load_f16(p3 + base);
+      std::uint32_t aa[4][4];
+      std::memcpy(aa[0], p0 + base + 2, 16);
+      std::memcpy(aa[1], p1 + base + 2, 16);
+      std::memcpy(aa[2], p2 + base + 2, 16);
+      std::memcpy(aa[3], p3 + base + 2, 16);
+      for (std::size_t k = 0; k < 4; ++k) {
+        const std::size_t a0 = b * 256 + k * 64;
+        // пер-строчные индексы решётки и маски для кодов c=0..7
+        std::uint8_t idx[4][8];
+        std::uint8_t sg[4][8];
+        for (std::size_t q = 0; q < 4; ++q) {
+          const std::uint8_t* a8 = reinterpret_cast<const std::uint8_t*>(aa[q]);
+          for (std::size_t c = 0; c < 8; ++c) {
+            idx[q][c] = a8[c < 4 ? c : c + 4];
+            sg[q][c] = static_cast<std::uint8_t>(
+                (aa[q][c < 4 ? 1 : 3] >> (7 * (c % 4))) & 127U);
+          }
+        }
+        const float sub[4][2] = {
+            {0.5F + static_cast<float>(aa[0][1] >> 28),
+             0.5F + static_cast<float>(aa[0][3] >> 28)},
+            {0.5F + static_cast<float>(aa[1][1] >> 28),
+             0.5F + static_cast<float>(aa[1][3] >> 28)},
+            {0.5F + static_cast<float>(aa[2][1] >> 28),
+             0.5F + static_cast<float>(aa[2][3] >> 28)},
+            {0.5F + static_cast<float>(aa[3][1] >> 28),
+             0.5F + static_cast<float>(aa[3][3] >> 28)}};
+        for (std::size_t c = 0; c < 8; ++c) {
+          const std::size_t a = a0 + c * 8;
+          const float spv = sp[a >> 5];
+          // независимые цепочки на 4 строки: grid+sign загружены один раз,
+          // активации — одна на строку
+          const int8x8_t w0 = vsub_s8(
+              veor_s8(vld1_s8(reinterpret_cast<const std::int8_t*>(
+                            &dequant_tables::iq2xxs_grid[idx[0][c]])),
+                      vld1_s8(reinterpret_cast<const std::int8_t*>(
+                            &kMask8[tables::ksigns_iq2xs[sg[0][c]]]))),
+              vld1_s8(reinterpret_cast<const std::int8_t*>(
+                  &kMask8[tables::ksigns_iq2xs[sg[0][c]]])));
+          const int8x8_t w1 = vsub_s8(
+              veor_s8(vld1_s8(reinterpret_cast<const std::int8_t*>(
+                            &dequant_tables::iq2xxs_grid[idx[1][c]])),
+                      vld1_s8(reinterpret_cast<const std::int8_t*>(
+                            &kMask8[tables::ksigns_iq2xs[sg[1][c]]]))),
+              vld1_s8(reinterpret_cast<const std::int8_t*>(
+                  &kMask8[tables::ksigns_iq2xs[sg[1][c]]])));
+          const int8x8_t w2 = vsub_s8(
+              veor_s8(vld1_s8(reinterpret_cast<const std::int8_t*>(
+                            &dequant_tables::iq2xxs_grid[idx[2][c]])),
+                      vld1_s8(reinterpret_cast<const std::int8_t*>(
+                            &kMask8[tables::ksigns_iq2xs[sg[2][c]]]))),
+              vld1_s8(reinterpret_cast<const std::int8_t*>(
+                  &kMask8[tables::ksigns_iq2xs[sg[2][c]]])));
+          const int8x8_t w3 = vsub_s8(
+              veor_s8(vld1_s8(reinterpret_cast<const std::int8_t*>(
+                            &dequant_tables::iq2xxs_grid[idx[3][c]])),
+                      vld1_s8(reinterpret_cast<const std::int8_t*>(
+                            &kMask8[tables::ksigns_iq2xs[sg[3][c]]]))),
+              vld1_s8(reinterpret_cast<const std::int8_t*>(
+                  &kMask8[tables::ksigns_iq2xs[sg[3][c]]])));
+          const int32x2_t p0 =
+              vdot_s32(vdup_n_s32(0), w0, vld1_s8(ap + a));
+          const int32x2_t p1 =
+              vdot_s32(vdup_n_s32(0), w1, vld1_s8(ap + a));
+          const int32x2_t p2 =
+              vdot_s32(vdup_n_s32(0), w2, vld1_s8(ap + a));
+          const int32x2_t p3 =
+              vdot_s32(vdup_n_s32(0), w3, vld1_s8(ap + a));
+          f0 = vfmaq_f32(f0, vcvtq_f32_s32(vdupq_n_s32(
+                                 vget_lane_s32(p0, 0) + vget_lane_s32(p0, 1))),
+                         vdupq_n_f32((c < 4 ? sub[0][0] : sub[0][1]) * spv));
+          f1 = vfmaq_f32(f1, vcvtq_f32_s32(vdupq_n_s32(
+                                 vget_lane_s32(p1, 0) + vget_lane_s32(p1, 1))),
+                         vdupq_n_f32((c < 4 ? sub[1][0] : sub[1][1]) * spv));
+          f2 = vfmaq_f32(f2, vcvtq_f32_s32(vdupq_n_s32(
+                                 vget_lane_s32(p2, 0) + vget_lane_s32(p2, 1))),
+                         vdupq_n_f32((c < 4 ? sub[2][0] : sub[2][1]) * spv));
+          f3 = vfmaq_f32(f3, vcvtq_f32_s32(vdupq_n_s32(
+                                 vget_lane_s32(p3, 0) + vget_lane_s32(p3, 1))),
+                         vdupq_n_f32((c < 4 ? sub[3][0] : sub[3][1]) * spv));
+        }
+      }
+      // dot_iq2xxs: total += d * acc per block; out = 0.25 * total
+      out[r + 0] += 0.25F * d0 * vaddvq_f32(f0);
+      out[r + 1] += 0.25F * d1 * vaddvq_f32(f1);
+      out[r + 2] += 0.25F * d2 * vaddvq_f32(f2);
+      out[r + 3] += 0.25F * d3 * vaddvq_f32(f3);
+      f0 = vdupq_n_f32(0.0F);
+      f1 = vdupq_n_f32(0.0F);
+      f2 = vdupq_n_f32(0.0F);
+      f3 = vdupq_n_f32(0.0F);
+    }
+  }
+  for (; r < nrows; ++r) {
+    out[r] = dot_iq2xxs(rows + r * rb, act, in_dim);
+  }
+}
+
+// ---- q6_k: 256 весов, 6 бит; шкала int8 на 16 весов, d на блок.
+// раскладка: две половины по 128, в каждой q1/q2/q3/q4 по 32 значения.
+float dot_q6k(const std::uint8_t* row, const ActQ8& act,
+              std::size_t in_dim) noexcept {
+  constexpr std::size_t kBs = 210;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  float total = 0.0F;
+  const int8x16_t k32 = vdupq_n_s8(32);
+  const uint8x16_t low4 = vdupq_n_u8(0x0F);
+  for (std::size_t b = 0; b < nb; ++b) {
+    const std::size_t base = b * kBs;
+    const float d = load_f16(row + base + 208);
+    float acc = 0.0F;
+    for (std::size_t h = 0; h < 2; ++h) {
+      const std::uint8_t* ql = row + base + h * 64;
+      const std::uint8_t* qh = row + base + 128 + h * 32;
+      const std::int8_t* sc =
+          reinterpret_cast<const std::int8_t*>(row + base + 192 + h * 8);
+      for (std::size_t part = 0; part < 4; ++part) {
+        const std::size_t ql_off = (part & 1) ? 32 : 0;
+        const std::size_t sh = 2 * part;
+        for (std::size_t half = 0; half < 2; ++half) {
+          const std::uint8_t* qlb = ql + ql_off + half * 16;
+          const uint8x16_t qv =
+              vld1q_u8(qlb);
+          const uint8x16_t nib =
+              (part < 2) ? vandq_u8(qv, low4) : vshrq_n_u8(qv, 4);
+          const uint8x16_t hi = vandq_u8(
+              vshlq_u8(vld1q_u8(qh + half * 16),
+                       vdupq_n_s8(static_cast<std::int8_t>(-static_cast<int>(sh)))),
+              vdupq_n_u8(0x03));
+          const int8x16_t q = vsubq_s8(
+              vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(hi, 4))), k32);
+          const std::size_t a =
+              b * 256 + h * 128 + part * 32 + half * 16;
+          const int32x4_t p =
+              vdotq_s32(vdupq_n_s32(0), q, vld1q_s8(ap + a));
+          acc += static_cast<float>(vaddvq_s32(p)) *
+                 static_cast<float>(sc[part * 2 + half]) * sp[a >> 5];
+        }
+      }
+    }
+    total += d * acc;
+  }
+  return total;
+}
+
+// ---- iq1_s, четыре строки: тот же layout, что в dot_iq1s; каждая строка —
+// своя сетка (iq1s_grid) и активации, латентность vdot закрыта парами
+void dot_rows_iq1s(const std::uint8_t* rows, std::size_t rb,
+                   std::size_t nrows, const ActQ8& act, std::size_t in_dim,
+                   float* out) noexcept {
+  constexpr std::size_t kBs = 50;
+  constexpr float kDelta = 0.125F;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+
+  std::size_t r = 0;
+  for (; r + 4 <= nrows; r += 4) {
+    const std::uint8_t* p0 = rows + (r + 0) * rb;
+    const std::uint8_t* p1 = rows + (r + 1) * rb;
+    const std::uint8_t* p2 = rows + (r + 2) * rb;
+    const std::uint8_t* p3 = rows + (r + 3) * rb;
+    out[r + 0] = 0.0F;
+    out[r + 1] = 0.0F;
+    out[r + 2] = 0.0F;
+    out[r + 3] = 0.0F;
+    for (std::size_t b = 0; b < nb; ++b) {
+      const std::size_t base = b * kBs;
+      const float d0 = load_f16(p0 + base);
+      const float d1 = load_f16(p1 + base);
+      const float d2 = load_f16(p2 + base);
+      const float d3 = load_f16(p3 + base);
+      const std::uint8_t* qs0 = p0 + base + 2;
+      const std::uint8_t* qs1 = p1 + base + 2;
+      const std::uint8_t* qs2 = p2 + base + 2;
+      const std::uint8_t* qs3 = p3 + base + 2;
+      const std::uint16_t* qh0 =
+          reinterpret_cast<const std::uint16_t*>(p0 + base + 34);
+      const std::uint16_t* qh1 =
+          reinterpret_cast<const std::uint16_t*>(p1 + base + 34);
+      const std::uint16_t* qh2 =
+          reinterpret_cast<const std::uint16_t*>(p2 + base + 34);
+      const std::uint16_t* qh3 =
+          reinterpret_cast<const std::uint16_t*>(p3 + base + 34);
+      float a0 = 0.0F, a1 = 0.0F, a2 = 0.0F, a3 = 0.0F;
+      for (std::size_t j = 0; j < 8; ++j) {
+        const std::uint32_t q0 = qh0[j];
+        const std::uint32_t q1 = qh1[j];
+        const std::uint32_t q2 = qh2[j];
+        const std::uint32_t q3 = qh3[j];
+        const std::size_t a = b * 256 + j * 32;
+        const int8x16_t x0 = vld1q_s8(ap + a);
+        const int8x16_t x1 = vld1q_s8(ap + a + 16);
+        const int8x8_t g00 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs0[4 * j + 0] | ((q0 << 8) & 0x700U)]));
+        const int8x8_t g01 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs0[4 * j + 1] | ((q0 << 5) & 0x700U)]));
+        const int8x8_t g02 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs0[4 * j + 2] | ((q0 << 2) & 0x700U)]));
+        const int8x8_t g03 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs0[4 * j + 3] | ((q0 >> 1) & 0x700U)]));
+        int32x4_t p0v = vdotq_s32(vdupq_n_s32(0), vcombine_s8(g00, g01), x0);
+        p0v = vdotq_s32(p0v, vcombine_s8(g02, g03), x1);
+        const int8x8_t g10 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs1[4 * j + 0] | ((q1 << 8) & 0x700U)]));
+        const int8x8_t g11 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs1[4 * j + 1] | ((q1 << 5) & 0x700U)]));
+        const int8x8_t g12 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs1[4 * j + 2] | ((q1 << 2) & 0x700U)]));
+        const int8x8_t g13 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs1[4 * j + 3] | ((q1 >> 1) & 0x700U)]));
+        int32x4_t p1v = vdotq_s32(vdupq_n_s32(0), vcombine_s8(g10, g11), x0);
+        p1v = vdotq_s32(p1v, vcombine_s8(g12, g13), x1);
+        const int8x8_t g20 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs2[4 * j + 0] | ((q2 << 8) & 0x700U)]));
+        const int8x8_t g21 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs2[4 * j + 1] | ((q2 << 5) & 0x700U)]));
+        const int8x8_t g22 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs2[4 * j + 2] | ((q2 << 2) & 0x700U)]));
+        const int8x8_t g23 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs2[4 * j + 3] | ((q2 >> 1) & 0x700U)]));
+        int32x4_t p2v = vdotq_s32(vdupq_n_s32(0), vcombine_s8(g20, g21), x0);
+        p2v = vdotq_s32(p2v, vcombine_s8(g22, g23), x1);
+        const int8x8_t g30 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs3[4 * j + 0] | ((q3 << 8) & 0x700U)]));
+        const int8x8_t g31 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs3[4 * j + 1] | ((q3 << 5) & 0x700U)]));
+        const int8x8_t g32 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs3[4 * j + 2] | ((q3 << 2) & 0x700U)]));
+        const int8x8_t g33 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+            &dequant_tables::iq1s_grid[qs3[4 * j + 3] | ((q3 >> 1) & 0x700U)]));
+        int32x4_t p3v = vdotq_s32(vdupq_n_s32(0), vcombine_s8(g30, g31), x0);
+        p3v = vdotq_s32(p3v, vcombine_s8(g32, g33), x1);
+        // 4 независимые цепочки: каждая заканчивает парой vdot + скалярный
+        // вклад — латентность закрыта в 4 раза плотнее
+        const int psum0 = vaddvq_s32(p0v);
+        const int psum1 = vaddvq_s32(p1v);
+        const int psum2 = vaddvq_s32(p2v);
+        const int psum3 = vaddvq_s32(p3v);
+        const int bsum =
+            vaddlvq_s8(x0) + vaddlvq_s8(x1);
+        const std::size_t a5 = a >> 5;
+        const float ls0 = 2.0F * static_cast<float>((q0 >> 12) & 7U) + 1.0F;
+        const float ls1 = 2.0F * static_cast<float>((q1 >> 12) & 7U) + 1.0F;
+        const float ls2 = 2.0F * static_cast<float>((q2 >> 12) & 7U) + 1.0F;
+        const float ls3 = 2.0F * static_cast<float>((q3 >> 12) & 7U) + 1.0F;
+        const float sg0 = (q0 & 0x8000U) != 0 ? -1.0F : 1.0F;
+        const float sg1 = (q1 & 0x8000U) != 0 ? -1.0F : 1.0F;
+        const float sg2 = (q2 & 0x8000U) != 0 ? -1.0F : 1.0F;
+        const float sg3 = (q3 & 0x8000U) != 0 ? -1.0F : 1.0F;
+        a0 += (static_cast<float>(psum0) + kDelta * sg0 * static_cast<float>(bsum)) * ls0 * sp[a5];
+        a1 += (static_cast<float>(psum1) + kDelta * sg1 * static_cast<float>(bsum)) * ls1 * sp[a5];
+        a2 += (static_cast<float>(psum2) + kDelta * sg2 * static_cast<float>(bsum)) * ls2 * sp[a5];
+        a3 += (static_cast<float>(psum3) + kDelta * sg3 * static_cast<float>(bsum)) * ls3 * sp[a5];
+      }
+      out[r + 0] += d0 * a0;
+      out[r + 1] += d1 * a1;
+      out[r + 2] += d2 * a2;
+      out[r + 3] += d3 * a3;
+    }
+  }
+  for (; r < nrows; ++r) {
+    out[r] = dot_iq1s(rows + r * rb, act, in_dim);
+  }
+}
+
+// ---- mxfp4, четыре строки: тот же layout, что в dot_mxfp4; активации
+// загружаются один раз на блок, шкала e8m0 на блок
+void dot_rows_mxfp4(const std::uint8_t* rows, std::size_t rb,
+                    std::size_t nrows, const ActQ8& act, std::size_t in_dim,
+                    float* out) noexcept {
+  constexpr std::size_t kBs = 17;
+  const std::size_t nb = in_dim / 32;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  const int8x16_t tbl = vld1q_s8(
+      reinterpret_cast<const std::int8_t*>(dequant_tables::kvalues_fp4.data()));
+  const uint8x16_t mask4 = vdupq_n_u8(0x0FU);
+
+  std::size_t r = 0;
+  for (; r + 4 <= nrows; r += 4) {
+    float32x4_t a0 = vdupq_n_f32(0.0F);
+    float32x4_t a1 = vdupq_n_f32(0.0F);
+    float32x4_t a2 = vdupq_n_f32(0.0F);
+    float32x4_t a3 = vdupq_n_f32(0.0F);
+    for (std::size_t b = 0; b < nb; ++b) {
+      const int8x16_t x0 = vld1q_s8(ap + b * 32);
+      const int8x16_t x1 = vld1q_s8(ap + b * 32 + 16);
+      auto acc_row = [&](const std::uint8_t* p, float32x4_t& acc) {
+        const float d = e8m0_half(p[b * kBs]);
+        const uint8x16_t q = vld1q_u8(p + b * kBs + 1);
+        const int8x16_t wlo = vqtbl1q_s8(tbl, vandq_u8(q, mask4));
+        const int8x16_t whi = vqtbl1q_s8(tbl, vshrq_n_u8(q, 4));
+        int32x4_t s = vdotq_s32(vdupq_n_s32(0), wlo, x0);
+        s = vdotq_s32(s, whi, x1);
+        acc = vfmaq_f32(acc, vcvtq_f32_s32(s),
+                        vdupq_n_f32(d * sp[b]));
+      };
+      acc_row(rows + (r + 0) * rb, a0);
+      acc_row(rows + (r + 1) * rb, a1);
+      acc_row(rows + (r + 2) * rb, a2);
+      acc_row(rows + (r + 3) * rb, a3);
+    }
+    out[r + 0] = vaddvq_f32(a0);
+    out[r + 1] = vaddvq_f32(a1);
+    out[r + 2] = vaddvq_f32(a2);
+    out[r + 3] = vaddvq_f32(a3);
+  }
+  for (; r < nrows; ++r) {
+    out[r] = dot_mxfp4(rows + r * rb, act, in_dim);
+  }
+}
+
+// ---- q6_k, четыре строки: тот же layout, что в dot_q6k; активации загружаются
+// один раз на итерацию (vdot + vfma на строку), сумма vaddvq по блоку
+void dot_rows_q6k(const std::uint8_t* rows, std::size_t rb,
+                  std::size_t nrows, const ActQ8& act, std::size_t in_dim,
+                  float* out) noexcept {
+  constexpr std::size_t kBs = 210;
+  const std::size_t nb = in_dim / 256;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+  const int8x16_t k32 = vdupq_n_s8(32);
+  const uint8x16_t low4 = vdupq_n_u8(0x0F);
+
+  auto row_w = [&](const std::uint8_t* p, std::size_t base, std::size_t h,
+                   std::size_t part, std::size_t half, std::size_t ql_off,
+                   std::size_t sh) -> int8x16_t {
+    const uint8x16_t qv = vld1q_u8(p + base + h * 64 + ql_off + half * 16);
+    const uint8x16_t nib = (part < 2) ? vandq_u8(qv, low4) : vshrq_n_u8(qv, 4);
+    const uint8x16_t hi = vandq_u8(
+        vshlq_u8(vld1q_u8(p + base + 128 + h * 32 + half * 16),
+                 vdupq_n_s8(static_cast<std::int8_t>(-static_cast<int>(sh)))),
+        vdupq_n_u8(0x03));
+    return vsubq_s8(
+        vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(hi, 4))), k32);
+  };
+
+  std::size_t r = 0;
+  for (; r + 4 <= nrows; r += 4) {
+    const std::uint8_t* p0 = rows + (r + 0) * rb;
+    const std::uint8_t* p1 = rows + (r + 1) * rb;
+    const std::uint8_t* p2 = rows + (r + 2) * rb;
+    const std::uint8_t* p3 = rows + (r + 3) * rb;
+    float32x4_t f0 = vdupq_n_f32(0.0F);
+    float32x4_t f1 = vdupq_n_f32(0.0F);
+    float32x4_t f2 = vdupq_n_f32(0.0F);
+    float32x4_t f3 = vdupq_n_f32(0.0F);
+    for (std::size_t b = 0; b < nb; ++b) {
+      const std::size_t base = b * kBs;
+      const float d0 = load_f16(p0 + base + 208);
+      const float d1 = load_f16(p1 + base + 208);
+      const float d2 = load_f16(p2 + base + 208);
+      const float d3 = load_f16(p3 + base + 208);
+      for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t part = 0; part < 4; ++part) {
+          const std::size_t ql_off = (part & 1) ? 32 : 0;
+          const std::size_t sh = 2 * part;
+          for (std::size_t half = 0; half < 2; ++half) {
+            const std::size_t aoff =
+                b * 256 + h * 128 + part * 32 + half * 16;
+            const float sc0 =
+                static_cast<float>(
+                    reinterpret_cast<const std::int8_t*>(p0 + base + 192 + h * 8)[part * 2 + half]) *
+                sp[aoff >> 5];
+            const float sc1 =
+                static_cast<float>(
+                    reinterpret_cast<const std::int8_t*>(p1 + base + 192 + h * 8)[part * 2 + half]) *
+                sp[aoff >> 5];
+            const float sc2 =
+                static_cast<float>(
+                    reinterpret_cast<const std::int8_t*>(p2 + base + 192 + h * 8)[part * 2 + half]) *
+                sp[aoff >> 5];
+            const float sc3 =
+                static_cast<float>(
+                    reinterpret_cast<const std::int8_t*>(p3 + base + 192 + h * 8)[part * 2 + half]) *
+                sp[aoff >> 5];
+            const int32x4_t p0v =
+                vdotq_s32(vdupq_n_s32(0),
+                          row_w(p0, base, h, part, half, ql_off, sh),
+                          vld1q_s8(ap + aoff));
+            const int32x4_t p1v =
+                vdotq_s32(vdupq_n_s32(0),
+                          row_w(p1, base, h, part, half, ql_off, sh),
+                          vld1q_s8(ap + aoff));
+            const int32x4_t p2v =
+                vdotq_s32(vdupq_n_s32(0),
+                          row_w(p2, base, h, part, half, ql_off, sh),
+                          vld1q_s8(ap + aoff));
+            const int32x4_t p3v =
+                vdotq_s32(vdupq_n_s32(0),
+                          row_w(p3, base, h, part, half, ql_off, sh),
+                          vld1q_s8(ap + aoff));
+            f0 = vfmaq_f32(f0, vcvtq_f32_s32(p0v), vdupq_n_f32(sc0));
+            f1 = vfmaq_f32(f1, vcvtq_f32_s32(p1v), vdupq_n_f32(sc1));
+            f2 = vfmaq_f32(f2, vcvtq_f32_s32(p2v), vdupq_n_f32(sc2));
+            f3 = vfmaq_f32(f3, vcvtq_f32_s32(p3v), vdupq_n_f32(sc3));
+          }
+        }
+      }
+      out[r + 0] += d0 * vaddvq_f32(f0);
+      out[r + 1] += d1 * vaddvq_f32(f1);
+      out[r + 2] += d2 * vaddvq_f32(f2);
+      out[r + 3] += d3 * vaddvq_f32(f3);
+      f0 = vdupq_n_f32(0.0F);
+      f1 = vdupq_n_f32(0.0F);
+      f2 = vdupq_n_f32(0.0F);
+      f3 = vdupq_n_f32(0.0F);
+    }
+  }
+  for (; r < nrows; ++r) {
+    out[r] = dot_q6k(rows + r * rb, act, in_dim);
   }
 }
 

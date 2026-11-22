@@ -21,4 +21,12 @@ namespace tokshit::spec {
 void run(Model& model, const BpeTokenizer& tok, const std::string& prompt,
          std::size_t max_new);
 
+// DSpark drafter (Inkling2 target): greedy, lossless. `draft_path` points at
+// the dflash GGUF. K is read from TOKSHIT_DSPARK_K (default 3, max 7).
+// Returns false when DSpark cannot run (wrong passes, missing draft, ...);
+// the caller should then fall back to the normal decode path.
+bool run_dspark(Model& model, const BpeTokenizer& tok,
+                const std::string& prompt, std::size_t max_new,
+                const std::string& draft_path);
+
 }  // namespace tokshit::spec

@@ -211,6 +211,10 @@ void Model::prepare_workspace() {
 // размера). делает эмбеддинг, все слои, финальную норму и голову
 void Model::token_logits(uint32_t token, KVCache& kv, std::size_t pos,
                          std::vector<float>& out) {
+  if (ink_) {
+    ink_->token_logits(token, pos, out);
+    return;
+  }
   Workspace& ws = *ws_;
   // prefill: только первые вызовы (до начала генерации). main.cpp
   // выставит prefilling_ = false перед генерацией

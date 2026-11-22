@@ -303,15 +303,8 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     if (text.empty()) continue;
 
     tokshit::pool::set_active(true);
-    std::vector<uint32_t> turn;
-    turn.push_back(kUser);
-    if (!s.system_prompt.empty()) {
-      for (uint32_t id : tok.encode(s.system_prompt + "\n\n")) {
-        turn.push_back(id);
-      }
-    }
-    for (uint32_t id : tok.encode(text)) turn.push_back(id);
-    turn.push_back(kAssistant);
+    std::vector<uint32_t> turn =
+        tokshit::cli::build_turn(model, tok, text, s.system_prompt);
 
     const auto tp = tokshit::Clock::now();
     {

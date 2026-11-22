@@ -40,6 +40,13 @@ struct DecodeResult {
 extern volatile std::sig_atomic_t g_interrupt;
 void install_sigint();
 
+// Собирает ids хода. Для Flint — старый формат USER/text/ASSISTANT, для
+// inkling2 — шаблон Thinking Machines с effort-заголовком.
+[[nodiscard]] std::vector<uint32_t> build_turn(const Model& model,
+                                               const BpeTokenizer& tok,
+                                               std::string_view user,
+                                               std::string_view system);
+
 DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
                     std::size_t& pos, std::vector<float>& logits,
                     const SampleParams& params, Rng& rng, int reasoning_budget,
@@ -99,6 +106,14 @@ void chat_loop(Model& model, const BpeTokenizer& tok,
                const FreqProfileCfg& freq_cfg);
 void verify_ids(Model& model, const BpeTokenizer& tok, const std::string& prompt,
                 const std::string& path, std::size_t cap);
+void dspark_debug(Model& model, const BpeTokenizer& tok,
+                  const std::string& prompt, std::size_t steps,
+                  const std::string& draft_path);
+
+// Debug parity check: batched Inkling2 logits/taps против последовательных
+// на одном и том же префиксе.
+void ink_batch_debug(Model& model, const BpeTokenizer& tok,
+                     const std::string& prompt, std::size_t group);
 
 void print_help();
 void apply_env_presets();

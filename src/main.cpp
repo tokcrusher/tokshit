@@ -4,6 +4,8 @@
 #include <cstring>
 #include <string>
 
+#include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -14,6 +16,44 @@
 #include "cli.hpp"
 
 namespace cli = tokshit::cli;
+
+namespace {
+
+// Drop clean page-cache pages of sibling .gguf files (mmproj, other quants).
+// The text runtime does not need them, and on a 15 GB phone every cached
+// byte competes with the 9.14 GB target model.
+void drop_sibling_gguf(const std::string& model_path) {
+  const std::size_t slash = model_path.find_last_of('/');
+  const std::string dir = slash == std::string::npos
+                              ? std::string(".")
+                              : model_path.substr(0, slash);
+  const std::string self = slash == std::string::npos
+                               ? model_path
+                               : model_path.substr(slash + 1);
+  DIR* d = ::opendir(dir.c_str());
+  if (d == nullptr) return;
+  std::size_t dropped = 0;
+  while (dirent* e = ::readdir(d)) {
+    const std::string name = e->d_name;
+    if (name.size() <= 5 ||
+        name.compare(name.size() - 5, 5, ".gguf") != 0 || name == self) {
+      continue;
+    }
+    const std::string full = dir + "/" + name;
+    const int fd = ::open(full.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) continue;
+    (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    ::close(fd);
+    ++dropped;
+  }
+  ::closedir(d);
+  if (dropped != 0) {
+    std::fprintf(stderr, "[tokshit] dropped page cache of %zu sibling .gguf\n",
+                 dropped);
+  }
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   cli::apply_env_presets();
@@ -32,6 +72,11 @@ int main(int argc, char** argv) {
   options.hot = !(hot_env != nullptr && *hot_env == '0');
   options.mmap_willneed = std::getenv("TOKSHIT_MMAP_WILLNEED") != nullptr;
 
+  if (const char* v = std::getenv("TOKSHIT_DROP_SIBLINGS");
+      v != nullptr && *v != '\0' && v[0] != '0') {
+    drop_sibling_gguf(path);
+  }
+
   auto loaded = tokshit::Model::load(path, options);
   if (!loaded.ok()) {
     std::fprintf(stderr,
@@ -48,9 +93,12 @@ int main(int argc, char** argv) {
     model.collect_hot();
     // После копии плотных весов page cache от mmap не нужен: эксперты
     // читаются мимо него. Сбрасываем, чтобы отдать память кэшу экспертов.
-    if (const char* v = std::getenv("TOKSHIT_DROP_CACHE");
-        v == nullptr || *v != '0') {
-      model.gguf().fadvise_dontneed(0, model.gguf().file_len());
+    // Для inkling2 плотные веса остаются в mmap — cache не трогаем.
+    if (!model.is_inkling2()) {
+      if (const char* v = std::getenv("TOKSHIT_DROP_CACHE");
+          v == nullptr || *v != '0') {
+        model.gguf().fadvise_dontneed(0, model.gguf().file_len());
+      }
     }
   }
 
@@ -101,6 +149,25 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (const char* bt = std::getenv("TOKSHIT_INK_BATCH_TEST");
+      bt != nullptr && *bt != '\0') {
+    const std::size_t group =
+        argc > 3 ? static_cast<std::size_t>(std::strtoull(argv[3], nullptr, 10))
+                 : 3;
+    cli::ink_batch_debug(model, tok, argc > 2 ? argv[2] : "hi", group);
+    return 0;
+  }
+
+  if (const char* draft_path = std::getenv("TOKSHIT_DSPARK_DEBUG");
+      draft_path != nullptr && *draft_path != '\0') {
+    const std::size_t steps =
+        argc > 3 ? static_cast<std::size_t>(std::strtoull(argv[3], nullptr, 10))
+                 : 16;
+    cli::dspark_debug(model, tok, argc > 2 ? argv[2] : "hi", steps,
+                      draft_path);
+    return 0;
+  }
+
   // Teacher-forced verify: сравнить draft с эталонными id и посчитать acceptance.
   if (const char* v = std::getenv("TOKSHIT_VERIFY_IDS");
       v != nullptr && *v != '\0') {
@@ -138,6 +205,23 @@ int main(int argc, char** argv) {
       }
     }
     if (have_prompt) {
+      if (const char* dp = std::getenv("TOKSHIT_DSPARK");
+          dp != nullptr && *dp != '\0') {
+        float temperature = 0.0F;
+        if (const char* tv = std::getenv("TOKSHIT_TEMPERATURE");
+            tv != nullptr && *tv != '\0') {
+          temperature = std::strtof(tv, nullptr);
+        }
+        if (temperature > 1e-6F) {
+          std::fprintf(stderr,
+                       "[dspark] только greedy; выставьте --temperature 0\n");
+        } else if (tokshit::spec::run_dspark(model, tok, prompt, max_new, dp)) {
+          return 0;
+        } else {
+          std::fprintf(stderr,
+                       "[dspark] не запустился; обычный decode\n");
+        }
+      }
       if (const char* sv = std::getenv("TOKSHIT_SPEC");
           sv != nullptr && *sv != '\0' && std::strcmp(sv, "0") != 0) {
         tokshit::spec::run(model, tok, prompt, max_new);

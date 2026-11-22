@@ -314,10 +314,12 @@ void Model::prefetch_experts(std::size_t layer,
 
 // обёртки частотного профиля: see free functions above
 bool Model::save_freq_profile(const std::string& path) const {
+  if (ink_) return false;
   return tokshit::save_freq_profile(*freq_, n_layers_, path);
 }
 
 bool Model::load_freq_profile(const std::string& path) {
+  if (ink_) return false;
   return tokshit::load_freq_profile(*freq_, n_layers_, n_experts_, path);
 }
 
@@ -325,10 +327,15 @@ bool Model::load_freq_profile(const std::string& path) {
 // модели. веса при k_used=1 вырождаются в единицу — черновик читает в n_used
 // раз меньше байтов с диска и считается пропорционально быстрее
 void Model::set_router_topk(std::size_t k) {
+  if (ink_) {
+    ink_->set_router_topk(k);
+    return;
+  }
   router_topk_ = k;
 }
 
 std::size_t Model::router_topk() const noexcept {
+  if (ink_) return n_used_;
   return router_topk_ != 0 && router_topk_ < n_used_ ? router_topk_ : n_used_;
 }
 
@@ -416,6 +423,7 @@ void Model::prefill_bulk_layer(std::size_t layer,
 }
 
 void Model::pin_hot_experts(std::size_t k) {
+  if (ink_) return;
   if (!io_ || resident_budget_ == 0 || k == 0) return;
 
   std::fprintf(stderr, "[pin] called k=%zu, budget_per_layer=%llu MB\n",

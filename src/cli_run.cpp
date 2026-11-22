@@ -12,7 +12,10 @@
 #include <unistd.h>
 
 #include "tokshit/dequant.hpp"
+#include "tokshit/dspark.hpp"
+#include "tokshit/gguf.hpp"
 #include "tokshit/kv.hpp"
+#include "tokshit/mmap.hpp"
 #include "tokshit/metrics.hpp"
 #include "tokshit/model.hpp"
 #include "tokshit/pool.hpp"
@@ -106,25 +109,45 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   const tokshit::SampleParams params = sample_params_from_env();
   const auto t0 = tokshit::Clock::now();
 
-  std::vector<uint32_t> turn;
-  turn.push_back(kUser);
-  for (uint32_t id : tok.encode(prompt)) turn.push_back(id);
-  turn.push_back(kAssistant);
+  std::vector<uint32_t> turn = tokshit::cli::build_turn(model, tok, prompt, "");
+  if (std::getenv("TOKSHIT_DUMP_TURN") != nullptr) {
+    std::fprintf(stderr, "[turn]");
+    for (uint32_t id : turn) std::fprintf(stderr, " %u", id);
+    std::fprintf(stderr, "\n");
+  }
 
   model.set_prefilling(true);
   {
     PrefillBar bar;
     bar.start();
     std::size_t done = 0;
-    const std::size_t pchunk = dump == nullptr ? prefill_batch_size() : 0;
+    const std::size_t pchunk =
+        (dump == nullptr && !model.is_inkling2()) ? prefill_batch_size() : 0;
     if (pchunk != 0 && !turn.empty()) {
       prefill_batched(model, std::span<const uint32_t>(turn), pos, pchunk, kv,
                       logits);
       pos += turn.size();
     } else {
+      const bool ppl_dbg = std::getenv("TOKSHIT_INK_PPL") != nullptr;
       for (uint32_t id : turn) {
         model.token_logits(id, kv, pos, logits);
         dump_logits(dump, logits);
+        if (ppl_dbg && pos + 1 < turn.size()) {
+          float mx = logits[0];
+          for (float v : logits) mx = std::max(mx, v);
+          double se = 0.0;
+          for (float v : logits) se += std::exp(static_cast<double>(v) - mx);
+          const double lse = mx + std::log(se);
+          const uint32_t tg = turn[pos + 1];
+          std::size_t top = 0;
+          for (std::size_t i = 1; i < logits.size(); ++i) {
+            if (logits[i] > logits[top]) top = i;
+          }
+          std::fprintf(stderr,
+                       "[ppl] p=%zu target=%u logp=%.4f top=%zu top_logp=%.4f\n",
+                       pos, tg, static_cast<double>(logits[tg]) - lse, top,
+                       static_cast<double>(logits[top]) - lse);
+        }
         ++pos;
         ++done;
         bar.tick(done, turn.size(), width, err_tty);
@@ -133,6 +156,75 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     bar.finish(err_tty);
   }
   model.set_prefilling(false);
+  if (std::getenv("TOKSHIT_DUMP_TURN") != nullptr && !logits.empty()) {
+    float mx = logits[0];
+    for (float v : logits) mx = std::max(mx, v);
+    std::fprintf(stderr, "[turn] logits size=%zu max=%.3f first=%.3f\n",
+                 logits.size(), mx, logits[0]);
+  }
+  if (const char* probe = std::getenv("TOKSHIT_INK_PROBE");
+      probe != nullptr && *probe != '\0') {
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < logits.size(); ++i) {
+      if (logits[i] > logits[best]) best = i;
+    }
+    std::fprintf(stderr, "[probe] argmax=%zu '%s'\n", best,
+                 tok.decode(std::vector<uint32_t>{static_cast<uint32_t>(best)})
+                     .c_str());
+    std::vector<uint32_t> pr = tok.encode(probe);
+    if (!pr.empty()) {
+      const uint32_t id = pr[0];
+      std::size_t rank = 0;
+      for (std::size_t i = 0; i < logits.size(); ++i) {
+        if (logits[i] > logits[id]) ++rank;
+      }
+      std::fprintf(stderr, "[probe] '%s' id=%u rank=%zu logit=%.3f top=%.3f\n",
+                   probe, id, rank, logits[id], logits[best]);
+    }
+    // top-5
+    for (int k = 0; k < 5; ++k) {
+      std::size_t bi = 0;
+      for (std::size_t i = 1; i < logits.size(); ++i) {
+        if (logits[i] > logits[bi]) bi = i;
+      }
+      std::fprintf(stderr, "[probe] #%d %.3f %zu '%s'\n", k, logits[bi], bi,
+                   tok.decode(std::vector<uint32_t>{
+                                  static_cast<uint32_t>(bi)}).c_str());
+      logits[bi] = -1e30F;
+    }
+  }
+  if (std::getenv("TOKSHIT_INK_SELFTEST") != nullptr) {
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < logits.size(); ++i) {
+      if (logits[i] > logits[best]) best = i;
+    }
+    const uint32_t t = static_cast<uint32_t>(best);
+    std::vector<float> inc;
+    model.token_logits(t, kv, pos, inc);
+    ++pos;
+    std::vector<float> fresh;
+    std::size_t p2 = 0;
+    for (uint32_t id : turn) model.token_logits(id, kv, p2++, fresh);
+    model.token_logits(t, kv, p2, fresh);
+    double md = 0.0;
+    std::size_t bi = 0;
+    for (std::size_t i = 0; i < inc.size(); ++i) {
+      const double d = std::fabs(static_cast<double>(inc[i]) - fresh[i]);
+      if (d > md) {
+        md = d;
+        bi = i;
+      }
+    }
+    std::fprintf(stderr,
+                 "[selftest] token=%u inc_top=%zu fresh_top=%zu maxdiff=%.4f "
+                 "at %zu (inc=%.3f fresh=%.3f)\n",
+                 t, static_cast<std::size_t>(std::distance(
+                        inc.begin(), std::max_element(inc.begin(), inc.end()))),
+                 static_cast<std::size_t>(std::distance(
+                        fresh.begin(), std::max_element(fresh.begin(), fresh.end()))),
+                 md, bi, inc[bi], fresh[bi]);
+    return;
+  }
   const double prefill =
       std::chrono::duration<double>(tokshit::Clock::now() - t0).count();
   if (tokshit::prefetch_enabled()) model.pin_hot_experts(64);
@@ -226,6 +318,9 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   }
   if (std::getenv("TOKSHIT_EXPERT_STATS") != nullptr) {
     print_expert_stats(m);
+  }
+  if (std::getenv("TOKSHIT_EXPERT_LOCALITY") != nullptr) {
+    expert_loc_report();
   }
   tokshit::pool::set_active(false);
 }
@@ -330,6 +425,202 @@ void verify_ids(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
                    static_cast<double>(ref.size()),
                first_miss, runs, avg_run, longest,
                static_cast<double>(ref.size()) / (dt > 1e-9 ? dt : 1e-9));
+}
+
+// Teacher-forced DSpark check: run the target ahead, feed its real taps into
+// the draft and count how often the first draft token matches the target's
+// next greedy token. This isolates draft quality from verification plumbing.
+void dspark_debug(Model& model, const BpeTokenizer& tok,
+                  const std::string& prompt, std::size_t steps,
+                  const std::string& draft_path) {
+  Inkling2* ink = model.inkling2();
+  if (ink == nullptr) {
+    std::fprintf(stderr, "[dspark] not an Inkling2 model\n");
+    return;
+  }
+  auto g = Gguf::open(draft_path);
+  if (!g.ok()) {
+    std::fprintf(stderr, "[dspark] open: %s\n",
+                 g.error().message.c_str());
+    return;
+  }
+  Gguf draft_gguf = std::move(g.value());
+  auto mm = draft_gguf.mmap_file();
+  if (!mm.ok()) {
+    std::fprintf(stderr, "[dspark] mmap: %s\n", mm.error().message.c_str());
+    return;
+  }
+  Mmap draft_mm = std::move(mm.value());
+  auto d = DSpark::load(draft_gguf, draft_mm, *ink, ink->kv_ctx());
+  if (!d.ok()) {
+    std::fprintf(stderr, "[dspark] load: %s\n", d.error().message.c_str());
+    return;
+  }
+  auto& draft = *d.value();
+  std::vector<uint32_t> turn = build_turn(model, tok, prompt, "");
+  std::vector<float> logits(ink->vocab(), 0.0F);
+  std::size_t pos = 0;
+  pool::set_active(true);
+  const auto t0 = Clock::now();
+  for (uint32_t id : turn) {
+    ink->token_logits(id, pos, logits);
+    draft.inject(pos, ink->taps());
+    ++pos;
+  }
+  std::fprintf(stderr,
+               "[dspark] prefill %zu tok, taps=%zu, block=%zu, target_slots:",
+               turn.size(), ink->n_taps(), draft.block_size());
+  for (uint32_t s : draft.target_slots()) std::fprintf(stderr, " %u", s);
+  std::fputs("\n", stderr);
+
+  std::size_t agree = 0;
+  std::size_t runs = 0;
+  std::vector<uint32_t> cand;
+  uint32_t last = turn.empty() ? 0 : turn.back();
+  for (std::size_t i = 0; i < steps; ++i) {
+    std::size_t best = 0;
+    for (std::size_t j = 1; j < logits.size(); ++j) {
+      if (logits[j] > logits[best]) best = j;
+    }
+    if (tok.is_eog(static_cast<uint32_t>(best))) break;
+    draft.draft(last, pos, 3, cand);
+    const bool ok = !cand.empty() && cand[0] == best;
+    if (ok) ++agree;
+    ++runs;
+    if (std::getenv("TOKSHIT_DSPARK_TRACE") != nullptr) {
+      std::fprintf(stderr, "[dspark] p=%zu target=%zu draft:", pos, best);
+      for (uint32_t c : cand) std::fprintf(stderr, " %u", c);
+      std::fprintf(stderr, " %s\n", ok ? "ok" : "MISS");
+    }
+    ink->token_logits(static_cast<uint32_t>(best), pos, logits);
+    draft.inject(pos, ink->taps());
+    last = static_cast<uint32_t>(best);
+    ++pos;
+  }
+  pool::set_active(false);
+  const double dt =
+      std::chrono::duration<double>(Clock::now() - t0).count();
+  std::fprintf(stderr,
+               "[dspark] first-token acceptance %zu/%zu = %.1f%%, %.2f tok/s "
+               "(teacher-forced, includes target)\n",
+               agree, runs,
+               runs != 0 ? 100.0 * static_cast<double>(agree) /
+                               static_cast<double>(runs)
+                         : 0.0,
+               dt > 1e-9 ? static_cast<double>(runs) / dt : 0.0);
+}
+
+// Прямая проверка батч-пути: на каждом префиксе считаем nb токенов
+// последовательно и батчем, сравниваем логиты и tap-буферы. Состояние до
+// группы восстанавливается через Snapshot; K/V хвоста перезаписываются
+// батчем до первого чтения, как в настоящем verify.
+void ink_batch_debug(Model& model, const BpeTokenizer& tok,
+                     const std::string& prompt, std::size_t group) {
+  Inkling2* ink = model.inkling2();
+  if (ink == nullptr) {
+    std::fprintf(stderr, "[batch] not an Inkling2 model\n");
+    return;
+  }
+  if (group == 0) group = 1;
+  group = std::min<std::size_t>(group, 8);
+  std::vector<uint32_t> tap_slots(ink->n_slots() + 1);
+  for (std::size_t i = 0; i < tap_slots.size(); ++i) {
+    tap_slots[i] = static_cast<uint32_t>(i);
+  }
+  ink->set_tap_slots(std::span<const uint32_t>(tap_slots));
+  std::vector<uint32_t> turn = build_turn(model, tok, prompt, "");
+  const std::size_t v = ink->vocab();
+  const std::size_t nt = ink->n_taps();
+  const std::size_t h = ink->n_embd();
+  std::vector<float> ref(v * group, 0.0F);
+  std::vector<float> got(v * group, 0.0F);
+  std::vector<float> row(v, 0.0F);
+  std::vector<float> ref_taps(group * nt * h, 0.0F);
+  std::vector<uint32_t> ids(group, 0);
+
+  std::size_t p = 0;
+  std::size_t groups = 0;
+  std::size_t argmax_bad = 0;
+  std::size_t tap_bad = 0;
+  double worst = 0.0;
+  double worst_tap = 0.0;
+  pool::set_active(true);
+  while (p < turn.size()) {
+    const std::size_t nb = std::min(group, turn.size() - p);
+    // Свежий replay префикса: иначе K/V от батча предыдущей группы (который
+    // мог разойтись) протекает в эталон. Snapshot/restore не трогает K/V,
+    // поэтому каждый p стартует с чистого листа.
+    for (std::size_t i = 0; i < p; ++i) {
+      ink->token_logits(turn[i], i, row);
+    }
+    Inkling2::Snapshot pre;
+    ink->snapshot(pre);
+    for (std::size_t j = 0; j < nb; ++j) {
+      ink->token_logits(turn[p + j], p + j, row);
+      std::memcpy(ref.data() + j * v, row.data(), v * sizeof(float));
+      if (nt != 0) {
+        std::memcpy(ref_taps.data() + j * nt * h, ink->taps().data(),
+                    nt * h * sizeof(float));
+      }
+      ids[j] = turn[p + j];
+    }
+    ink->restore(pre);
+    ink->token_logits_batch(std::span<const uint32_t>(ids.data(), nb), p,
+                            std::span<float>(got.data(), nb * v));
+    if (ink->last_batch() != nb) {
+      std::fprintf(stderr, "[batch] p=%zu last_batch=%zu != %zu\n", p,
+                   ink->last_batch(), nb);
+      break;
+    }
+    double gmax = 0.0;
+    std::size_t gbad = 0;
+    for (std::size_t j = 0; j < nb; ++j) {
+      const float* a = ref.data() + j * v;
+      const float* b = got.data() + j * v;
+      std::size_t ai = 0;
+      std::size_t bi = 0;
+      for (std::size_t i = 0; i < v; ++i) {
+        gmax = std::max(gmax, static_cast<double>(std::fabs(a[i] - b[i])));
+        if (a[i] > a[ai]) ai = i;
+        if (b[i] > b[bi]) bi = i;
+      }
+      if (ai != bi) ++gbad;
+    }
+    double gtap = 0.0;
+    std::size_t bad_j = 999;
+    std::size_t bad_k = 999;
+    if (nt != 0) {
+      const auto bt = ink->taps_batch();
+      for (std::size_t j = 0; j < nb; ++j) {
+        for (std::size_t k = 0; k < nt * h; ++k) {
+          const double d = static_cast<double>(
+              std::fabs(ref_taps[j * nt * h + k] - bt[j * nt * h + k]));
+          if (d != 0.0 && bad_j == 999) {
+            bad_j = j;
+            bad_k = k / h;
+          }
+          gtap = std::max(gtap, d);
+        }
+      }
+      if (gtap != 0.0) ++tap_bad;
+    }
+    std::fprintf(stderr,
+                 "[batch] p=%zu nb=%zu max|dlogit|=%.6g argmax_bad=%zu "
+                 "max|dtap|=%.6g first_bad=tok%zu/slot%zu\n",
+                 p, nb, gmax, gbad, gtap,
+                 bad_j == 999 ? 999 : bad_j,
+                 bad_k == 999 ? 999 : tap_slots[bad_k]);
+    worst = std::max(worst, gmax);
+    worst_tap = std::max(worst_tap, gtap);
+    argmax_bad += gbad;
+    ++groups;
+    p += nb;
+  }
+  pool::set_active(false);
+  std::fprintf(stderr,
+               "[batch] groups=%zu worst|dlogit|=%.6g argmax_bad=%zu "
+               "worst|dtap|=%.6g tap_groups_bad=%zu\n",
+               groups, worst, argmax_bad, worst_tap, tap_bad);
 }
 
 // ── интерактивный чат ──────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ struct BlockSpec {
   friend constexpr bool operator==(BlockSpec, BlockSpec) = default;
 };
 
-// GGML-compatible quant codes (0..30) plus the tokshit group=64 v2 codes
+// GGML-compatible quant codes (0..42) plus the tokshit group=64 v2 codes
 // (100..102). The numeric values are part of the GGUF file format and must not
 // be renumbered.
 enum class QuantType : uint16_t {
@@ -49,6 +49,9 @@ enum class QuantType : uint16_t {
   Iq4Xs = 23,
   Iq1M = 29,
   Bf16 = 30,
+  Mxfp4 = 39,
+  Nvfp4 = 40,
+  Q2_0 = 42,
   TokshitQ4K64 = 100,
   TokshitQ5K64 = 101,
   TokshitQ6K64 = 102,
@@ -109,6 +112,12 @@ enum class QuantType : uint16_t {
       return "Iq1M";
     case QuantType::Bf16:
       return "Bf16";
+    case QuantType::Mxfp4:
+      return "Mxfp4";
+    case QuantType::Nvfp4:
+      return "Nvfp4";
+    case QuantType::Q2_0:
+      return "Q2_0";
     case QuantType::TokshitQ4K64:
       return "TokshitQ4K64";
     case QuantType::TokshitQ5K64:
@@ -172,6 +181,12 @@ enum class QuantType : uint16_t {
       return QuantType::Iq1M;
     case 30:
       return QuantType::Bf16;
+    case 39:
+      return QuantType::Mxfp4;
+    case 40:
+      return QuantType::Nvfp4;
+    case 42:
+      return QuantType::Q2_0;
     case 100:
       return QuantType::TokshitQ4K64;
     case 101:
@@ -232,6 +247,12 @@ enum class QuantType : uint16_t {
       return BlockSpec{256, 136};
     case QuantType::Iq1M:
       return BlockSpec{256, 56};
+    case QuantType::Mxfp4:
+      return BlockSpec{32, 17};
+    case QuantType::Nvfp4:
+      return BlockSpec{64, 36};
+    case QuantType::Q2_0:
+      return BlockSpec{64, 18};
     case QuantType::TokshitQ4K64:
       return BlockSpec{64, 36};
     case QuantType::TokshitQ5K64:
