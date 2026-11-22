@@ -393,6 +393,104 @@ float dot_iq2s(const std::uint8_t* row, const ActQ8& act,
   return vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 }
 
+// iq2_s, четыре строки: решётка/знаки/шкалы так же как в dot_iq2s, входные
+// активации (a0/a1) загружаются один раз на сабблок и делятся между строками —
+// независимые пары vdot+fmla закрывают латентность vdot
+void dot_rows_iq2s(const std::uint8_t* rows, std::size_t rb, std::size_t nrows,
+                   const ActQ8& act, std::size_t in_dim, float* out) noexcept {
+  constexpr std::size_t kBs = 82;
+  const std::size_t nb = in_dim >> 8;
+  const std::int8_t* ap = act.q.data();
+  const float* sp = act.scales.data();
+
+  std::size_t r = 0;
+  for (; r + 4 <= nrows; r += 4) {
+    const std::uint8_t* p0 = rows + (r + 0) * rb;
+    const std::uint8_t* p1 = rows + (r + 1) * rb;
+    const std::uint8_t* p2 = rows + (r + 2) * rb;
+    const std::uint8_t* p3 = rows + (r + 3) * rb;
+    float32x4_t acc0 = vdupq_n_f32(0.0F);
+    float32x4_t acc1 = vdupq_n_f32(0.0F);
+    float32x4_t acc2 = vdupq_n_f32(0.0F);
+    float32x4_t acc3 = vdupq_n_f32(0.0F);
+
+    // одна строка: решётка/знаки/шкалы как в dot_iq2s
+    auto row_dot = [&](const std::uint8_t* p, float32x4_t& acc, std::size_t b,
+                       std::size_t ib, const int8x16_t& a0,
+                       const int8x16_t& a1) {
+      const std::size_t base = b * kBs;
+      const std::size_t a = b * 256 + ib * 32;
+      const float d4 = load_f16(p + base) * 0.25F;
+      const std::uint8_t qhb = p[base + 66 + ib];
+      const std::uint8_t* qsb = p + base + 2 + ib * 4;
+      const std::uint8_t* sgb = p + base + 34 + ib * 4;
+      const float spa = sp[a >> 5];
+      const std::uint32_t i00 =
+          static_cast<std::uint32_t>(qsb[0]) |
+          ((static_cast<std::uint32_t>(qhb) & 0x03U) << 8);
+      const std::uint32_t i01 =
+          static_cast<std::uint32_t>(qsb[1]) |
+          ((static_cast<std::uint32_t>(qhb) & 0x0CU) << 6);
+      const std::uint32_t i02 =
+          static_cast<std::uint32_t>(qsb[2]) |
+          ((static_cast<std::uint32_t>(qhb) & 0x30U) << 4);
+      const std::uint32_t i03 =
+          static_cast<std::uint32_t>(qsb[3]) |
+          ((static_cast<std::uint32_t>(qhb) & 0xC0U) << 2);
+      const int8x8_t g00 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &tables::iq2s_grid[i00]));
+      const int8x8_t g01 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &tables::iq2s_grid[i01]));
+      const int8x8_t g02 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &tables::iq2s_grid[i02]));
+      const int8x8_t g03 = vld1_s8(reinterpret_cast<const std::int8_t*>(
+          &tables::iq2s_grid[i03]));
+      const int8x8_t m00 =
+          vld1_s8(reinterpret_cast<const std::int8_t*>(&kMask8[sgb[0]]));
+      const int8x8_t m01 =
+          vld1_s8(reinterpret_cast<const std::int8_t*>(&kMask8[sgb[1]]));
+      const int8x8_t m02 =
+          vld1_s8(reinterpret_cast<const std::int8_t*>(&kMask8[sgb[2]]));
+      const int8x8_t m03 =
+          vld1_s8(reinterpret_cast<const std::int8_t*>(&kMask8[sgb[3]]));
+      const int8x16_t w01 =
+          vcombine_s8(vsub_s8(veor_s8(g00, m00), m00),
+                      vsub_s8(veor_s8(g01, m01), m01));
+      const int8x16_t w23 =
+          vcombine_s8(vsub_s8(veor_s8(g02, m02), m02),
+                      vsub_s8(veor_s8(g03, m03), m03));
+      const float s01 =
+          d4 * (0.5F + static_cast<float>(p[base + 74 + ib] & 0x0Fu)) * spa;
+      const float s23 =
+          d4 * (0.5F + static_cast<float>((p[base + 74 + ib] >> 4) & 0x0Fu)) *
+          spa;
+      const int32x4_t q0 = vdotq_s32(vdupq_n_s32(0), w01, a0);
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(q0), vdupq_n_f32(s01));
+      const int32x4_t q1 = vdotq_s32(vdupq_n_s32(0), w23, a1);
+      acc = vfmaq_f32(acc, vcvtq_f32_s32(q1), vdupq_n_f32(s23));
+    };
+
+    for (std::size_t b = 0; b < nb; ++b) {
+      for (std::size_t ib = 0; ib < 8; ++ib) {
+        const std::size_t a = b * 256 + ib * 32;
+        const int8x16_t a0 = vld1q_s8(ap + a);
+        const int8x16_t a1 = vld1q_s8(ap + a + 16);
+        row_dot(p0, acc0, b, ib, a0, a1);
+        row_dot(p1, acc1, b, ib, a0, a1);
+        row_dot(p2, acc2, b, ib, a0, a1);
+        row_dot(p3, acc3, b, ib, a0, a1);
+      }
+    }
+    out[r + 0] = vaddvq_f32(acc0);
+    out[r + 1] = vaddvq_f32(acc1);
+    out[r + 2] = vaddvq_f32(acc2);
+    out[r + 3] = vaddvq_f32(acc3);
+  }
+  for (; r < nrows; ++r) {
+    out[r] = dot_iq2s(rows + r * rb, act, in_dim);
+  }
+}
+
 // iq3_s: без промежуточного wbuf на стеке, считаем сразу по распакованным int8.
 float dot_iq3s(const std::uint8_t* row, const ActQ8& act,
                std::size_t in_dim) noexcept {

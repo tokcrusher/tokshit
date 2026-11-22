@@ -229,9 +229,16 @@ void DSpark::head_step(const float* hidden, const float* context, uint32_t prev,
   matvec_f32(hout_f32_, h, rank, markov, corr_.data());
   for (std::size_t i = 0; i < h; ++i) corr_[i] += hidden_out_bias_[i];
 
-  target_->lm_head(corr_.data(), logits.data());
+  // Пер-шаг bias: lm_head @ corr. base[j] = lm_head @ hidden_j уже посчитан
+  // одним BatchSeg-проходом в draft(); тут — только сумма + argmax.
+  bias_.resize(logits.size());
+  target_->lm_head(corr_.data(), bias_.data());
   if (have_base) {
-    for (std::size_t i = 0; i < vocab_padded_; ++i) logits[i] += base[i];
+    for (std::size_t i = 0; i < vocab_padded_; ++i) {
+      logits[i] = bias_[i] + base[i];
+    }
+  } else {
+    std::copy(bias_.begin(), bias_.end(), logits.begin());
   }
   for (std::size_t i = 0; i < vocab_unpadded_; ++i) {
     logits[i] = softcap_ * std::tanh(logits[i] / softcap_);

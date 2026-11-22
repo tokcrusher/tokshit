@@ -124,6 +124,7 @@ class DSpark {
   std::vector<float> fuse_ctx_, kctx_, vctx_, state_, joint_buf_, joint_out_,
       corr_;
   std::vector<float> base_, logits_, row_, scores_, norm_;
+  std::vector<float> bias_;  // per-step lm_head(corr): the interesting bias
   std::vector<kernels::ActQ8> acts_;
   std::vector<float> scratch_;
   std::size_t injected_high_ = 0;

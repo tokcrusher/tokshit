@@ -373,6 +373,10 @@ void dot_rows(QuantType quant, std::span<const uint8_t> rows, size_t rb,
       neon::dot_rows_nvfp4(rows.data(), rb, nrows, act, in_dim, out);
       return;
     }
+    if (quant == QuantType::Iq2S && in_dim % 256 == 0) {
+      neon::dot_rows_iq2s(rows.data(), rb, nrows, act, in_dim, out);
+      return;
+    }
     if (use_iq2row() && in_dim % 256 == 0) {
       switch (quant) {
         case QuantType::Iq4Xs:

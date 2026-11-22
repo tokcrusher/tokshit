@@ -10,7 +10,8 @@ cd "$(dirname "$0")/.."
 
 BASE=(TOKSHIT_MIN_AVAIL_MB=1200 TOKSHIT_HOT=0 TOKSHIT_EXPERT_CACHE_MB=512
       TOKSHIT_DROP_SIBLINGS=1 TOKSHIT_PREFAULT=0 TOKSHIT_KV_CTX=512
-      TOKSHIT_PRINT_IDS=1)
+      TOKSHIT_PRINT_IDS=1 TOKSHIT_POOL_WORKERS=4 TOKSHIT_POOL_PIN=1)
+# copy to worktree if changed
 
 echo "=== plain top8 ==="
 env "${BASE[@]}" scripts/safe_run.sh build/tokshit --temperature 0 "$MODEL" \

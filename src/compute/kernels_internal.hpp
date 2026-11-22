@@ -34,6 +34,8 @@ void dot_rows_q2_0(const uint8_t* rows, size_t rb, size_t nrows,
                    const ActQ8& act, size_t in_dim, float* out) noexcept;
 void dot_rows_nvfp4(const uint8_t* rows, size_t rb, size_t nrows,
                     const ActQ8& act, size_t in_dim, float* out) noexcept;
+void dot_rows_iq2s(const uint8_t* rows, size_t rb, size_t nrows,
+                   const ActQ8& act, size_t in_dim, float* out) noexcept;
 
 // q4_k (6-бит шкалы + min на сабблок). dot считается точно против
 // скалярного эталона через sum(v*q) и sum(q) на 32-блоке активации

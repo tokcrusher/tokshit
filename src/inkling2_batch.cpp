@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <string>
 #include <vector>
@@ -607,7 +608,7 @@ void Inkling2::run_app_batch(std::size_t slot, std::size_t ip, int pass,
       std::fill(ffn, ffn + h, 0.0F);
     } else {
       const auto t_moe = std::chrono::steady_clock::now();
-      moe(L, mix2b_.data() + j * h, ffn);
+      moe_batch(L, mix2b_.data(), ffnb_.data(), b);
       add_ms(g_batch_moe_ms, t_moe);
     }
     if (dump0) {
@@ -632,6 +633,229 @@ void Inkling2::run_app_batch(std::size_t slot, std::size_t ip, int pass,
     }
   }
   if (dump0) dump_batch_vec("x0", xb_.data(), h);
+}
+
+// ── moe_batch ───────────────────────────────────────────────────────────
+// B токенов батча через MoE-слой: роутер — одна batched-полоса на все
+// токены, затем union экспертов батча (gate_up + down) по эксперту с
+// BatchSeg-ами: веса читаются один раз на эксперт, а обслуживают все его
+// пары. Пер-токен топ-k, веса и накопление out[j] в том же порядке, что и
+// у Inkling2::moe(), чтобы отличия были только из-за перегруппировки
+// сложений (union vs цикл по k).
+void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
+                          std::size_t b) {
+  const std::size_t h = hidden_;
+  const std::size_t nff = n_ff_exp_;
+  const std::size_t used =
+      router_topk_ != 0 && router_topk_ < n_used_ ? router_topk_ : n_used_;
+  std::fill(out, out + b * h, 0.0F);
+  if (b == 0 || n_expert_ == 0 || used == 0) return;
+  const std::size_t M = b * used;
+  const auto bytes_of = [&](const InkMeta& m) {
+    const uint8_t* base = (m.hot ? hot_.data() : data_) + m.base;
+    return std::span<const uint8_t>(
+        base, static_cast<std::size_t>(m.rows) * m.rb);
+  };
+  // срез одного эксперта: блок эксперта — `rows` строк по rb байт.
+  const auto expert_bytes = [&](const InkMeta& m, std::size_t e) {
+    const uint8_t* base = (m.hot ? hot_.data() : data_) + m.base +
+                          e * static_cast<std::size_t>(m.rb) * m.rows;
+    return std::span<const uint8_t>(
+        base, static_cast<std::size_t>(m.rows) * m.rb);
+  };
+  constexpr std::size_t kNoPair = std::numeric_limits<std::size_t>::max();
+
+  // ── роутер: gate_inp на B токенов через run_bsegs ────────────────────
+  router_b_.resize(b * n_expert_);
+  router_acts_.resize(b);
+  for (std::size_t j = 0; j < b; ++j) {
+    kernels::quantize_into(std::span<const float>(x + j * h, h),
+                           router_acts_[j]);
+  }
+  {
+    const BatchSeg seg{bytes_of(L.gate_inp), L.gate_inp.rb, L.gate_inp.quant,
+                       L.gate_inp.in_dim, x, router_acts_.data(), b,
+                       router_b_.data(), n_expert_};
+    batchlib::run_bsegs(std::span<const BatchSeg>(&seg, 1), 16);
+  }
+
+  // ── пер-токен топ-k: тот же rule, что и Inkling2::moe() ───────────────
+  top_b_.resize(M);
+  wts_b_.resize(M);
+  pair_at_b_.resize(M);
+  const std::vector<float>& eb = L.exp_probs_b;
+  for (std::size_t j = 0; j < b; ++j) {
+    float* rr = router_b_.data() + j * n_expert_;
+    for (std::size_t e = 0; e < n_expert_; ++e) {
+      rr[e] = sigmoidf(rr[e]) + eb[e];
+    }
+    int* top = top_b_.data() + j * used;
+    for (std::size_t k = 0; k < used; ++k) {
+      int best = -1;
+      float bv = -1e30F;
+      for (std::size_t e = 0; e < n_expert_; ++e) {
+        bool taken = false;
+        for (std::size_t kk = 0; kk < k; ++kk) {
+          if (top[kk] == static_cast<int>(e)) {
+            taken = true;
+            break;
+          }
+        }
+        if (taken) continue;
+        if (rr[e] > bv) {
+          bv = rr[e];
+          best = static_cast<int>(e);
+        }
+      }
+      top[k] = best;
+    }
+    float* w = wts_b_.data() + j * used;
+    float sum = 0.0F;
+    for (std::size_t k = 0; k < used; ++k) {
+      float p = 0.0F;
+      if (top[k] >= 0) {
+        const std::size_t e = static_cast<std::size_t>(top[k]);
+        p = rr[e] - eb[e];
+        if (p < 0.0F) p = 0.0F;
+      }
+      w[k] = p;
+      sum += p;
+    }
+    const float inv = 1.0F / (sum + 1e-20F);
+    for (std::size_t k = 0; k < used; ++k) {
+      w[k] *= inv;
+      if (expert_scale_ != 0.0F) w[k] *= expert_scale_;
+    }
+    if (b == 1) {  // для паритета с dump в run_app_batch
+      for (std::size_t k = 0; k < used; ++k) {
+        top_[k] = top[k];
+        wts_[k] = w[k];
+      }
+    }
+  }
+
+  // ── union экспертов батча: seen/emap/utop, затем flat (j, вес) ──────
+  seen_b_.resize(n_expert_);
+  emap_b_.resize(n_expert_);
+  std::fill(seen_b_.data(), seen_b_.data() + n_expert_, 0);
+  std::fill(emap_b_.data(), emap_b_.data() + n_expert_, -1);
+  utop_b_.clear();
+  for (std::size_t j = 0; j < b; ++j) {
+    const int* top = top_b_.data() + j * used;
+    for (std::size_t k = 0; k < used; ++k) {
+      const int e = top[k];
+      if (e < 0) continue;
+      if (seen_b_[e] == 0) {
+        seen_b_[e] = 1;
+        emap_b_[e] = static_cast<int>(utop_b_.size());
+        utop_b_.push_back(static_cast<std::size_t>(e));
+      }
+    }
+  }
+  const std::size_t nu = utop_b_.size();
+  moff_b_.resize(n_expert_);
+  mcur_b_.resize(n_expert_);
+  std::fill(moff_b_.data(), moff_b_.data() + nu, 0);
+  std::size_t total = 0;
+  for (std::size_t j = 0; j < b; ++j) {
+    const int* top = top_b_.data() + j * used;
+    for (std::size_t k = 0; k < used; ++k) {
+      const int e = top[k];
+      if (e < 0) continue;
+      ++moff_b_[static_cast<std::size_t>(emap_b_[e])];
+      ++total;
+    }
+  }
+  {
+    std::size_t cursor = 0;
+    for (std::size_t u = 0; u < nu; ++u) {
+      const std::size_t cnt = moff_b_[u];
+      moff_b_[u] = cursor;
+      mcur_b_[u] = cursor;
+      cursor += cnt;
+    }
+  }
+
+  // flat пары: gx_b_ — входы gate_up на пару, pair_at_b_ — пара → flat-индекс
+  gx_b_.resize(total * h);
+  moe_in_b_.resize(total);
+  gu_b_.resize(total * 2 * nff);
+  act_b_.resize(total * nff);
+  moe_act_b_.resize(total);
+  dn_b_.resize(total * h);
+  for (std::size_t j = 0; j < b; ++j) {
+    const int* top = top_b_.data() + j * used;
+    for (std::size_t k = 0; k < used; ++k) {
+      const int e = top[k];
+      if (e < 0) {
+        pair_at_b_[j * used + k] = kNoPair;
+        continue;
+      }
+      const std::size_t u = static_cast<std::size_t>(emap_b_[e]);
+      const std::size_t at = mcur_b_[u]++;
+      pair_at_b_[j * used + k] = at;
+      std::memcpy(gx_b_.data() + at * h, x + j * h, h * sizeof(float));
+    }
+  }
+  for (std::size_t at = 0; at < total; ++at) {
+    kernels::quantize_into(std::span<const float>(gx_b_.data() + at * h, h),
+                           moe_in_b_[at]);
+  }
+
+  // ── per expert: gate_up (batched) → SiTU + quantize → down (batched) ─
+  for (std::size_t u = 0; u < nu; ++u) {
+    const std::size_t off = moff_b_[u];
+    const std::size_t cnt =
+        (u + 1 < nu ? moff_b_[u + 1] : total) - off;
+    if (cnt == 0) continue;
+    {
+      const BatchSeg seg{expert_bytes(L.gate_up_exps, utop_b_[u]),
+                         L.gate_up_exps.rb, L.gate_up_exps.quant,
+                         L.gate_up_exps.in_dim, gx_b_.data() + off * h,
+                         moe_in_b_.data() + off, cnt,
+                         gu_b_.data() + off * 2 * nff, 2 * nff};
+      batchlib::run_bsegs(std::span<const BatchSeg>(&seg, 1), 32);
+    }
+    const float gs = L.gate_up_scale.empty() ? 1.0F
+                                             : L.gate_up_scale[utop_b_[u]];
+    for (std::size_t mi = 0; mi < cnt; ++mi) {
+      const float* gu = gu_b_.data() + (off + mi) * 2 * nff;
+      float* dst = act_b_.data() + (off + mi) * nff;
+      for (std::size_t i = 0; i < nff; ++i) {
+        const float gi = gu[i] * gs;
+        const float ui = gu[nff + i] * gs;
+        float act = situ_beta_ * std::tanh(gi / situ_beta_) * sigmoidf(gi);
+        act *= situ_linear_beta_ > 0.0F
+                   ? situ_linear_beta_ * std::tanh(ui / situ_linear_beta_)
+                   : ui;
+        dst[i] = act;
+      }
+      kernels::quantize_into(std::span<const float>(dst, nff),
+                             moe_act_b_[off + mi]);
+    }
+    {
+      const BatchSeg seg{expert_bytes(L.down_exps, utop_b_[u]),
+                         L.down_exps.rb, L.down_exps.quant,
+                         L.down_exps.in_dim, act_b_.data() + off * nff,
+                         moe_act_b_.data() + off, cnt, dn_b_.data() + off * h,
+                         h};
+      batchlib::run_bsegs(std::span<const BatchSeg>(&seg, 1), 32);
+    }
+  }
+
+  // ── накопление out[j] += w_k · down[k] в порядке k, как в moe() ─────
+  for (std::size_t j = 0; j < b; ++j) {
+    float* dst = out + j * h;
+    const int* top = top_b_.data() + j * used;
+    for (std::size_t k = 0; k < used; ++k) {
+      const std::size_t at = pair_at_b_[j * used + k];
+      if (at == kNoPair) continue;
+      const float w = wts_b_[j * used + k] *
+                      (L.down_scale.empty() ? 1.0F : L.down_scale[top[k]]);
+      const float* src = dn_b_.data() + at * h;
+      for (std::size_t i = 0; i < h; ++i) dst[i] += w * src[i];
+    }
+  }
 }
 
 void Inkling2::token_logits_batch(std::span<const uint32_t> tokens,

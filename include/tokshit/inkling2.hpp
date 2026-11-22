@@ -139,6 +139,7 @@ class Inkling2 {
   void capture_batch_tap(std::size_t slot);
   void run_app_batch(std::size_t slot, std::size_t ip, int pass,
                      const float* msg_b, std::size_t pos0, std::size_t b);
+  void moe_batch(const InkLayer& L, float* x, float* out, std::size_t b);
   void apply_layer(std::size_t slot, std::size_t pass, bool has_msg,
                    const std::vector<std::vector<float>>& bank,
                    const std::vector<float>& bank_out);
@@ -222,6 +223,23 @@ class Inkling2 {
   kernels::ActQ8 act_q8_;
   kernels::ActQ8 act_in_[3];
   std::vector<kernels::ActQ8> act_all_q8_;
+  // moe_batch: union экспертов батча на b токенов + flat-пары (токен, вес)
+  std::vector<float> router_b_;          // B × n_expert_: открытые роутеры
+  std::vector<kernels::ActQ8> router_acts_;  // B: активации gate_inp (in_dim = h)
+  std::vector<int> top_b_;               // B × n_used_: топ-эксперты на токен
+  std::vector<float> wts_b_;             // B × n_used_: веса (норм. × expert_scale)
+  std::vector<std::size_t> pair_at_b_;   // B × n_used_: пара → flat-индекс (MAX = нет)
+  std::vector<std::uint8_t> seen_b_;     // n_expert_
+  std::vector<int> emap_b_;              // n_expert_: эксперт → индекс в utop_b_
+  std::vector<std::size_t> utop_b_;      // ≤ B × n_used_: union экспертов
+  std::vector<std::size_t> moff_b_;      // n_expert_: старты групп по индексу utop
+  std::vector<std::size_t> mcur_b_;      // n_expert_: курсоры при заполнении
+  std::vector<float> gx_b_;              // total × h: входы gate_up пар
+  std::vector<kernels::ActQ8> moe_in_b_;  // total: кванты входов gate_up
+  std::vector<float> gu_b_;              // total × 2nff: выходы gate_up
+  std::vector<float> act_b_;             // total × nff: SiTU (входы down)
+  std::vector<kernels::ActQ8> moe_act_b_;  // total: кванты SiTU → down
+  std::vector<float> dn_b_;              // total × h: выходы down
   std::vector<uint32_t> tap_slots_;
   std::vector<float> tap_buf_;
   std::vector<kernels::ActQ8> lm_acts_;

@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <time.h>
 #include <vector>
 
 namespace tokshit::pool {
@@ -186,7 +187,8 @@ TaskPool::TaskPool() {
   impl_ = new Impl();
   const std::size_t total =
       std::max<std::size_t>(1, std::thread::hardware_concurrency());
-  impl_->workers = env_usize("TOKSHIT_POOL_WORKERS", total - 1);
+  impl_->workers = env_usize("TOKSHIT_POOL_WORKERS", default_workers());
+  if (impl_->workers > total) impl_->workers = total;
   if (impl_->workers > 1024) impl_->workers = 1024;
 
   const bool pin = std::getenv("TOKSHIT_POOL_PIN") != nullptr;
@@ -226,6 +228,19 @@ TaskPool& TaskPool::instance() {
   return pool;
 }
 
+// Snap-to-4 threads: decode is GEMV (memory-bound), prefill is GEMM. Four
+// big cores is the sweet spot on a modern phone; more threads mostly spin on
+// the heterogeneous little cores and heat the fast ones.
+namespace {
+std::size_t default_workers() {
+#if defined(__aarch64__)
+  return 4;
+#else
+  return std::max<std::size_t>(1, std::thread::hardware_concurrency() - 1);
+#endif
+}
+}  // namespace
+
 void TaskPool::run(std::size_t n, TaskFn fn, void* ctx) {
   if (n == 0 || fn == nullptr) return;
   if (impl_->workers == 0) {
@@ -252,8 +267,21 @@ void TaskPool::run(std::size_t n, TaskFn fn, void* ctx) {
     fn(ctx, i);
     ++mine;
   }
-  while (st.done.load(std::memory_order_acquire) < impl_->workers) {
-    std::this_thread::yield();
+  // Гетерогенные ядра: быстрые чистить спином, но периодически спать —
+  // на 2.8 ГГц-ядрах ждать на YIELD забивает опропорциональную тепловую разницу.
+  {
+    const uint64_t target = st.workers;
+    uint64_t spins = 0;
+    while (st.done.load(std::memory_order_acquire) < target) {
+      if (spins >= 32) {
+        const timespec ts{0, 1000000};
+        ::nanosleep(&ts, nullptr);
+        spins = 0;
+      } else {
+        ++spins;
+        std::this_thread::yield();
+      }
+    }
   }
   st.exec_main.fetch_add(mine, std::memory_order_relaxed);
 }

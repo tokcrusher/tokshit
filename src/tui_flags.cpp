@@ -45,7 +45,7 @@ constexpr FlagDoc kFlags[] = {
     {"mlock-dense", "TOKSHIT_MLOCK_DENSE_MB", "MB", FlagGroup::Memory,
      "mlock плотных q/k/v/o/gate/out, МБ; осторожно с памятью", "0"},
     {"pool-workers", "TOKSHIT_POOL_WORKERS", "N", FlagGroup::Memory,
-     "потоков вычислительного пула", "ядра-1"},
+     "потоков вычислительного пула", "4 (aarch64), иначе ядра-1"},
     {"pool-pin", "TOKSHIT_POOL_PIN", "", FlagGroup::Memory,
      "привязать потоки пула к ядрам", "выкл"},
     {"pool-rt", "TOKSHIT_POOL_RT", "", FlagGroup::Memory,
