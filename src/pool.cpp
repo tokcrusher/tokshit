@@ -135,6 +135,14 @@ struct TaskPool::Impl {
     std::atomic<uint32_t> idle{0};
     std::atomic<uint64_t> exec_main{0};
     std::atomic<uint64_t> exec_workers{0};
+    // диагностика барьера, включается TOKSHIT_POOL_WAIT_STATS
+    // barrier diagnostics, enabled by TOKSHIT_POOL_WAIT_STATS
+    std::atomic<uint64_t> stat_calls{0};
+    std::atomic<uint64_t> stat_work_ns{0};
+    std::atomic<uint64_t> stat_wait_ns{0};
+    std::atomic<uint64_t> stat_wait_max{0};
+    std::atomic<uint64_t> stat_worker_ns{0};
+    std::atomic<uint64_t> stat_worker_max{0};
   };
 
   State state;
@@ -170,12 +178,25 @@ struct TaskPool::Impl {
       TaskFn run = state.run;
       void* ctx = state.ctx;
       const std::size_t n = state.n;
+      const auto t_begin = std::chrono::steady_clock::now();
       uint64_t mine = 0;
       for (;;) {
         const std::size_t i = state.next.fetch_add(1, std::memory_order_relaxed);
         if (i >= n) break;
         run(ctx, i);
         ++mine;
+      }
+      {
+        const auto dt = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_begin)
+                .count());
+        state.stat_worker_ns.fetch_add(dt, std::memory_order_relaxed);
+        uint64_t prev = state.stat_worker_max.load(std::memory_order_relaxed);
+        while (dt > prev &&
+               !state.stat_worker_max.compare_exchange_weak(
+                   prev, dt, std::memory_order_relaxed)) {
+        }
       }
       state.exec_workers.fetch_add(mine, std::memory_order_relaxed);
       state.done.fetch_add(1, std::memory_order_release);
@@ -259,6 +280,9 @@ void TaskPool::run(std::size_t n, TaskFn fn, void* ctx) {
   // publish the job, wake workers via generation, take tasks ourselves too,
   // and at the end wait until every worker bumps done
   Impl::State& st = impl_->state;
+  static const bool wait_stats =
+      std::getenv("TOKSHIT_POOL_WAIT_STATS") != nullptr;
+  const auto t_pub = std::chrono::steady_clock::now();
   st.run = fn;
   st.ctx = ctx;
   st.n = n;
@@ -273,11 +297,10 @@ void TaskPool::run(std::size_t n, TaskFn fn, void* ctx) {
     fn(ctx, i);
     ++mine;
   }
+const auto t_work = std::chrono::steady_clock::now();
   // Гетерогенные ядра: быстрые чистить спином, но периодически спать —
   // на 2.8 ГГц-ядрах ждать на YIELD забивает опропорциональную тепловую разницу.
   {
-    // ждём, пока все workers воркеры отметили done (exec_main + exec_workers
-    // равны workers)
     const uint64_t target = impl_->workers;
     uint64_t spins = 0;
     while (st.done.load(std::memory_order_acquire) < target) {
@@ -291,6 +314,24 @@ void TaskPool::run(std::size_t n, TaskFn fn, void* ctx) {
       }
     }
   }
+  if (wait_stats) {
+    const auto t_end = std::chrono::steady_clock::now();
+    const auto work_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t_work - t_pub)
+            .count());
+    const auto wait_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_work)
+            .count());
+    st.stat_calls.fetch_add(1, std::memory_order_relaxed);
+    st.stat_work_ns.fetch_add(work_ns, std::memory_order_relaxed);
+    st.stat_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+    uint64_t prev = st.stat_wait_max.load(std::memory_order_relaxed);
+    while (wait_ns > prev &&
+           !st.stat_wait_max.compare_exchange_weak(prev, wait_ns,
+                                                   std::memory_order_relaxed)) {
+    }
+  }
+
   st.exec_main.fetch_add(mine, std::memory_order_relaxed);
 }
 
@@ -316,6 +357,23 @@ void TaskPool::set_active(bool active) {
     }
   }
   impl_->state.active.store(active, std::memory_order_relaxed);
+  if (!active && std::getenv("TOKSHIT_POOL_WAIT_STATS") != nullptr) {
+    const auto& s = impl_->state;
+    const uint64_t calls = s.stat_calls.load(std::memory_order_relaxed);
+    const uint64_t work = s.stat_work_ns.load(std::memory_order_relaxed);
+    const uint64_t wait = s.stat_wait_ns.load(std::memory_order_relaxed);
+    const uint64_t wmax = s.stat_wait_max.load(std::memory_order_relaxed);
+    const uint64_t worker_max =
+        s.stat_worker_max.load(std::memory_order_relaxed);
+    std::fprintf(
+        stderr,
+        "[pool-wait] calls=%llu work=%.3fs wait=%.3fs wait_max=%.1fms "
+        "worker_max=%.1fms\n",
+        static_cast<unsigned long long>(calls),
+        static_cast<double>(work) / 1e9, static_cast<double>(wait) / 1e9,
+        static_cast<double>(wmax) / 1e6,
+        static_cast<double>(worker_max) / 1e6);
+  }
   if (!active && std::getenv("TOKSHIT_POOL_STATS") != nullptr) {
     std::fprintf(stderr, "[pool] workers=%zu main_tasks=%llu worker_tasks=%llu\n",
                  impl_->workers,
