@@ -79,10 +79,14 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
 
     const auto t_tok = Clock::now();
     const uint64_t io_t0 = options.token_debug ? io_read_bytes() : 0;
+    const auto pf_t0 = options.token_debug ? page_faults()
+                                           : std::pair<uint64_t, uint64_t>{0, 0};
     const uint64_t ld_t0 =
         options.token_debug ? metrics().t_load.load() : 0;
     const uint64_t mm_t0 =
         options.token_debug ? metrics().t_expert_mm.load() : 0;
+    const uint64_t mb_t0 =
+        options.token_debug ? metrics().c_mm_bytes.load() : 0;
     const uint64_t dw_t0 = metrics().t_down_wait.load();
     const uint64_t hit_t0 = metrics().c_expert_hit.load();
     const uint64_t miss_t0 = metrics().c_expert_miss.load();
@@ -94,17 +98,22 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
 
     if (options.token_debug) {
       const auto& m = metrics();
+      const auto pf = page_faults();
       const double dt =
           std::chrono::duration<double>(Clock::now() - t_tok).count();
       std::fprintf(
           stderr,
-          "[tok %zu] %.0fms io=%.1fMB load=%.0fms exmm=%.0fms dw=%.0fms "
-          "hit=%llu miss=%llu\n",
+          "[tok %zu] %.0fms io=%.1fMB w=%.1fMB load=%.0fms exmm=%.0fms "
+          "dw=%.0fms minf=%llu majf=%llu rss=%lluMB hit=%llu miss=%llu\n",
           result.generated, dt * 1e3,
           static_cast<double>(io_read_bytes() - io_t0) / 1e6,
+          static_cast<double>(m.c_mm_bytes.load() - mb_t0) / 1e6,
           static_cast<double>(m.t_load.load() - ld_t0) / 1e6,
           static_cast<double>(m.t_expert_mm.load() - mm_t0) / 1e6,
           static_cast<double>(m.t_down_wait.load() - dw_t0) / 1e6,
+          static_cast<unsigned long long>(pf.first - pf_t0.first),
+          static_cast<unsigned long long>(pf.second - pf_t0.second),
+          static_cast<unsigned long long>(rss_mb()),
           static_cast<unsigned long long>(m.c_expert_hit.load() - hit_t0),
           static_cast<unsigned long long>(m.c_expert_miss.load() - miss_t0));
     }

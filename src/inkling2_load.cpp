@@ -487,6 +487,45 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
                  static_cast<double>(off) / 1e9);
   }
 
+  // Optional: keep the most reused dense weights resident. Experts are left
+  // to the page cache; locking 9 GB on a 15 GB phone is not safe.
+  {
+    std::size_t cap_mb = 0;
+    if (const char* v = std::getenv("TOKSHIT_MLOCK_DENSE_MB");
+        v != nullptr && *v != '\0') {
+      cap_mb = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+    }
+    if (cap_mb != 0) {
+      const std::size_t cap = cap_mb * 1024 * 1024;
+      std::size_t locked = 0;
+      std::size_t failed = 0;
+      auto lock_meta = [&](const InkMeta& meta) {
+        if (meta.base == 0 || meta.hot || locked >= cap) return;
+        const std::size_t len =
+            static_cast<std::size_t>(meta.rb) * meta.rows;
+        if (len == 0 || locked + len > cap) return;
+        if (mm.lock_range(meta.base, len)) {
+          locked += len;
+        } else {
+          ++failed;
+        }
+      };
+      for (const auto& L : m->layers_) {
+        lock_meta(L.q);
+        lock_meta(L.k);
+        lock_meta(L.v);
+        lock_meta(L.o);
+        lock_meta(L.gate);
+        lock_meta(L.rel);
+      }
+      lock_meta(m->out_);
+      std::fprintf(stderr,
+                   "[inkling2] mlock dense: %.1f MB (cap %zu MB, %zu ranges "
+                   "failed)\n",
+                   static_cast<double>(locked) / 1e6, cap_mb, failed);
+    }
+  }
+
   std::fprintf(stderr,
                "[inkling2] phys=%zu slots=%zu passes=%zu core=[%zu,%zu) "
                "hidden=%zu heads=%zu/%zu dim=%zu experts=%zu top=%zu ff=%zu "
@@ -499,6 +538,16 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
   std::fprintf(stderr, "[inkling2] softcap=%g situ=%g/%g expert_scale=%g\n",
                m->final_softcap_, m->situ_beta_, m->situ_linear_beta_,
                m->expert_scale_);
+  if (const char* pv = std::getenv("TOKSHIT_INK_PASSES");
+      pv != nullptr && *pv != '\0') {
+    const unsigned long n = std::strtoul(pv, nullptr, 10);
+    if (n >= 1 && n < m->n_passes_) {
+      std::fprintf(stderr,
+                   "[inkling2] LOSSY: passes=%lu/%zu, checkpoint was trained "
+                   "for %zu; output quality may degrade\n",
+                   n, m->n_passes_, m->n_passes_);
+    }
+  }
 
   std::fflush(stderr);
   return m;

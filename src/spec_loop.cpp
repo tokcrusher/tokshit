@@ -10,8 +10,12 @@
 #include <cstring>
 #include <vector>
 
+#include "tokshit/dspark.hpp"
+#include "tokshit/gguf.hpp"
 #include "tokshit/metrics.hpp"
+#include "tokshit/mmap.hpp"
 #include "tokshit/pool.hpp"
+#include "tokshit/sampling.hpp"
 #include "tokshit/special_tokens.hpp"
 
 namespace tokshit::spec {
@@ -30,6 +34,30 @@ std::size_t argmax(std::span<const float> x) {
     if (x[i] > x[best]) best = i;
   }
   return best;
+}
+
+// Same Inkling chat template as cli::build_turn, kept here so the core spec
+// loop does not depend on the executable's cli translation unit.
+std::vector<uint32_t> ink_turn(const BpeTokenizer& tok,
+                               std::string_view user) {
+  std::vector<uint32_t> turn;
+  if (std::getenv("TOKSHIT_RAW_PROMPT") != nullptr) return tok.encode(user);
+  auto push_special = [&](std::string_view name) {
+    const auto id = tok.token_id(name);
+    if (id.has_value()) turn.push_back(*id);
+  };
+  push_special("<|message_system|>");
+  push_special("<|content_text|>");
+  for (uint32_t id : tok.encode("Thinking effort level: 0.9")) {
+    turn.push_back(id);
+  }
+  push_special("<|end_message|>");
+  push_special("<|message_user|>");
+  push_special("<|content_text|>");
+  for (uint32_t id : tok.encode(user)) turn.push_back(id);
+  push_special("<|end_message|>");
+  push_special("<|message_model|>");
+  return turn;
 }
 
 }  // namespace
@@ -251,6 +279,312 @@ void run(Model& model, const BpeTokenizer& tok, const std::string& prompt,
                static_cast<double>(io_read_bytes()) / 1e9,
                static_cast<unsigned long long>(rss_mb()),
                static_cast<unsigned long long>(pf.second));
+}
+
+bool run_dspark(Model& model, const BpeTokenizer& tok,
+                const std::string& prompt, std::size_t max_new,
+                const std::string& draft_path) {
+  Inkling2* ink = model.inkling2();
+  if (ink == nullptr) {
+    std::fprintf(stderr, "[dspark] not an Inkling2 model\n");
+    return false;
+  }
+  // Tap 41 живёт только на третьем core-проходе. С TOKSHIT_INK_PASSES=1..2
+  // target-тэпы неполные, и черновик получил бы мёртвый контекст.
+  if (const char* pv = std::getenv("TOKSHIT_INK_PASSES");
+      pv != nullptr && *pv != '\0') {
+    const unsigned long n = std::strtoul(pv, nullptr, 10);
+    if (n != 3) {
+      std::fprintf(stderr,
+                   "[dspark] TOKSHIT_INK_PASSES=%lu: DSpark требует все 3 "
+                   "core-прохода (taps 5/23/41/48); обычный decode\n",
+                   n);
+      return false;
+    }
+  }
+  float temperature = 0.0F;
+  if (const char* tv = std::getenv("TOKSHIT_TEMPERATURE");
+      tv != nullptr && *tv != '\0') {
+    temperature = std::strtof(tv, nullptr);
+  }
+  if (temperature > 1e-6F) {
+    std::fprintf(stderr,
+                 "[dspark] только greedy: выставьте --temperature 0; "
+                 "спекуляция выключена\n");
+    return false;
+  }
+
+  auto g = Gguf::open(draft_path);
+  if (!g.ok()) {
+    std::fprintf(stderr, "[dspark] open: %s\n", g.error().message.c_str());
+    return false;
+  }
+  Gguf draft_gguf = std::move(g.value());
+  auto mm = draft_gguf.mmap_file();
+  if (!mm.ok()) {
+    std::fprintf(stderr, "[dspark] mmap: %s\n", mm.error().message.c_str());
+    return false;
+  }
+  Mmap draft_mm = std::move(mm.value());
+  auto d = DSpark::load(draft_gguf, draft_mm, *ink, ink->kv_ctx());
+  if (!d.ok()) {
+    std::fprintf(stderr, "[dspark] load: %s\n", d.error().message.c_str());
+    return false;
+  }
+  auto& draft = *d.value();
+
+  std::size_t K = env_u("TOKSHIT_DSPARK_K", 3);
+  K = std::min(K, draft.max_draft());
+  if (K == 0) {
+    std::fprintf(stderr, "[dspark] draft max is 0\n");
+    return false;
+  }
+  const bool batch_cfg = env_u("TOKSHIT_DSPARK_BATCH", 1) != 0;
+  const std::size_t vocab = ink->vocab();
+
+  std::vector<uint32_t> turn = ink_turn(tok, prompt);
+  std::vector<float> head(ink->vocab(), 0.0F);
+  std::size_t pos = 0;
+  pool::set_active(true);
+  const auto t0 = Clock::now();
+  for (uint32_t id : turn) {
+    ink->token_logits(id, pos, head);
+    draft.inject(pos, ink->taps());
+    ++pos;
+  }
+  const double prefill_s =
+      std::chrono::duration<double>(Clock::now() - t0).count();
+  uint32_t last = turn.empty() ? 0 : turn.back();
+
+  std::size_t gen = 0;
+  std::size_t rounds = 0;
+  std::size_t proposed = 0;
+  std::size_t accepted = 0;
+  std::size_t verifies = 0;
+  std::size_t batch_rounds = 0;
+  std::vector<uint32_t> ids;
+  std::vector<uint32_t> cand;
+  std::vector<float> batch_logits(vocab * K, 0.0F);
+  Utf8Buffer utf8;
+
+  const auto amax = [](std::span<const float> x) {
+    std::size_t best = 0;
+    for (std::size_t i = 1; i < x.size(); ++i) {
+      if (x[i] > x[best]) best = i;
+    }
+    return best;
+  };
+
+  const auto emit = [&](uint32_t id) -> bool {
+    if (tok.is_eog(id)) return false;
+    ids.push_back(id);
+    if (id >= 199998) {
+      utf8 = Utf8Buffer{};
+      if (id == 200010) std::fputc('\n', stdout);
+    } else {
+      const std::string chunk = utf8.push(tok.token_bytes(id));
+      if (!chunk.empty()) {
+        std::fwrite(chunk.data(), 1, chunk.size(), stdout);
+        std::fflush(stdout);
+      }
+    }
+    ++gen;
+    return gen < max_new;
+  };
+
+  const auto g0 = Clock::now();
+  while (gen < max_new && pos < ink->kv_ctx()) {
+    const std::size_t first = amax(head);
+    if (tok.is_eog(static_cast<uint32_t>(first))) break;
+
+    draft.draft(last, pos, K, cand);
+    ++rounds;
+    proposed += cand.size();
+    std::size_t m = 0;
+    bool stop = false;
+    if (cand.empty()) {
+      ink->token_logits(static_cast<uint32_t>(first), pos, head);
+      draft.inject(pos, ink->taps());
+      last = static_cast<uint32_t>(first);
+      ++m;
+      ++verifies;
+      stop = !emit(last);
+    } else if (cand[0] != first) {
+      // Черновик промахнулся уже на первом токене: батч всё равно был бы
+      // отвергнут, платим только за одну коррекцию.
+      const uint32_t id = static_cast<uint32_t>(first);
+      ink->token_logits(id, pos, head);
+      draft.inject(pos, ink->taps());
+      last = id;
+      ++m;
+      ++verifies;
+      stop = !emit(id);
+    } else if (tok.is_eog(cand[0])) {
+      // target greedy сам хочет EOG: не кормим его обратно
+      stop = true;
+    } else {
+      // Кандидаты до первого EOG; сам EOG в target не прогоняем.
+      std::size_t n = cand.size();
+      for (std::size_t j = 1; j < cand.size(); ++j) {
+        if (tok.is_eog(cand[j])) {
+          n = j;
+          break;
+        }
+      }
+      const std::size_t npos = pos + n;
+      if (batch_cfg && npos <= ink->kv_ctx()) {
+        static const bool check =
+            std::getenv("TOKSHIT_DSPARK_CHECK") != nullptr;
+        std::vector<float> check_logits;
+        if (check) {
+          check_logits.assign(n * vocab, 0.0F);
+          Inkling2::Snapshot pre;
+          ink->snapshot(pre);
+          std::vector<float> row(vocab, 0.0F);
+          for (std::size_t j = 0; j < n; ++j) {
+            ink->token_logits(cand[j], pos + j, row);
+            std::copy(row.begin(), row.end(),
+                      check_logits.begin() +
+                          static_cast<std::ptrdiff_t>(j * vocab));
+          }
+          ink->restore(pre);
+        }
+        ink->token_logits_batch(std::span<const uint32_t>(cand.data(), n),
+                                pos,
+                                std::span<float>(batch_logits.data(),
+                                                 n * vocab));
+        if (check) {
+          for (std::size_t j = 0; j < n; ++j) {
+            const float* a = check_logits.data() + j * vocab;
+            const float* b = batch_logits.data() + j * vocab;
+            float mx = 0.0F;
+            std::size_t ai = 0;
+            std::size_t bi = 0;
+            for (std::size_t i = 0; i < vocab; ++i) {
+              mx = std::max(mx, std::fabs(a[i] - b[i]));
+              if (a[i] > a[ai]) ai = i;
+              if (b[i] > b[bi]) bi = i;
+            }
+            std::fprintf(stderr,
+                         "[dspark check] pos=%zu j=%zu max|d|=%.6g "
+                         "seq=%zu bat=%zu %s\n",
+                         pos, j, mx, ai, bi, ai == bi ? "ok" : "MISS");
+          }
+        }
+        ++batch_rounds;
+        verifies += n;
+        std::size_t acc = 1;
+        while (acc < n) {
+          const std::size_t want = amax(std::span<const float>(
+              batch_logits.data() + (acc - 1) * vocab, vocab));
+          if (cand[acc] == want) {
+            ++acc;
+          } else {
+            break;
+          }
+        }
+        const auto taps = ink->taps_batch();
+        const std::size_t nt = ink->n_taps();
+        if (acc == n) {
+          for (std::size_t j = 0; j < n; ++j) {
+            draft.inject(pos + j, taps.subspan(j * nt * ink->n_embd(),
+                                               nt * ink->n_embd()));
+          }
+          accepted += n;
+          std::copy(batch_logits.begin() +
+                        static_cast<std::ptrdiff_t>((n - 1) * vocab),
+                    batch_logits.begin() +
+                        static_cast<std::ptrdiff_t>(n * vocab),
+                    head.begin());
+          last = cand[n - 1];
+          m = n;
+          for (std::size_t j = 0; j < n; ++j) {
+            if (!emit(cand[j])) {
+              stop = true;
+              break;
+            }
+          }
+        } else {
+          ink->restore_batch(acc);
+          for (std::size_t j = 0; j < acc; ++j) {
+            draft.inject(pos + j, taps.subspan(j * nt * ink->n_embd(),
+                                               nt * ink->n_embd()));
+          }
+          const uint32_t id = static_cast<uint32_t>(amax(
+              std::span<const float>(batch_logits.data() + (acc - 1) * vocab,
+                                     vocab)));
+          accepted += acc;
+          ink->token_logits(id, pos + acc, head);
+          draft.inject(pos + acc, ink->taps());
+          last = id;
+          ++verifies;
+          m = acc + 1;
+          for (std::size_t j = 0; j < acc; ++j) {
+            if (!emit(cand[j])) {
+              stop = true;
+              break;
+            }
+          }
+          if (!stop) stop = !emit(id);
+        }
+      } else {
+        // Последовательный fallback: тот же код, что был до батча.
+        for (std::size_t j = 0; !stop && j < cand.size() && gen < max_new;
+             ++j) {
+          const std::size_t want = amax(head);
+          if (cand[j] != want) {
+            const uint32_t id = static_cast<uint32_t>(want);
+            ink->token_logits(id, pos + m, head);
+            draft.inject(pos + m, ink->taps());
+            last = id;
+            ++m;
+            ++verifies;
+            stop = !emit(id);
+            break;
+          }
+          const uint32_t id = cand[j];
+          if (tok.is_eog(id)) {
+            stop = true;
+            break;
+          }
+          ink->token_logits(id, pos + m, head);
+          draft.inject(pos + m, ink->taps());
+          last = id;
+          ++m;
+          ++accepted;
+          ++verifies;
+          stop = !emit(id);
+        }
+      }
+    }
+    pos += m;
+    if (m == 0 || stop) break;
+  }
+  const double gen_s =
+      std::chrono::duration<double>(Clock::now() - g0).count();
+  pool::set_active(false);
+  std::fputc('\n', stdout);
+
+  if (std::getenv("TOKSHIT_PRINT_IDS") != nullptr && !ids.empty()) {
+    std::fputs("[ids:", stderr);
+    for (uint32_t id : ids) std::fprintf(stderr, " %u", id);
+    std::fputs("]\n", stderr);
+  }
+  std::fprintf(
+      stderr,
+      "[dspark: prefill %zu tok за %.1fs | генерация %zu tok за %.1fs = "
+      "%.2f tok/s | раундов %zu, verify %zu, предложено %zu, принято %zu "
+      "(%.1f%%), средняя длина %.2f, батч-раундов %zu]\n",
+      turn.size(), prefill_s, gen, gen_s,
+      static_cast<double>(gen) / (gen_s > 1e-9 ? gen_s : 1e-9), rounds,
+      verifies, proposed, accepted,
+      proposed != 0 ? 100.0 * static_cast<double>(accepted) /
+                          static_cast<double>(proposed)
+                    : 0.0,
+      rounds != 0 ? static_cast<double>(gen) / static_cast<double>(rounds)
+                  : 0.0,
+      batch_rounds);
+  return true;
 }
 
 }  // namespace tokshit::spec

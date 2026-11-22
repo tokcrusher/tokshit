@@ -70,13 +70,30 @@ sink (sink только в знаменателе, в V-сумму не вход
 `TOKSHIT_SPEC_CTX`, `TOKSHIT_SPEC_MAXB`. `--spec-fast` и
 `--spec-verify-topk` меняют выход модели и помечаются **LOSSY**.
 
+### DSpark для Inkling-2-Mini
+
+Отдельный путь `spec::run_dspark()` (`--dspark FILE`). Черновик — не
+урезанный роутер target, а внешний `dflash` GGUF на 402 МБ: 3 слоя,
+block size 8, markov rank 256. Target отдаёт ему 4 тапа по
+слотам `[5,23,41,48]`; маппинг — по визиту, не по физическому слою.
+Backbone draft-блока считает все 8 позиций параллельно, цепочная только
+голова. Greedy-ids на проверенных промптах совпадают с plain greedy.
+
+Verify умеет два режима: последовательный (`--dspark-batch=0`) и
+батчевый (`Inkling2::token_logits_batch()`, по умолчанию). Батч
+переиспользует плотные веса на K кандидатов и подтверждён паритетом
+(`TOKSHIT_INK_BATCH_TEST`, max|dlogit|=0). Acceptance: sequentially 30.8 %,
+batched 47.6 %; скорость (16 токенов, warm): plain 1.65, sequential 1.53,
+batched 1.13–1.23 tok/s — выигрыша над plain нет. Детали — в
+[DSPARK.md](DSPARK.md).
+
 ## 6. Что проверено
 
 - KV: capacity, high-water, rollback, f16/f32 roundtrip.
 - Attention: f16/f32 против скалярной ссылки, sink и SWA.
 - Деквант Q8_0 и `dot_row_multi` на нескольких активациях.
 - Batched matvec против `dot_row` для F32 и Q8_0.
-- 161 кейс / 7715 проверок зелёные локально.
+- 186 кейсов / 9951 проверка зелёные локально.
 - Паритет на устройстве: greedy-иды `--spec` и обычного декода совпали
   байт в байт на коротких промптах.
 
@@ -94,9 +111,19 @@ sink (sink только в знаменателе, в V-сумму не вход
 нет. Полный verify остаётся lossless, но на этом устройстве медленнее
 обычного декода.
 
+DSpark на Inkling-2-Mini не даёт ускорения: sequential 1.53 tok/s,
+batched 1.13–1.23 против plain 1.65 (16 токенов, warm, K=3); acceptance
+30.8 % / 47.6 %. Batched-MoE и batched-attention не реализованы.
+
 ## 8. Ограничения
 
-- Батч-путь зовёт `dot_row` построчно; batched NEON-ядра — следующий шаг.
+- DSpark-verify: батч переиспользует dense matvec, но attention,
+  shortconv и MoE всё равно по токенам; union-эксперты по top-8
+  повышают трафик на B=3.
+- Batched head (`lm_head @ corr`) ещё не сделан — head считает LM head
+  на каждый шаг головы.
+- Lossy levers (`--topk-experts 2`, `--passes 2`) не хватило, чтобы
+  отправить ускоритель над plain на этом телефоне.
 - Контекст длиннее sliding-window (513) требует отдельной проверки
   батчевого SWA-пути.
 - Пиннинг горячих экспертов удерживает только рабочий набор; оценивать
@@ -112,6 +139,8 @@ sink (sink только в знаменателе, в V-сумму не вход
 | `--mlock` | зарезервировано, не подключено |
 | `--turbo` | **LOSSY**: top-2 + Q4_0 dense, кэш 1024, O_DIRECT |
 | `--spec-fast` | **LOSSY**: `--spec --spec-k 4 --spec-maxb 8 --spec-verify-topk 2` |
+| `--dspark FILE` | DSpark draft для Inkling-2-Mini, только greedy |
+| `--dspark-batch 0` | последовательный verify вместо батчевого |
 
 Внутри также: `dot_row_multi` раскладывает строку весов в float один раз
 для всех активаций батча; батч-путь не аллоцирует память на каждом слое

@@ -9,8 +9,10 @@
 #include <string>
 #include <vector>
 
+#include "tokshit/batch.hpp"
 #include "tokshit/dequant.hpp"
 #include "tokshit/kernels.hpp"
+#include "tokshit/metrics.hpp"
 #include "tokshit/pool.hpp"
 
 namespace tokshit {
@@ -33,6 +35,8 @@ void matvec_task(void* ctx, std::size_t chunk) {
   const uint32_t r0 = static_cast<uint32_t>(chunk) * t.rows_per_task;
   if (r0 >= t.rows) return;
   const uint32_t n = std::min(t.rows_per_task, t.rows - r0);
+  metrics().c_mm_bytes.fetch_add(static_cast<uint64_t>(n) * t.rb,
+                                 std::memory_order_relaxed);
   if (t.act != nullptr) {
     thread_local std::vector<float> scratch;
     kernels::dot_rows(
@@ -87,17 +91,22 @@ void expert_task(void* ctx, std::size_t t) {
       static_cast<std::uint32_t>(t % j.chunks) * j.chunk_rows;
   if (r0 >= j.rows) return;
   const std::uint32_t n = std::min(j.chunk_rows, j.rows - r0);
+  metrics().c_mm_bytes.fetch_add(static_cast<uint64_t>(n) * j.rb,
+                                 std::memory_order_relaxed);
   const std::uint8_t* base = j.data + e * j.stride;
   const float* xv = j.x + slot * j.x_stride;
   float* yv = j.out + slot * j.out_stride + r0;
   const tokshit::kernels::ActQ8& a =
       j.act_block != nullptr ? j.act_block[slot] : *j.act;
   thread_local std::vector<float> scratch;
-  for (std::uint32_t r = 0; r < n; ++r) {
-    yv[r] = tokshit::kernels::dot_row(
-        j.quant, std::span<const std::uint8_t>(base + (r0 + r) * j.rb, j.rb),
-        j.rb, std::span<const float>(xv, j.in), a, j.in, scratch);
-  }
+  // 4-row kernels for iq2_s/q8_0/q4_0/q4_k/q6_k; other quants fall back to
+  // dot_row inside dot_rows. The expert chunk reads each weight row once.
+  tokshit::kernels::dot_rows(
+      j.quant,
+      std::span<const std::uint8_t>(
+          base + static_cast<std::size_t>(r0) * j.rb,
+          static_cast<std::size_t>(n) * j.rb),
+      j.rb, n, std::span<const float>(xv, j.in), a, j.in, yv, scratch);
 }
 
 struct MultiJob {
@@ -126,14 +135,17 @@ void multi_task(void* ctx, std::size_t task) {
       static_cast<std::uint32_t>(task - j.starts[s]) * j.chunk_rows;
   if (r0 >= seg.rows) return;
   const std::uint32_t n = std::min(j.chunk_rows, seg.rows - r0);
+  metrics().c_mm_bytes.fetch_add(static_cast<uint64_t>(n) * seg.rb,
+                                 std::memory_order_relaxed);
   thread_local std::vector<float> scratch;
-  for (std::uint32_t r = 0; r < n; ++r) {
-    seg.y[r0 + r] = tokshit::kernels::dot_row(
-        seg.quant,
-        std::span<const std::uint8_t>(seg.data + (r0 + r) * seg.rb, seg.rb),
-        seg.rb, std::span<const float>(seg.x, seg.in), *seg.act, seg.in,
-        scratch);
-  }
+  // Use the 4-row kernels for q8_0/q4_0/q6_k/q4_k: same activations, weights
+  // read once per four rows. Other quants fall back to dot_row internally.
+  tokshit::kernels::dot_rows(
+      seg.quant,
+      std::span<const std::uint8_t>(seg.data + static_cast<std::size_t>(r0) * seg.rb,
+                                    static_cast<std::size_t>(n) * seg.rb),
+      seg.rb, n, std::span<const float>(seg.x, seg.in), *seg.act, seg.in,
+      seg.y + r0, scratch);
 }
 
 inline float sigmoidf(float x) { return 1.0F / (1.0F + std::exp(-x)); }
@@ -537,6 +549,71 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
   }
 }
 
+void Inkling2::set_tap_slots(std::span<const uint32_t> slots) {
+  tap_slots_.assign(slots.begin(), slots.end());
+  std::sort(tap_slots_.begin(), tap_slots_.end());
+  tap_buf_.assign(tap_slots_.size() * hidden_, 0.0F);
+}
+
+void Inkling2::capture_tap(std::size_t slot) {
+  if (tap_slots_.empty() || slot >= slot_count_) return;
+  const std::size_t h = hidden_;
+  for (std::size_t k = 0; k < tap_slots_.size(); ++k) {
+    if (tap_slots_[k] == slot) {
+      std::memcpy(tap_buf_.data() + k * h, x_.data(), h * sizeof(float));
+    }
+  }
+}
+
+void Inkling2::embed_normed(uint32_t token, float* out) {
+  const std::size_t rb = tok_embd_.rb;
+  const uint8_t* row = data_ + tok_embd_.base + rb * token;
+  const auto deq = dequant_into(tok_embd_.quant,
+                                std::span<const uint8_t>(row, rb), hidden_,
+                                std::span<float>(out, hidden_));
+  if (!deq.ok()) std::fill(out, out + hidden_, 0.0F);
+  rmsnorm(std::span<float>(out, hidden_),
+          std::span<const float>(tok_norm_.data(), tok_norm_.size()), eps_);
+}
+
+void Inkling2::lm_head(const float* x, float* out) {
+  matvec(out_, x, out);
+}
+
+void Inkling2::lm_head_batch(const float* x, std::size_t b,
+                             std::size_t stride, float* out) {
+  if (b == 0) return;
+  lm_acts_.resize(b);
+  for (std::size_t j = 0; j < b; ++j) {
+    kernels::quantize_into(
+        std::span<const float>(x + j * stride, out_.in_dim), lm_acts_[j]);
+  }
+  const uint8_t* base = out_.hot ? hot_.data() + out_.base : data_ + out_.base;
+  const BatchSeg seg{
+      std::span<const uint8_t>(base,
+                               static_cast<std::size_t>(out_.rows) * out_.rb),
+      out_.rb, out_.quant, out_.in_dim, x, lm_acts_.data(), b, out,
+      out_.rows};
+  batchlib::run_bsegs(std::span<const BatchSeg>(&seg, 1), 16);
+}
+
+void Inkling2::snapshot(Snapshot& s) const {
+  s.conv.resize(slots_.size());
+  s.high.resize(slots_.size());
+  for (std::size_t i = 0; i < slots_.size(); ++i) {
+    s.conv[i] = slots_[i].conv;
+    s.high[i] = slots_[i].high;
+  }
+}
+
+void Inkling2::restore(const Snapshot& s) {
+  if (s.conv.size() != slots_.size()) return;
+  for (std::size_t i = 0; i < slots_.size(); ++i) {
+    slots_[i].conv = s.conv[i];
+    slots_[i].high = s.high[i];
+  }
+}
+
 void Inkling2::embed(uint32_t token) {
   const std::size_t rb = tok_embd_.rb;
   const uint8_t* row = data_ + tok_embd_.base + rb * token;
@@ -568,6 +645,18 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
   const std::size_t h = hidden_;
   const std::size_t kvd = n_kv_ * head_dim_;
   const std::size_t core = core_end_ - core_start_;
+
+  // LOSSY experiment: fewer core passes than the checkpoint was trained for.
+  // The weights are shared across passes, so this only changes the schedule.
+  std::size_t passes_run = n_passes_;
+  if (const char* pv = std::getenv("TOKSHIT_INK_PASSES");
+      pv != nullptr && *pv != '\0') {
+    const unsigned long n = std::strtoul(pv, nullptr, 10);
+    if (n >= 1 && n <= n_passes_) passes_run = static_cast<std::size_t>(n);
+  }
+  if (passes_run != n_passes_) {
+    std::fill(tap_buf_.begin(), tap_buf_.end(), 0.0F);
+  }
 
   std::vector<std::vector<float>> blocks;
   std::vector<float> prelude;
@@ -848,6 +937,7 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
 
   // прелюдия
   for (std::size_t slot = 0; slot < core_start_; ++slot) {
+    capture_tap(slot);
     run_app(slot, slot, 0, nullptr, nullptr);
   }
   prelude = x_;
@@ -855,13 +945,14 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
 
   std::vector<std::vector<float>> bank;
   std::vector<float> prev_out;
-  for (std::size_t p = 0; p < n_passes_; ++p) {
+  for (std::size_t p = 0; p < passes_run; ++p) {
     if (p > 0) {
       x_ = prelude;
       blocks = prelude_blocks;
     }
     for (std::size_t ip = core_start_; ip < core_end_; ++ip) {
       const std::size_t slot = core_start_ + p * core + (ip - core_start_);
+      capture_tap(slot);
       const InkLayer& L = phys(slot);
       const float* mkv = nullptr;
       const float* mres = nullptr;
@@ -901,7 +992,7 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
       }
       run_app(slot, ip, static_cast<int>(p), mkv, mres);
     }
-    if (p + 1 < n_passes_) {
+    if (p + 1 < passes_run) {
       // банк: старт второго core-блока и выход прохода
       bank.clear();
       for (std::size_t i = prelude_blocks.size() + 1; i < blocks.size(); ++i) {
@@ -914,6 +1005,7 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
   // эпилог
   for (std::size_t ip = core_end_; ip < n_phys_; ++ip) {
     const std::size_t slot = ip - core_end_ + core_start_ + core * n_passes_;
+    capture_tap(slot);
     run_app(slot, ip, 0, nullptr, nullptr);
   }
 
@@ -967,6 +1059,11 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
   }
   rmsnorm(std::span<float>(mix2_.data(), h),
           std::span<const float>(out_norm_.data(), out_norm_.size()), eps_);
+  for (std::size_t k = 0; k < tap_slots_.size(); ++k) {
+    if (tap_slots_[k] == slot_count_) {
+      std::memcpy(tap_buf_.data() + k * h, mix2_.data(), h * sizeof(float));
+    }
+  }
   if (pos == 8 && std::getenv("TOKSHIT_INK_DUMP_DIR") != nullptr) {
     dump_vec("out_hidden", mix2_);
     dump_vec("x_final", x_);

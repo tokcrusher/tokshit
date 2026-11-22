@@ -25,6 +25,7 @@ const char* env_for_flag(const std::string& name) {
 bool flag_is_bool(const std::string& name) {
   static const char* const kBool[] = {
       "hot",           "hot-conv",       "o-direct",       "drop-cache",
+      "drop-siblings",  "prefault",
       "prefetch",      "prefetch-idle",  "io-merge",       "freq-persist",
       "mmap-willneed", "fadv-dontneed",  "fadv-random",    "pool-pin",
       "pool-rt",       "pool-stats",     "print-ids",

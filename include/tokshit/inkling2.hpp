@@ -78,7 +78,45 @@ class Inkling2 {
   void token_logits(uint32_t token, std::size_t pos,
                     std::vector<float>& out);
 
+  // Layer-major batched verify/prefill. `tokens` are consecutive positions
+  // starting at `pos`; `out` is b*vocab_unpadded. The K/V and conv state end
+  // after the last token; use restore_batch() to roll back a rejected tail.
+  void token_logits_batch(std::span<const uint32_t> tokens, std::size_t pos,
+                          std::span<float> out);
+  [[nodiscard]] std::span<const float> taps_batch() const noexcept {
+    return batch_taps_;
+  }
+  [[nodiscard]] std::size_t last_batch() const noexcept { return last_batch_; }
+  void restore_batch(std::size_t accepted);
+
+  // DSpark target taps: slot indices whose *input* hidden is captured
+  // (slot_count means the final normalized hidden). Ascending order.
+  void set_tap_slots(std::span<const uint32_t> slots);
+  [[nodiscard]] std::span<const float> taps() const noexcept { return tap_buf_; }
+  [[nodiscard]] std::size_t n_taps() const noexcept { return tap_slots_.size(); }
+
+  // Shared target tensors used by the draft: token embedding + tok_norm and
+  // the LM head. embed_normed writes `hidden_` floats.
+  void embed_normed(uint32_t token, float* out);
+  void lm_head(const float* x, float* out);
+  // Batched LM head: b rows of `stride` floats, output b*vocab_padded.
+  void lm_head_batch(const float* x, std::size_t b, std::size_t stride,
+                     float* out);
+
+  // Conv/high-water state snapshot for speculative rollback. K/V rows above
+  // the restored high-water mark are ignored by the next forward.
+  struct Snapshot {
+    std::vector<std::vector<float>> conv;
+    std::vector<std::size_t> high;
+  };
+  void snapshot(Snapshot& s) const;
+  void restore(const Snapshot& s);
+
   [[nodiscard]] std::size_t vocab() const noexcept { return vocab_unpadded_; }
+  [[nodiscard]] std::size_t vocab_padded() const noexcept {
+    return vocab_padded_;
+  }
+  [[nodiscard]] std::size_t n_embd() const noexcept { return hidden_; }
   [[nodiscard]] std::size_t n_slots() const noexcept { return slot_count_; }
   [[nodiscard]] std::size_t n_phys() const noexcept { return n_phys_; }
   [[nodiscard]] std::size_t n_experts() const noexcept { return n_expert_; }
@@ -96,6 +134,11 @@ class Inkling2 {
 
   void reset();
   void embed(uint32_t token);
+  void capture_tap(std::size_t slot);
+  void ensure_batch(std::size_t b);
+  void capture_batch_tap(std::size_t slot);
+  void run_app_batch(std::size_t slot, std::size_t ip, int pass,
+                     const float* msg_b, std::size_t pos0, std::size_t b);
   void apply_layer(std::size_t slot, std::size_t pass, bool has_msg,
                    const std::vector<std::vector<float>>& bank,
                    const std::vector<float>& bank_out);
@@ -179,6 +222,26 @@ class Inkling2 {
   kernels::ActQ8 act_q8_;
   kernels::ActQ8 act_in_[3];
   std::vector<kernels::ActQ8> act_all_q8_;
+  std::vector<uint32_t> tap_slots_;
+  std::vector<float> tap_buf_;
+  std::vector<kernels::ActQ8> lm_acts_;
+
+  // batched verify buffers
+  std::size_t batch_cap_ = 0;
+  std::size_t batch_pos0_ = 0;
+  std::size_t last_batch_ = 0;
+  std::size_t max_blocks_ = 16;
+  std::vector<float> xb_, inp_sab_, nrm3b_, inp3b_, mixb_, mix2b_, msg_b_,
+      ob_, ffnb_, ffn_in_b_, prev_out_b_, prelude_b_, hb_;
+  std::vector<float> qb_, kb_, vb_, rb_, gateb_, attnb_, sinkb_, dyn_kb_,
+      dyn_vb_;
+  std::vector<float> block_bank_, bank_b_, prelude_blocks_b_;
+  std::vector<std::size_t> block_count_, bank_count_, prelude_count_;
+  std::vector<float> conv_before_, conv_steps_;
+  std::vector<float> batch_taps_;
+  std::vector<float> logits_b_;
+  std::vector<kernels::ActQ8> acts_b_;
+  std::vector<const float*> state_ptrs_;
   std::vector<uint8_t> hot_;  // Q8_0 dense + output, один буфер
   double prof_mv_ns_ = 0.0;
   double prof_moe_ns_ = 0.0;

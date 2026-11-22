@@ -5,6 +5,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -42,6 +43,40 @@ void pin_to_cpu(std::size_t cpu) {
 #pragma GCC diagnostic pop
 #endif
   (void)::sched_setaffinity(0, sizeof(set), &set);
+}
+
+// cpu max frequency in kHz, 0 if sysfs is unavailable
+unsigned long cpu_max_freq(std::size_t cpu) {
+  char path[128];
+  std::snprintf(path, sizeof(path),
+                "/sys/devices/system/cpu/cpu%zu/cpufreq/cpuinfo_max_freq",
+                cpu);
+  FILE* f = std::fopen(path, "r");
+  if (f == nullptr) return 0;
+  unsigned long v = 0;
+  if (std::fscanf(f, "%lu", &v) != 1) v = 0;
+  std::fclose(f);
+  return v;
+}
+
+// CPUs sorted by max frequency, fastest first. Falls back to the natural
+// order when sysfs is missing. This keeps 7 spinning workers off the two
+// 2.0 GHz little cores on a 3.2+3.0+2.8 GHz phone.
+std::vector<std::size_t> cpus_by_freq(std::size_t total) {
+  std::vector<std::size_t> order(total);
+  for (std::size_t i = 0; i < total; ++i) order[i] = i;
+  std::vector<unsigned long> freq(total, 0);
+  bool any = false;
+  for (std::size_t i = 0; i < total; ++i) {
+    freq[i] = cpu_max_freq(i);
+    any = any || freq[i] != 0;
+  }
+  if (!any) return order;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](std::size_t a, std::size_t b) {
+                     return freq[a] > freq[b];
+                   });
+  return order;
 }
 
 // просим sched_fifo и отрицательный nice, обычно в отказ но попытка не пытка
@@ -157,18 +192,22 @@ TaskPool::TaskPool() {
   const bool pin = std::getenv("TOKSHIT_POOL_PIN") != nullptr;
   const bool rt = std::getenv("TOKSHIT_POOL_RT") != nullptr;
   const bool stats = std::getenv("TOKSHIT_POOL_STATS") != nullptr;
+  const std::vector<std::size_t> order = cpus_by_freq(total);
 
   impl_->threads.reserve(impl_->workers);
   for (std::size_t i = 0; i < impl_->workers; ++i) {
-    impl_->threads.emplace_back([this, i, pin, rt, stats, total]() {
-      if (rt) try_realtime();
-      const int rc = boost_uclamp();
-      if (i == 0 && stats) {
-        std::fprintf(stderr, "[pool] uclamp.min=1024 -> %d\n", rc);
-      }
-      if (pin) pin_to_cpu((total - 1 - impl_->workers + i) % total);
-      impl_->worker_loop();
-    });
+    impl_->threads.emplace_back(
+        [this, i, pin, rt, stats, order]() {
+          if (rt) try_realtime();
+          const int rc = boost_uclamp();
+          if (i == 0 && stats) {
+            std::fprintf(stderr, "[pool] uclamp.min=1024 -> %d\n", rc);
+          }
+          if (pin && !order.empty()) {
+            pin_to_cpu(order[i % order.size()]);
+          }
+          impl_->worker_loop();
+        });
   }
 }
 
@@ -230,7 +269,13 @@ void TaskPool::set_active(bool active) {
       std::fprintf(stderr, "[pool] main uclamp.min=1024 -> %d\n", rc);
     }
     if (std::getenv("TOKSHIT_POOL_PIN") != nullptr) {
-      const std::size_t main_cpu = env_usize("TOKSHIT_MAIN_CPU", 7);
+      static const std::size_t fastest = [] {
+        const std::size_t total =
+            std::max<std::size_t>(1, std::thread::hardware_concurrency());
+        const std::vector<std::size_t> order = cpus_by_freq(total);
+        return order.empty() ? std::size_t{0} : order.front();
+      }();
+      const std::size_t main_cpu = env_usize("TOKSHIT_MAIN_CPU", fastest);
       pin_to_cpu(main_cpu);
     }
   }

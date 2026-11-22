@@ -106,6 +106,14 @@ void chat_loop(Model& model, const BpeTokenizer& tok,
                const FreqProfileCfg& freq_cfg);
 void verify_ids(Model& model, const BpeTokenizer& tok, const std::string& prompt,
                 const std::string& path, std::size_t cap);
+void dspark_debug(Model& model, const BpeTokenizer& tok,
+                  const std::string& prompt, std::size_t steps,
+                  const std::string& draft_path);
+
+// Debug parity check: batched Inkling2 logits/taps против последовательных
+// на одном и том же префиксе.
+void ink_batch_debug(Model& model, const BpeTokenizer& tok,
+                     const std::string& prompt, std::size_t group);
 
 void print_help();
 void apply_env_presets();

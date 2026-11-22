@@ -34,6 +34,9 @@ set(TOKSHIT_CORE_SOURCES
   src/model_load.cpp
   src/inkling2_load.cpp
   src/inkling2_forward.cpp
+  src/inkling2_batch.cpp
+  src/dspark_load.cpp
+  src/dspark_forward.cpp
   src/model_hot.cpp
   src/model_cache.cpp
   src/model_layer.cpp

@@ -29,12 +29,16 @@ dot-product и стримит экспертов с флеша через пос
 
 10. [PERFORMANCE.ru.md](PERFORMANCE.ru.md) — текущие замеры, бюджет токена,
     ограничения устройства.
-11. [PERF_SESSION2.md](PERF_SESSION2.md) — исторический отчёт сессии
+11. [PERF_SESSION3.md](PERF_SESSION3.md) — Inkling-2-Mini на телефоне:
+    forward, ядра, попытка DSpark.
+12. [DSPARK.md](DSPARK.md) — draft `dflash`, tap-маппинг, замеры и
+    оставшаяся работа по батч-verify.
+13. [PERF_SESSION2.md](PERF_SESSION2.md) — исторический отчёт сессии
     16–17.11.2026: что проверено и какие гипотезы отклонены.
-12. [BENCH.ru.md](BENCH.ru.md) — харнесс decode/prefill/A/B, JSON/CSV,
+14. [BENCH.ru.md](BENCH.ru.md) — харнесс decode/prefill/A/B, JSON/CSV,
     regression gate.
-13. [ROADMAP.md](ROADMAP.md) — статус, задачи, риски.
-14. [CONTRIBUTING.md](CONTRIBUTING.md) — сборка и правила разработки.
+15. [ROADMAP.md](ROADMAP.md) — статус, задачи, риски.
+16. [CONTRIBUTING.md](CONTRIBUTING.md) — сборка и правила разработки.
 
 English entry point: [README.md](../README.md),
 [ARCHITECTURE.en.md](ARCHITECTURE.en.md),
