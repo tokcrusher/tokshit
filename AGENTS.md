@@ -48,28 +48,36 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
 - Attention: NEON f16 dot/axpy + relative-bias table bounded by `pos`;
   8–10× faster at long context. Global layers [5,11,17,23] must see the full
   context; only the 20 local layers use window 1024. Never clip global.
-- Pool: 4 workers, pinning by max frequency, no 1 ms sleep in the main barrier.
+- Pool: main thread on X4, workers pinned to the more homogeneous A720 cores
+  (skip the fastest core for workers). This was a real win: 2.9 → ~4.4 burst.
+  `TOKSHIT_POOL_CPUS` can pin an explicit mask.
 - Dense F32/BF16: NEON `dot_f32_neon` / `dot_bf16_neon`.
 - DSpark: implemented, greedy, lossless on checked prompts; batched verify
   remains slower than plain (acceptance 47.6 %, ~1.1–1.3 vs 1.6–1.8 tok/s).
-- Measured: 4-token burst 2.7–4.0 tok/s (median ~2.9), 16-token sustained
-  ~2.35 tok/s; `w=2801.5 MB/token`; model fits (RSS ~6.8 GB,
-  `MemAvailable` ~8.2 GB), `majf` tens per token.
-- `--passes 2` / `--topk-experts 2` are LOSSY; varloop 1.97 → 2.52;
-  top2/passes2 ~3.9–5.2. Batched prefill B=32 was slower; keep sequential.
+- **Lossless profile** (`scripts/run_inkling2.sh`): ~4.3–4.5 tok/s burst,
+  ~3.4–3.5 sustained (16 tokens). `w=2801.5 MB/token`; model fits
+  (RSS ~6.8–8.5 GB, `MemAvailable` ~8–9.5 GB).
+- **LOSSY 10 tok/s profile** (`scripts/run_inkling2_fast.sh`):
+  top-2 experts + 2 core passes + Q4_0 dense + 6 workers. Measured
+  **10.04–10.56 tok/s** burst/short and **9.2–9.4 tok/s** on a 24-token
+  coding prompt. Quality is visibly degraded; never present as lossless.
+- `--passes 2` alone ~2.5; top2+Q4+passes2 is the 9–10.5 configuration.
+  Batched prefill B=32 was slower; keep sequential.
+- Audio: a subagent is downloading tiny ASR/TTS models (whisper.cpp small/base
+  + sherpa-onnx/Piper) into `~/audio/` for future voice integration.
 
 ## Goal
 
-Reach 10 tok/s on Inkling-2-Mini without stopping at the first plateau.
-Remaining code levers, in order:
+10 tok/s has been reached with the **LOSSY** profile. Do not stop here if the
+user wants a lossless 10: remaining non-lossy levers, in order:
 
-1. Prefetch experts for the **next layer** using the previous token's routing
-   (`TOKSHIT_INK_PREFETCH_PREV`) to raise memory-level parallelism.
-2. Fix/benchmark 4-row IQ2_XXS; optimize IQ1_S/Q2_0/NVFP4 table kernels.
-3. i8mm for dense Q6K/Q4K/Q8_0 (measure; `TOKSHIT_I8MM=1` was slower in one
-   noisy run, re-test cold).
-4. LTO / inlining of `dot_row` in the pool tasks.
-5. Only then lossy top2/passes2; keep them clearly marked.
+1. Fix/benchmark 4-row IQ2_XXS; optimize IQ1_S/Q2_0/NVFP4 table kernels.
+2. i8mm for dense Q6K/Q4K/Q8_0 (measure cold; `TOKSHIT_I8MM=1` was slower in
+   one noisy run).
+3. LTO / inlining of `dot_row` in the pool tasks.
+4. Previous-token/next-layer expert prefetch (`TOKSHIT_INK_PREFETCH_PREV`)
+   was inconclusive; re-test with the new A720 pinning.
+5. Keep the lossy 10 tok/s profile clearly marked; never call it lossless.
 
 ## Rules
 
