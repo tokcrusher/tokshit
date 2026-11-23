@@ -98,6 +98,22 @@ void clear_chat_context(ChatSession& s) {
   s.pos = 0;
 }
 
+// Литеральные \n -> реальные переводы строк. Нужно и для строк stdin
+// (TOKSHIT_CHAT_UNESCAPE), и для стартового префикса.
+std::string unescape_newlines(std::string_view in) {
+  std::string out;
+  out.reserve(in.size());
+  for (std::size_t i = 0; i < in.size(); ++i) {
+    if (in[i] == '\\' && i + 1 < in.size() && in[i + 1] == 'n') {
+      out.push_back('\n');
+      ++i;
+    } else {
+      out.push_back(in[i]);
+    }
+  }
+  return out;
+}
+
 void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
                const FreqProfileCfg& freq_cfg) {
   const bool tty = ::isatty(STDIN_FILENO) != 0 && ::isatty(STDOUT_FILENO) != 0;
@@ -134,6 +150,30 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
       v != nullptr && *v != '\0') {
     const unsigned long long n = std::strtoull(v, nullptr, 10);
     if (n != 0) chat_max_new = static_cast<std::size_t>(n);
+  }
+
+  // Стартовый префикс: few-shot/инструкции, которые можно прогреть до
+  // первого вопроса. Для голоса это убирает 15–20 токенов из prefill
+  // первого хода; прогрев идёт, пока пользователь говорит/идёт ASR.
+  if (const char* pv = std::getenv("TOKSHIT_CHAT_PREFIX");
+      pv != nullptr && *pv != '\0' && model.is_inkling2()) {
+    const std::string prefix = unescape_newlines(pv);
+    const std::vector<uint32_t> ids = tok.encode(prefix);
+    if (!ids.empty() && s.pos + ids.size() < model.inkling2()->kv_ctx()) {
+      tokshit::pool::set_active(true);
+      model.set_prefilling(true);
+      const auto t0 = tokshit::Clock::now();
+      for (uint32_t id : ids) {
+        model.token_logits(id, s.kv, s.pos, logits);
+        ++s.pos;
+      }
+      model.set_prefilling(false);
+      tokshit::pool::set_active(false);
+      const double dt =
+          std::chrono::duration<double>(tokshit::Clock::now() - t0).count();
+      std::fprintf(stderr, "[prefix] %zu tok за %.1fs, pos=%zu\n", ids.size(),
+                   dt, s.pos);
+    }
   }
 
   if (tty) {
@@ -320,17 +360,7 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     std::string text = cmd.arg;
     if (const char* ue = std::getenv("TOKSHIT_CHAT_UNESCAPE");
         ue != nullptr && *ue != '\0' && *ue != '0') {
-      std::string un;
-      un.reserve(text.size());
-      for (std::size_t i = 0; i < text.size(); ++i) {
-        if (text[i] == '\\' && i + 1 < text.size() && text[i + 1] == 'n') {
-          un.push_back('\n');
-          ++i;
-        } else {
-          un.push_back(text[i]);
-        }
-      }
-      text.swap(un);
+      text = unescape_newlines(text);
     }
     if (text.empty()) continue;
 
