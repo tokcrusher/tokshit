@@ -302,16 +302,12 @@ const auto t_work = std::chrono::steady_clock::now();
   // на 2.8 ГГц-ядрах ждать на YIELD забивает опропорциональную тепловую разницу.
   {
     const uint64_t target = impl_->workers;
-    uint64_t spins = 0;
+    // decode calls this barrier thousands of times per token; sleeping here
+    // adds ~1 ms per short task and dominates the token time. Spin-yield is
+    // cheaper for the common <100 us task; the worker loop still sleeps when
+    // the pool is idle.
     while (st.done.load(std::memory_order_acquire) < target) {
-      if (spins >= 32) {
-        const timespec ts{0, 1000000};
-        ::nanosleep(&ts, nullptr);
-        spins = 0;
-      } else {
-        ++spins;
-        std::this_thread::yield();
-      }
+      std::this_thread::yield();
     }
   }
   if (wait_stats) {

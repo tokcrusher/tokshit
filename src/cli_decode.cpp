@@ -1,5 +1,6 @@
 #include "cli.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 
 #include "tokshit/metrics.hpp"
 #include "tokshit/model.hpp"
+#include "tokshit/quant.hpp"
 #include "tokshit/reasoning.hpp"
 #include "tokshit/sampling.hpp"
 #include "tokshit/special_tokens.hpp"
@@ -89,6 +91,12 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
         options.token_debug ? metrics().c_mm_bytes.load() : 0;
     const uint64_t fb_t0 =
         options.token_debug ? metrics().c_dot_fallback.load() : 0;
+    std::array<uint64_t, 64> fbq_t0{};
+    if (options.token_debug) {
+      for (std::size_t i = 0; i < fbq_t0.size(); ++i) {
+        fbq_t0[i] = metrics().c_fallback_q[i].load(std::memory_order_relaxed);
+      }
+    }
     const uint64_t dw_t0 = metrics().t_down_wait.load();
     const uint64_t hit_t0 = metrics().c_expert_hit.load();
     const uint64_t miss_t0 = metrics().c_expert_miss.load();
@@ -119,6 +127,17 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
           static_cast<unsigned long long>(rss_mb()),
           static_cast<unsigned long long>(m.c_expert_hit.load() - hit_t0),
           static_cast<unsigned long long>(m.c_expert_miss.load() - miss_t0));
+      std::string fbs;
+      for (std::size_t qi = 0; qi < fbq_t0.size(); ++qi) {
+        const uint64_t d =
+            m.c_fallback_q[qi].load(std::memory_order_relaxed) - fbq_t0[qi];
+        if (d == 0) continue;
+        fbs += ' ';
+        fbs += quant_name(static_cast<QuantType>(qi));
+        fbs += '=';
+        fbs += std::to_string(d);
+      }
+      if (!fbs.empty()) std::fprintf(stderr, "     fbq:%s\n", fbs.c_str());
     }
   }
 

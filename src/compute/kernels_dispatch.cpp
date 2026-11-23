@@ -34,6 +34,13 @@ int env_flag(const char* name) noexcept {
   return 1;
 }
 
+// диагностический гейт: TOKSHIT_SCALAR_DENSE=1 отключает neon-ядра q5_k/bf16
+// (dense attention), чтобы сравнить со старым scalar-путём end-to-end
+bool scalar_dense() noexcept {
+  static const bool v = env_flag("TOKSHIT_SCALAR_DENSE") != 0;
+  return v;
+}
+
 }  // namespace
 
 // проверяем есть ли на этом cpu dotprod. результат кэшируется
@@ -106,6 +113,9 @@ bool has_neon_dot(QuantType quant) noexcept {
     case QuantType::Q6K:
     case QuantType::Q4K:
       return true;
+    // q5_k/bf16 имеют neon-ядра (dot_q5k/dot_bf16), но has_neon_dot также
+    // управляет переквантованием горячих весов в Q8_0: q8_0 всё ещё быстрее
+    // на плотных весах, поэтому здесь их не рекламируем
     default:
       return false;
   }
@@ -190,6 +200,16 @@ float dot_row(QuantType quant, std::span<const uint8_t> row, size_t rb,
       case QuantType::Q4K:
         if (use_kquant() && in_dim % 256 == 0) {
           return neon::dot_q4k(row.data(), act, in_dim);
+        }
+        break;
+      case QuantType::Q5K:
+        if (!scalar_dense() && in_dim % 256 == 0) {
+          return neon::dot_q5k(row.data(), act, in_dim);
+        }
+        break;
+      case QuantType::Bf16:
+        if (!scalar_dense() && in_dim % 32 == 0) {
+          return neon::dot_bf16(row.data(), act, in_dim);
         }
         break;
       default:
@@ -277,6 +297,18 @@ void dot_row_multi(QuantType quant, std::span<const uint8_t> row, size_t rb,
         else
           for (size_t j = 0; j < n; ++j)
             out[j] = neon::dot_q4k(row.data(), acts[j], in_dim);
+        break;
+      case QuantType::Q5K:
+        if (scalar_dense() || in_dim % 256 != 0) handled = false;
+        else
+          for (size_t j = 0; j < n; ++j)
+            out[j] = neon::dot_q5k(row.data(), acts[j], in_dim);
+        break;
+      case QuantType::Bf16:
+        if (scalar_dense() || in_dim % 32 != 0) handled = false;
+        else
+          for (size_t j = 0; j < n; ++j)
+            out[j] = neon::dot_bf16(row.data(), acts[j], in_dim);
         break;
       case QuantType::Q2_0:
         if (in_dim % 64 != 0) handled = false;

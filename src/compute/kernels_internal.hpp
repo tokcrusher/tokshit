@@ -41,6 +41,10 @@ void dot_rows_iq2s(const uint8_t* rows, size_t rb, size_t nrows,
 // скалярного эталона через sum(v*q) и sum(q) на 32-блоке активации
 float dot_q4k(const uint8_t* row, const ActQ8& act, size_t in_dim) noexcept;
 float dot_q6k(const uint8_t* row, const ActQ8& act, size_t in_dim) noexcept;
+// q5_k: 6-бит шкалы + min на сабблок, 5-битный код (nibble + бит из qh)
+float dot_q5k(const uint8_t* row, const ActQ8& act, size_t in_dim) noexcept;
+// bf16: 2 байта на вес, конверсия сдвигом в старшие 16 бит float
+float dot_bf16(const uint8_t* row, const ActQ8& act, size_t in_dim) noexcept;
 void dot_rows_q4k(const uint8_t* rows, size_t rb, size_t nrows,
                   const ActQ8& act, size_t in_dim, float* out) noexcept;
 
