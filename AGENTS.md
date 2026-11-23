@@ -57,12 +57,13 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
 - **Lossless profile** (`scripts/run_inkling2.sh`): ~4.3–4.5 tok/s burst,
   ~3.4–3.5 sustained (16 tokens). `w=2801.5 MB/token`; model fits
   (RSS ~6.8–8.5 GB, `MemAvailable` ~8–9.5 GB).
-- **LOSSY 10 tok/s profile** (`scripts/run_inkling2_fast.sh`):
-  top-2 experts + 2 core passes + Q4_0 dense + 6 workers. Measured
-  **10.04–10.56 tok/s** burst/short and **9.2–9.4 tok/s** on a 24-token
-  coding prompt. Quality is visibly degraded; never present as lossless.
-- `--passes 2` alone ~2.5; top2+Q4+passes2 is the 9–10.5 configuration.
-  Batched prefill for Inkling2 is wired (`TOKSHIT_INK_PREFILL_BATCH`,
+- **LOSSY coherent profile** (`scripts/run_inkling2_fast.sh`):
+  top-4 experts + **3 core passes** + original dense weights + 6 workers.
+  Measured ~6.2–6.7 tok/s; text stays readable. This replaces the old
+  top-2/2-pass/Q4 profile: that reached 13.3 tok/s but looped
+  ("Capital capital capital..."). `--passes 2` is the real quality cliff;
+  dropping experts alone to 4/8 is tolerable for voice.
+- Batched prefill for Inkling2 is wired (`TOKSHIT_INK_PREFILL_BATCH`,
   default 16, `TOKSHIT_INK_PREFILL_ONLY_LAST`): fixed a real bug where
   `moe_batch()` ran inside the per-token loop (B× the MoE work). Measured
   same-prompt, temperature 0: sequential 3.24 tok/s (61 tok in 18.8 s);
@@ -88,13 +89,13 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
 - **Speed/quality tiers** (16-token decode, cool phone ~37–40 °C):
   | mode | tok/s | quality |
   |---|---:|---|
-  | lossless top-8 / 3 passes | **4.9–5.0** | reference |
-  | 2 passes, top-8 | 6.4 | coherent on QA |
-  | 2 passes, top-4 | 9.2 | degraded coding |
-  | 2 passes, top-3 | 10.5 | visibly garbled coding |
-  | 2 passes, top-2 + Q4 dense | 13.3 | heavy loss |
-  The last three are LOSSY; never default them for code. The lossless voice
-  path uses top-8/3 passes.
+  | lossless top-8 / 3 passes | **5.5** | reference |
+  | top-4 / **3 passes** (`run_inkling2_fast.sh`, `VOICE_FAST=1`) | 6.2–6.7 | readable; LOSSY 4/8 experts |
+  | top-8 or top-4 / **2 passes** | 6.4–9.2 | loops on many prompts |
+  | top-2 / 2 passes + Q4 dense | 13.3 | garbage |
+  The 2-pass modes are the quality cliff, not the expert count. Never
+  default them for voice/code. Lossless voice uses top-8/3 passes; the
+  coherent fast voice tier is top-4/3 passes via `VOICE_FAST=1`.
 - **Voice latency** (persistent, prefix warmup, base ASR, streaming TTS):
   first token after the question **2.7 s**, first TTS ~3.2 s; second turn
   **1.9 s** to first token / **2.45 s** to audio. Engine load 4.4 s + prefix
