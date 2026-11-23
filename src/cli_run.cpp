@@ -34,6 +34,18 @@ std::size_t prefill_batch_size() {
   return static_cast<std::size_t>(std::min<unsigned long long>(n, 512));
 }
 
+// Inkling2 prefill chunk. The layer-major batch path is exact but the expert
+// union only pays off when the chunk is large enough to amortise the dense
+// weight stream; 16 is the measured sweet spot before the B^2 attention and
+// activation buffers start to hurt.
+std::size_t ink_prefill_batch_size() {
+  const char* v = std::getenv("TOKSHIT_INK_PREFILL_BATCH");
+  if (v == nullptr || *v == '\0') return 16;
+  const unsigned long long n = std::strtoull(v, nullptr, 10);
+  if (n == 0) return 0;
+  return static_cast<std::size_t>(std::min<unsigned long long>(n, 256));
+}
+
 // Переносим готовый батч-kv в старый KVCache, чтобы декод дальше шёл
 // неизменным путём. Слой хранится как [k0 v0 k1 v1 ...], по kv_dim float.
 void seed_kvcache(const tokshit::Kv& src, std::size_t n,
@@ -87,6 +99,85 @@ void prefill_batched(tokshit::Model& model,
   seed_kvcache(bk, pos + tokens.size(), kv);
 }
 
+// Inkling2 keeps its own K/V + conv state and ignores KVCache, so the batch
+// path can be driven directly; no seeding and no throwaway Kv allocation.
+void prefill_batched_ink(tokshit::Inkling2& ink,
+                         std::span<const uint32_t> tokens, std::size_t pos,
+                         std::size_t chunk, std::vector<float>& logits) {
+  // Only the last row of each chunk is sampled, so skip the LM head for the
+  // other rows (they still run every layer for their K/V state).
+  ::setenv("TOKSHIT_INK_PREFILL_ONLY_LAST", "1", 0);
+  const std::size_t vocab = ink.vocab();
+  if (logits.size() < vocab) logits.resize(vocab);
+  std::vector<float> outs(std::max<std::size_t>(chunk, 1) * vocab, 0.0F);
+  std::size_t i = 0;
+  while (i < tokens.size()) {
+    const std::size_t nb = std::min(chunk, tokens.size() - i);
+    ink.token_logits_batch(tokens.subspan(i, nb), pos + i,
+                           std::span<float>(outs.data(), nb * vocab));
+    std::copy(outs.begin() + static_cast<std::ptrdiff_t>((nb - 1) * vocab),
+              outs.begin() + static_cast<std::ptrdiff_t>(nb * vocab),
+              logits.begin());
+    i += nb;
+  }
+}
+
+// Prefill benchmark: one process loads the model once and sweeps chunk sizes
+// and prompt lengths. Only the last row of each chunk is consumed, exactly
+// like real prefill. Set TOKSHIT_INK_PREFILL_BENCH=1.
+void ink_prefill_bench(tokshit::Inkling2& ink,
+                       const std::vector<uint32_t>& base) {
+  ::setenv("TOKSHIT_INK_PREFILL_ONLY_LAST", "1", 0);
+  const std::size_t v = ink.vocab();
+  const std::size_t lens[2] = {30, 100};
+  const std::size_t bs[6] = {1, 4, 8, 16, 32, 64};
+  std::vector<float> row(v);
+  for (std::size_t li = 0; li < 2; ++li) {
+    const std::size_t n = lens[li];
+    std::vector<uint32_t> ids;
+    ids.reserve(n);
+    for (uint32_t id : base) {
+      if (ids.size() >= n) break;
+      ids.push_back(id);
+    }
+    // extend by cycling the prompt tokens; ids are guaranteed valid
+    for (std::size_t i = 0; ids.size() < n; ++i) {
+      ids.push_back(base[i % base.size()]);
+    }
+    for (std::size_t bi = 0; bi < 6; ++bi) {
+      const std::size_t b = bs[bi];
+      if (b == 1) {
+        const auto t0 = tokshit::Clock::now();
+        for (std::size_t i = 0; i < n; ++i) {
+          ink.token_logits(ids[i], i, row);
+        }
+        const double dt =
+            std::chrono::duration<double>(tokshit::Clock::now() - t0).count();
+        std::fprintf(stderr,
+                     "[pbench] n=%zu B=1 seq prefill=%.2fs %.2f tok/s\n", n, dt,
+                     static_cast<double>(n) / (dt > 1e-9 ? dt : 1e-9));
+        continue;
+      }
+      std::vector<float> outs(b * v, 0.0F);
+      std::size_t chunks = 0;
+      const auto t0 = tokshit::Clock::now();
+      for (std::size_t i = 0; i < n; i += b) {
+        const std::size_t nb = std::min(b, n - i);
+        ink.token_logits_batch(
+            std::span<const uint32_t>(ids.data() + i, nb), i,
+            std::span<float>(outs.data(), nb * v));
+        ++chunks;
+      }
+      const double dt =
+          std::chrono::duration<double>(tokshit::Clock::now() - t0).count();
+      std::fprintf(stderr,
+                   "[pbench] n=%zu B=%zu chunks=%zu prefill=%.2fs %.2f tok/s\n",
+                   n, b, chunks, dt,
+                   static_cast<double>(n) / (dt > 1e-9 ? dt : 1e-9));
+    }
+  }
+}
+
 // один прогон: промпт -> генерация -> метрики
 
 void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
@@ -115,17 +206,32 @@ void single_shot(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     for (uint32_t id : turn) std::fprintf(stderr, " %u", id);
     std::fprintf(stderr, "\n");
   }
+  if (model.is_inkling2() &&
+      std::getenv("TOKSHIT_INK_PREFILL_BENCH") != nullptr && !turn.empty()) {
+    ink_prefill_bench(*model.inkling2(), turn);
+    tokshit::pool::set_active(false);
+    return;
+  }
 
   model.set_prefilling(true);
   {
     PrefillBar bar;
     bar.start();
     std::size_t done = 0;
-    const std::size_t pchunk =
-        (dump == nullptr && !model.is_inkling2()) ? prefill_batch_size() : 0;
+    const bool ink = model.is_inkling2();
+    std::size_t pchunk = 0;
+    if (dump == nullptr) {
+      pchunk = ink ? ink_prefill_batch_size() : prefill_batch_size();
+    }
     if (pchunk != 0 && !turn.empty()) {
-      prefill_batched(model, std::span<const uint32_t>(turn), pos, pchunk, kv,
-                      logits);
+      if (ink) {
+        prefill_batched_ink(*model.inkling2(),
+                            std::span<const uint32_t>(turn), pos, pchunk,
+                            logits);
+      } else {
+        prefill_batched(model, std::span<const uint32_t>(turn), pos, pchunk, kv,
+                        logits);
+      }
       pos += turn.size();
     } else {
       const bool ppl_dbg = std::getenv("TOKSHIT_INK_PPL") != nullptr;
@@ -522,7 +628,7 @@ void ink_batch_debug(Model& model, const BpeTokenizer& tok,
     return;
   }
   if (group == 0) group = 1;
-  group = std::min<std::size_t>(group, 8);
+  group = std::min<std::size_t>(group, 16);
   std::vector<uint32_t> tap_slots(ink->n_slots() + 1);
   for (std::size_t i = 0; i < tap_slots.size(); ++i) {
     tap_slots[i] = static_cast<uint32_t>(i);
@@ -598,9 +704,28 @@ void ink_batch_debug(Model& model, const BpeTokenizer& tok,
           if (d != 0.0 && bad_j == 999) {
             bad_j = j;
             bad_k = k / h;
+            if (std::getenv("TOKSHIT_INK_BATCH_TAPDBG") != nullptr) {
+              std::fprintf(stderr,
+                           "[tapdbg] first k=%zu tap=%u ref[%.6f %.6f] "
+                           "bat[%.6f %.6f] d=%.6g\n",
+                           k, tap_slots[k / h], ref_taps[k],
+                           ref_taps[k + 1], bt[k], bt[k + 1], d);
+            }
           }
           gtap = std::max(gtap, d);
         }
+      }
+      if (std::getenv("TOKSHIT_INK_BATCH_TAPDBG") != nullptr) {
+        std::fprintf(stderr, "[tapdbg] per-tap:");
+        for (std::size_t k = 0; k < nt; ++k) {
+          double mx = 0.0;
+          for (std::size_t i = 0; i < h; ++i) {
+            mx = std::max(mx, static_cast<double>(std::fabs(
+                                  ref_taps[k * h + i] - bt[k * h + i])));
+          }
+          std::fprintf(stderr, " %zu:%.3g", tap_slots[k], mx);
+        }
+        std::fputs("\n", stderr);
       }
       if (gtap != 0.0) ++tap_bad;
     }

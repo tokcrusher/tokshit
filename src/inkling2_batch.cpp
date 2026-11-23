@@ -37,6 +37,16 @@ double g_batch_moe_ms = 0.0;
 double g_batch_attn_ms = 0.0;
 double g_batch_conv_ms = 0.0;
 double g_batch_head_ms = 0.0;
+// MoE internals: router, gate_up, SiTU+quant, down, accumulate.
+double g_moe_router_ms = 0.0;
+double g_moe_gu_ms = 0.0;
+double g_moe_situ_ms = 0.0;
+double g_moe_dn_ms = 0.0;
+double g_moe_acc_ms = 0.0;
+double g_moe_pack_ms = 0.0;
+std::size_t g_moe_calls = 0;
+std::size_t g_moe_union = 0;
+std::size_t g_moe_pairs = 0;
 
 void add_ms(double& dst, std::chrono::steady_clock::time_point t0) {
   dst += std::chrono::duration<double, std::milli>(
@@ -126,12 +136,74 @@ void matvec_f32_bf16(const InkMeta& m, const uint8_t* base, const float* x,
   }
 }
 
+// ── rows × acts через тот же dot_rows, что и одиночный путь ────────────
+// Батч обязан давать те же байты, что и token_logits: поэтому строки весов
+// считает dot_rows (4-row ядра), а не dot_row_multi с per-act dot_*. Один
+// чанк строк держим в L1 и прогоняем по всем активациям эксперта/сегмента.
+struct RowsMultiSeg {
+  const uint8_t* bytes = nullptr;
+  std::size_t rb = 0;
+  QuantType quant = QuantType::F32;
+  std::size_t in_dim = 0;
+  const float* x = nullptr;             // cnt × in_dim
+  const kernels::ActQ8* acts = nullptr; // cnt
+  std::size_t cnt = 0;
+  float* out = nullptr;                 // cnt × nrows
+  std::size_t nrows = 0;
+};
+
+struct RowsMultiJob {
+  const RowsMultiSeg* segs = nullptr;
+  std::size_t nsegs = 0;
+  const std::size_t* starts = nullptr;  // nsegs+1, prefix по числу чанков
+  std::size_t chunk_rows = 64;
+};
+
+void rows_multi_task(void* ctx, std::size_t task) {
+  const auto& j = *static_cast<const RowsMultiJob*>(ctx);
+  std::size_t si = 0;
+  while (j.starts[si + 1] <= task) ++si;
+  const RowsMultiSeg& s = j.segs[si];
+  const std::size_t r0 = (task - j.starts[si]) * j.chunk_rows;
+  const std::size_t r1 = std::min(s.nrows, r0 + j.chunk_rows);
+  if (r0 >= r1) return;
+  thread_local std::vector<float> scratch;
+  for (std::size_t k = 0; k < s.cnt; ++k) {
+    kernels::dot_rows(
+        s.quant,
+        std::span<const uint8_t>(s.bytes + r0 * s.rb,
+                                 (r1 - r0) * s.rb),
+        s.rb, r1 - r0,
+        std::span<const float>(s.x + k * s.in_dim, s.in_dim), s.acts[k],
+        s.in_dim, s.out + k * s.nrows + r0, scratch);
+  }
+}
+
+void run_rows_multi(std::span<const RowsMultiSeg> segs,
+                    std::size_t chunk_rows) {
+  if (chunk_rows == 0) chunk_rows = 64;
+  thread_local std::vector<std::size_t> starts;
+  starts.clear();
+  starts.reserve(segs.size() + 1);
+  starts.push_back(0);
+  std::size_t total = 0;
+  for (const RowsMultiSeg& s : segs) {
+    total += (s.nrows + chunk_rows - 1) / chunk_rows;
+    starts.push_back(total);
+  }
+  if (total == 0) return;
+  RowsMultiJob job{segs.data(), segs.size(), starts.data(), chunk_rows};
+  pool::run_tasks(total, rows_multi_task, &job);
+}
+
 void run_dense_bsegs(std::span<const BatchSeg> segs) {
   std::vector<BatchSeg> rest;
   rest.reserve(segs.size());
   for (const BatchSeg& s : segs) {
 #if defined(__aarch64__) && defined(TOKSHIT_HAVE_NEON_DOTPROD)
-    if (s.quant == QuantType::Q8_0 && s.in_dim % 32 == 0 &&
+    static const bool no_q8multi =
+        std::getenv("TOKSHIT_INK_NO_Q8MULTI") != nullptr;
+    if (!no_q8multi && s.quant == QuantType::Q8_0 && s.in_dim % 32 == 0 &&
         kernels::have_dotprod() && s.b != 0 && s.b <= 16) {
       Q8MultiTask task{&s, 16};
       const std::size_t tasks = (s.rows + task.rows_per_task - 1) /
@@ -142,12 +214,16 @@ void run_dense_bsegs(std::span<const BatchSeg> segs) {
 #endif
     rest.push_back(s);
   }
-  if (!rest.empty()) {
-    batchlib::run_bsegs(std::span<const BatchSeg>(rest.data(), rest.size()),
-                        16);
+  if (rest.empty()) return;
+  std::vector<RowsMultiSeg> rows;
+  rows.reserve(rest.size());
+  for (const BatchSeg& s : rest) {
+    if (s.b == 0 || s.rows == 0) continue;
+    rows.push_back(RowsMultiSeg{s.bytes.data(), s.rb, s.quant, s.in_dim, s.x,
+                                s.acts, s.b, s.out, s.rows});
   }
+  run_rows_multi(rows, 64);
 }
-
 void dump_batch_vec(const char* name, const float* p, std::size_t n) {
   const char* dir = std::getenv("TOKSHIT_INK_BATCH_DUMP_DIR");
   if (dir == nullptr || *dir == '\0') return;
@@ -587,6 +663,9 @@ void Inkling2::run_app_batch(std::size_t slot, std::size_t ip, int pass,
   }
 
   // ── FFN: depth-mix, control, MoE, post-conv ────────────────────────────
+  // MoE must run once for the whole chunk: it already unions the experts of
+  // every token. Calling it inside the per-token loop means B full MoE
+  // passes per layer (B× the work) — that was the B=32 catastrophe.
   static const bool noffn = std::getenv("TOKSHIT_INK_NOFFN") != nullptr;
   for (std::size_t j = 0; j < b; ++j) {
     std::memcpy(ffn_in_b_.data() + j * h, xb_.data() + j * h,
@@ -603,14 +682,18 @@ void Inkling2::run_app_batch(std::size_t slot, std::size_t ip, int pass,
     }
     rmsnorm(std::span<float>(mix2b_.data() + j * h, h),
             std::span<const float>(L.ffn_norm.data(), L.ffn_norm.size()), eps_);
-    float* ffn = ffnb_.data() + j * h;
+  }
+  {
+    const auto t_moe = std::chrono::steady_clock::now();
     if (noffn) {
-      std::fill(ffn, ffn + h, 0.0F);
+      std::fill(ffnb_.data(), ffnb_.data() + b * h, 0.0F);
     } else {
-      const auto t_moe = std::chrono::steady_clock::now();
       moe_batch(L, mix2b_.data(), ffnb_.data(), b);
-      add_ms(g_batch_moe_ms, t_moe);
     }
+    add_ms(g_batch_moe_ms, t_moe);
+  }
+  for (std::size_t j = 0; j < b; ++j) {
+    float* ffn = ffnb_.data() + j * h;
     if (dump0) {
       dump_batch_vec("moe_raw", ffn, h);
       dump_batch_vec("mix_ffn", mix2b_.data(), h);
@@ -669,6 +752,7 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
   // F32/BF16 gate_inp: matvec() без квантованной активации — ровно как в
   // moe(), чтобы роутер был тот же; квантованный gate_inp — run_bsegs (одна
   // полоса на все токены).
+  const auto t_router = std::chrono::steady_clock::now();
   router_b_.resize(b * n_expert_);
   if (L.gate_inp.quant == QuantType::F32 || L.gate_inp.quant == QuantType::Bf16) {
     for (std::size_t j = 0; j < b; ++j) {
@@ -680,10 +764,11 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
       kernels::quantize_into(std::span<const float>(x + j * h, h),
                              router_acts_[j]);
     }
-    const BatchSeg seg{bytes_of(L.gate_inp), L.gate_inp.rb, L.gate_inp.quant,
-                       L.gate_inp.in_dim, x, router_acts_.data(), b,
-                       router_b_.data(), n_expert_};
-    batchlib::run_bsegs(std::span<const BatchSeg>(&seg, 1), 16);
+    const RowsMultiSeg seg{bytes_of(L.gate_inp).data(), L.gate_inp.rb,
+                           L.gate_inp.quant, L.gate_inp.in_dim, x,
+                           router_acts_.data(), b, router_b_.data(),
+                           n_expert_};
+    run_rows_multi(std::span<const RowsMultiSeg>(&seg, 1), 64);
   }
 
   // ── пер-токен топ-k: тот же rule, что и Inkling2::moe() ───────────────
@@ -740,13 +825,16 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
       }
     }
   }
+  add_ms(g_moe_router_ms, t_router);
 
   // ── union экспертов батча: seen/emap/utop, затем flat (j, вес) ──────
+  const auto t_pack = std::chrono::steady_clock::now();
   seen_b_.resize(n_expert_);
   emap_b_.resize(n_expert_);
   std::fill(seen_b_.data(), seen_b_.data() + n_expert_, 0);
   std::fill(emap_b_.data(), emap_b_.data() + n_expert_, -1);
   utop_b_.clear();
+  utop_b_.reserve(M);
   for (std::size_t j = 0; j < b; ++j) {
     const int* top = top_b_.data() + j * used;
     for (std::size_t k = 0; k < used; ++k) {
@@ -754,12 +842,20 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
       if (e < 0) continue;
       if (seen_b_[e] == 0) {
         seen_b_[e] = 1;
-        emap_b_[e] = static_cast<int>(utop_b_.size());
         utop_b_.push_back(static_cast<std::size_t>(e));
       }
     }
   }
+  // Эксперты лежат в файле подряд: обход union в порядке возрастания id
+  // превращает случайные чтения в почти последовательные. emap строится
+  // заново под новый порядок.
+  std::sort(utop_b_.begin(), utop_b_.end());
   const std::size_t nu = utop_b_.size();
+  for (std::size_t u = 0; u < nu; ++u) {
+    emap_b_[utop_b_[u]] = static_cast<int>(u);
+  }
+  g_moe_calls += 1;
+  g_moe_union += nu;
   moff_b_.resize(n_expert_);
   mcur_b_.resize(n_expert_);
   std::fill(moff_b_.data(), moff_b_.data() + nu, 0);
@@ -784,12 +880,14 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
   }
 
   // flat пары: gx_b_ — входы gate_up на пару, pair_at_b_ — пара → flat-индекс
-  gx_b_.resize(total * h);
-  moe_in_b_.resize(total);
-  gu_b_.resize(total * 2 * nff);
-  act_b_.resize(total * nff);
-  moe_act_b_.resize(total);
-  dn_b_.resize(total * h);
+  // Буферы только растут: размер total гуляет от слоя к слою, и resize
+  // туда-обратно дёргал бы аллокации на каждом слое.
+  if (gx_b_.size() < total * h) gx_b_.resize(total * h);
+  if (moe_in_b_.size() < total) moe_in_b_.resize(total);
+  if (gu_b_.size() < total * 2 * nff) gu_b_.resize(total * 2 * nff);
+  if (act_b_.size() < total * nff) act_b_.resize(total * nff);
+  if (moe_act_b_.size() < total) moe_act_b_.resize(total);
+  if (dn_b_.size() < total * h) dn_b_.resize(total * h);
   for (std::size_t j = 0; j < b; ++j) {
     const int* top = top_b_.data() + j * used;
     for (std::size_t k = 0; k < used; ++k) {
@@ -808,23 +906,31 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
     kernels::quantize_into(std::span<const float>(gx_b_.data() + at * h, h),
                            moe_in_b_[at]);
   }
+  add_ms(g_moe_pack_ms, t_pack);
+  g_moe_pairs += total;
 
   // ── per expert: gate_up — один pass на все эксперты ────────────────────
-  moe_gu_segs_.clear();
-  moe_gu_segs_.reserve(nu);
+  thread_local std::vector<RowsMultiSeg> gu_segs;
+  gu_segs.clear();
+  gu_segs.reserve(nu);
   for (std::size_t u = 0; u < nu; ++u) {
     const std::size_t off = moff_b_[u];
     const std::size_t cnt =
         (u + 1 < nu ? moff_b_[u + 1] : total) - off;
     if (cnt == 0) continue;
-    moe_gu_segs_.push_back(BatchSeg{
-        expert_bytes(L.gate_up_exps, utop_b_[u]), L.gate_up_exps.rb,
+    gu_segs.push_back(RowsMultiSeg{
+        expert_bytes(L.gate_up_exps, utop_b_[u]).data(), L.gate_up_exps.rb,
         L.gate_up_exps.quant, L.gate_up_exps.in_dim, gx_b_.data() + off * h,
         moe_in_b_.data() + off, cnt, gu_b_.data() + off * 2 * nff, 2 * nff});
   }
-  batchlib::run_bsegs(moe_gu_segs_, 32);
+  {
+    const auto t_gu = std::chrono::steady_clock::now();
+    run_rows_multi(gu_segs, 64);
+    add_ms(g_moe_gu_ms, t_gu);
+  }
 
   // SiTU + quantize per pair
+  const auto t_situ = std::chrono::steady_clock::now();
   for (std::size_t u = 0; u < nu; ++u) {
     const std::size_t off = moff_b_[u];
     const std::size_t cnt =
@@ -838,7 +944,8 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
       for (std::size_t i = 0; i < nff; ++i) {
         const float gi = gu[i] * gs;
         const float ui = gu[nff + i] * gs;
-        float act = situ_beta_ * std::tanh(gi / situ_beta_) * sigmoidf(gi);
+        float act = situ_beta_ * std::tanh(gi / situ_beta_) /
+                    (1.0F + std::exp(-gi));
         act *= situ_linear_beta_ > 0.0F
                    ? situ_linear_beta_ * std::tanh(ui / situ_linear_beta_)
                    : ui;
@@ -848,23 +955,30 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
                              moe_act_b_[off + mi]);
     }
   }
+  add_ms(g_moe_situ_ms, t_situ);
 
   // ── down — второй pass на все эксперты ────────────────────────────────
-  moe_dn_segs_.clear();
-  moe_dn_segs_.reserve(nu);
+  thread_local std::vector<RowsMultiSeg> dn_segs;
+  dn_segs.clear();
+  dn_segs.reserve(nu);
   for (std::size_t u = 0; u < nu; ++u) {
     const std::size_t off = moff_b_[u];
     const std::size_t cnt =
         (u + 1 < nu ? moff_b_[u + 1] : total) - off;
     if (cnt == 0) continue;
-    moe_dn_segs_.push_back(BatchSeg{
-        expert_bytes(L.down_exps, utop_b_[u]), L.down_exps.rb,
+    dn_segs.push_back(RowsMultiSeg{
+        expert_bytes(L.down_exps, utop_b_[u]).data(), L.down_exps.rb,
         L.down_exps.quant, L.down_exps.in_dim, act_b_.data() + off * nff,
         moe_act_b_.data() + off, cnt, dn_b_.data() + off * h, h});
   }
-  batchlib::run_bsegs(moe_dn_segs_, 32);
+  {
+    const auto t_dn = std::chrono::steady_clock::now();
+    run_rows_multi(dn_segs, 64);
+    add_ms(g_moe_dn_ms, t_dn);
+  }
 
   // ── накопление out[j] += w_k · down[k] в порядке k, как в moe() ─────
+  const auto t_acc = std::chrono::steady_clock::now();
   for (std::size_t j = 0; j < b; ++j) {
     float* dst = out + j * h;
     const int* top = top_b_.data() + j * used;
@@ -877,6 +991,7 @@ void Inkling2::moe_batch(const InkLayer& L, float* x, float* out,
       for (std::size_t i = 0; i < h; ++i) dst[i] += w * src[i];
     }
   }
+  add_ms(g_moe_acc_ms, t_acc);
 }
 
 void Inkling2::token_logits_batch(std::span<const uint32_t> tokens,
@@ -909,6 +1024,15 @@ void Inkling2::token_logits_batch(std::span<const uint32_t> tokens,
   g_batch_attn_ms = 0.0;
   g_batch_conv_ms = 0.0;
   g_batch_head_ms = 0.0;
+  g_moe_router_ms = 0.0;
+  g_moe_gu_ms = 0.0;
+  g_moe_situ_ms = 0.0;
+  g_moe_dn_ms = 0.0;
+  g_moe_acc_ms = 0.0;
+  g_moe_pack_ms = 0.0;
+  g_moe_calls = 0;
+  g_moe_union = 0;
+  g_moe_pairs = 0;
   const std::size_t h = hidden_;
   const std::size_t core = core_end_ - core_start_;
   const std::size_t slots = slots_.size();
@@ -1013,7 +1137,15 @@ void Inkling2::token_logits_batch(std::span<const uint32_t> tokens,
   }
 
   // ── финальный depth-mix, out_norm, LM head ─────────────────────────────
-  for (std::size_t j = 0; j < b; ++j) {
+  // Prefill consumes only the chunk's last row. Earlier rows still have to go
+  // through the layers (their K/V+conv state feeds the next token), but the
+  // final norm/depth-mix and the 201k-row LM head can be skipped for them:
+  // the head is ~0.46 GMAC per row, i.e. 8% of the whole chunk at any B.
+  const bool only_last =
+      tap_slots_.empty() &&
+      std::getenv("TOKSHIT_INK_PREFILL_ONLY_LAST") != nullptr;
+  const std::size_t j0 = only_last ? b - 1 : 0;
+  for (std::size_t j = j0; j < b; ++j) {
     const std::size_t nb = block_count_[j];
     for (std::size_t s = 0; s < nb; ++s) {
       state_ptrs_[s] = block_bank_.data() + (j * max_blocks_ + s) * h;
@@ -1030,10 +1162,20 @@ void Inkling2::token_logits_batch(std::span<const uint32_t> tokens,
   // output.weight — Q4_K: dot_rows_q4k и dot_row_multi(q4k) дают одинаковые
   // числа (в отличие от Q8_0), поэтому голову батчим и читаем 261 МБ один раз.
   const auto t_head = std::chrono::steady_clock::now();
-  lm_head_batch(xb_.data(), b, h, logits_b_.data());
+  if (only_last) {
+    lm_head_batch(xb_.data() + (b - 1) * h, 1, h, logits_b_.data());
+  } else {
+    lm_head_batch(xb_.data(), b, h, logits_b_.data());
+  }
   add_ms(g_batch_head_ms, t_head);
   for (std::size_t j = 0; j < b; ++j) {
-    float* row = logits_b_.data() + j * vocab_padded_;
+    if (only_last && j + 1 < b) {
+      std::fill(out.begin() + static_cast<std::ptrdiff_t>(j * vocab),
+                out.begin() + static_cast<std::ptrdiff_t>((j + 1) * vocab),
+                -1e30F);
+      continue;
+    }
+    float* row = logits_b_.data() + (only_last ? 0 : j * vocab_padded_);
     if (final_softcap_ > 0.0F) {
       for (std::size_t i = 0; i < vocab_padded_; ++i) {
         row[i] = final_softcap_ * std::tanh(row[i] / final_softcap_);
@@ -1043,11 +1185,19 @@ void Inkling2::token_logits_batch(std::span<const uint32_t> tokens,
               out.begin() + static_cast<std::ptrdiff_t>(j * vocab));
   }
   if (std::getenv("TOKSHIT_INK_BATCH_PROF") != nullptr) {
+    const double calls = g_moe_calls != 0 ? static_cast<double>(g_moe_calls) : 1.0;
     std::fprintf(stderr,
                  "[batch prof] b=%zu dense=%.0fms moe=%.0fms attn=%.0fms "
                  "conv=%.0fms head=%.0fms\n",
                  b, g_batch_dense_ms, g_batch_moe_ms, g_batch_attn_ms,
                  g_batch_conv_ms, g_batch_head_ms);
+    std::fprintf(stderr,
+                 "[batch moe] calls=%zu union=%.1f pairs=%.1f router=%.0fms "
+                 "pack=%.0fms gu=%.0fms situ=%.0fms dn=%.0fms acc=%.0fms\n",
+                 g_moe_calls, static_cast<double>(g_moe_union) / calls,
+                 static_cast<double>(g_moe_pairs) / calls, g_moe_router_ms,
+                 g_moe_pack_ms, g_moe_gu_ms, g_moe_situ_ms, g_moe_dn_ms,
+                 g_moe_acc_ms);
   }
 }
 
