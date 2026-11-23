@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <string>
 #include <sys/mman.h>
+#include <atomic>
 #include <vector>
 
 #if defined(__aarch64__)
@@ -27,6 +28,12 @@ namespace {
 double g_prof_attn_ns = 0.0;
 double g_prof_attn_local_ns = 0.0;
 double g_prof_attn_global_ns = 0.0;
+
+// per-quant matvec cost, TOKSHIT_INK_PROF=1 only (quant code 0..63)
+double g_prof_q_ns[64] = {};
+std::uint64_t g_prof_q_bytes[64] = {};
+std::uint64_t g_prof_q_rows[64] = {};
+std::atomic<std::uint64_t> g_prof_expert_bytes{0};
 
 // F32/BF16 dense rows: raw float dot, no activation quantization. Used by the
 // router, loop controllers and other F32/BF16 weights that used to run scalar.
@@ -219,6 +226,8 @@ void expert_task(void* ctx, std::size_t t) {
   const std::uint32_t n = std::min(j.chunk_rows, j.rows - r0);
   metrics().c_mm_bytes.fetch_add(static_cast<uint64_t>(n) * j.rb,
                                  std::memory_order_relaxed);
+  g_prof_expert_bytes.fetch_add(static_cast<std::uint64_t>(n) * j.rb,
+                                std::memory_order_relaxed);
   const std::uint8_t* base = j.data + e * j.stride;
   const float* xv = j.x + slot * j.x_stride;
   float* yv = j.out + slot * j.out_stride + r0;
@@ -334,9 +343,16 @@ void Inkling2::matvec(const InkMeta& m, const float* x, float* y,
     matvec_task(&t, 0);
   }
   if (std::getenv("TOKSHIT_INK_PROF") != nullptr) {
-    prof_mv_ns_ += std::chrono::duration<double, std::nano>(
-                       std::chrono::steady_clock::now() - t0)
-                       .count();
+    const double ns = std::chrono::duration<double, std::nano>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    prof_mv_ns_ += ns;
+    const int qi = static_cast<int>(m.quant);
+    if (qi >= 0 && qi < 64) {
+      g_prof_q_ns[qi] += ns;
+      g_prof_q_bytes[qi] += static_cast<std::uint64_t>(m.rows) * m.rb;
+      g_prof_q_rows[qi] += m.rows;
+    }
   }
 }
 
@@ -573,6 +589,24 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
   const std::size_t nff = n_ff_exp_;
   const std::size_t used =
       router_topk_ != 0 && router_topk_ < n_used_ ? router_topk_ : n_used_;
+  const std::size_t gu_size = static_cast<std::size_t>(L.gate_up_exps.rb) *
+                              L.gate_up_exps.rows;
+  const std::size_t dn_size =
+      static_cast<std::size_t>(L.down_exps.rb) * L.down_exps.rows;
+  const std::size_t pl = static_cast<std::size_t>(&L - layers_.data());
+  static const bool prefetch_prev =
+      std::getenv("TOKSHIT_INK_PREFETCH_PREV") != nullptr;
+  if (prefetch_prev && pl < prev_top_valid_.size() && prev_top_valid_[pl]) {
+    for (std::size_t k = 0; k < used; ++k) {
+      const std::size_t e = prev_top_[pl][k];
+      (void)::madvise(
+          const_cast<uint8_t*>(data_ + L.gate_up_exps.base + e * gu_size),
+          gu_size, MADV_WILLNEED);
+      (void)::madvise(
+          const_cast<uint8_t*>(data_ + L.down_exps.base + e * dn_size),
+          dn_size, MADV_WILLNEED);
+    }
+  }
   matvec(L.gate_inp, x, router_.data());
 
   // sigmoid + bias, top-k
@@ -612,11 +646,13 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     if (expert_scale_ != 0.0F) wts_[k] *= expert_scale_;
   }
 
+  if (pl < prev_top_.size()) {
+    for (std::size_t k = 0; k < used; ++k) {
+      prev_top_[pl][k] = static_cast<uint32_t>(top_[k]);
+    }
+    prev_top_valid_[pl] = 1;
+  }
   std::fill(out, out + h, 0.0F);
-  const std::size_t gu_size = static_cast<std::size_t>(L.gate_up_exps.rb) *
-                              L.gate_up_exps.rows;
-  const std::size_t dn_size =
-      static_cast<std::size_t>(L.down_exps.rb) * L.down_exps.rows;
   kernels::quantize_into(std::span<const float>(x, h), act_q8_);
 
   // Optional readahead of the selected experts. The router already knows the
@@ -1265,8 +1301,30 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
     }
   }
   if (std::getenv("TOKSHIT_INK_PROF") != nullptr) {
-    std::fprintf(stderr, "[prof] token=%u pos=%zu mv=%.0fms moe=%.0fms\n",
-                 token, pos, prof_mv_ns_ / 1e6, prof_moe_ns_ / 1e6);
+    std::fprintf(stderr,
+                 "[prof] token=%u pos=%zu mv=%.0fms moe=%.0fms exb=%.1fMB\n",
+                 token, pos, prof_mv_ns_ / 1e6, prof_moe_ns_ / 1e6,
+                 static_cast<double>(g_prof_expert_bytes.load(
+                     std::memory_order_relaxed)) / 1e6);
+    g_prof_expert_bytes.store(0, std::memory_order_relaxed);
+    if (std::getenv("TOKSHIT_INK_PROF_Q") != nullptr) {
+      for (int qi = 0; qi < 64; ++qi) {
+        if (g_prof_q_ns[qi] <= 0.0) continue;
+        std::fprintf(stderr,
+                     "[profq] %-8s %.1fms %lluMB %llu rows %.1f GB/s\n",
+                     std::string(quant_name(static_cast<QuantType>(qi))).c_str(),
+                     g_prof_q_ns[qi] / 1e6,
+                     static_cast<unsigned long long>(g_prof_q_bytes[qi] / 1000000ULL),
+                     static_cast<unsigned long long>(g_prof_q_rows[qi]),
+                     static_cast<double>(g_prof_q_bytes[qi]) /
+                         (g_prof_q_ns[qi] > 1.0 ? g_prof_q_ns[qi] : 1.0));
+      }
+      for (int qi = 0; qi < 64; ++qi) {
+        g_prof_q_ns[qi] = 0.0;
+        g_prof_q_bytes[qi] = 0;
+        g_prof_q_rows[qi] = 0;
+      }
+    }
     prof_mv_ns_ = 0.0;
     prof_moe_ns_ = 0.0;
   }

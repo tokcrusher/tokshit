@@ -367,6 +367,9 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
 
   // KV и conv-state
   const std::size_t kvd = m->n_kv_ * m->head_dim_;
+  m->prev_top_.assign(m->n_phys_,
+                       std::vector<uint32_t>(m->n_used_, 0));
+  m->prev_top_valid_.assign(m->n_phys_, 0);
   m->slots_.resize(m->slot_count_);
   for (auto& st : m->slots_) {
     st.k.assign(m->kv_ctx_ * kvd, 0);

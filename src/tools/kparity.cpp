@@ -74,6 +74,8 @@ int main() {
            std::tuple{QuantType::Iq2Xxs, 66, 512},
            std::tuple{QuantType::Iq1S, 50, 512},
            std::tuple{QuantType::Mxfp4, 17, 512},
+           std::tuple{QuantType::Nvfp4, 36, 512},
+           std::tuple{QuantType::Q2_0, 18, 512},
            std::tuple{QuantType::Q6K, 210, 512},
        }) {
     std::printf("%s bs=%zu worst=%.4f\n", tokshit::quant_name(q).data(), bs,

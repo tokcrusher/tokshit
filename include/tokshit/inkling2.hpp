@@ -243,6 +243,8 @@ class Inkling2 {
   std::vector<float> dn_b_;              // total × h: выходы down
   std::vector<BatchSeg> moe_gu_segs_;    // segs gate_up (один проход)
   std::vector<BatchSeg> moe_dn_segs_;    // segs down (овторный проход)
+  std::vector<std::vector<uint32_t>> prev_top_;
+  std::vector<uint8_t> prev_top_valid_;
   std::vector<uint32_t> tap_slots_;
   std::vector<float> tap_buf_;
   std::vector<kernels::ActQ8> lm_acts_;
