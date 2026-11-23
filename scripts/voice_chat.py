@@ -13,7 +13,11 @@ mic -> whisper.cpp ASR -> tokshit persistent chat -> Piper TTS -> speaker
 декодирует. Один TTS-воркер и один плеер — голоса не накладываются.
 
 Режимы:
-  scripts/voice_chat.py                       # интерактивно (Enter/q)
+  scripts/voice_chat.py                       # TUI, если stdin+stdout TTY
+  scripts/voice_chat.py --no-tui              # построчный режим
+  scripts/voice_chat.py --tui --text "..."    # TUI + готовый ход
+  scripts/voice_chat.py --fast                # lossy top-4 turbo
+  scripts/voice_chat.py --one-sentence        # ровно одно предложение
   scripts/voice_chat.py --seconds 5           # запись ровно 5 с
   scripts/voice_chat.py --hands-free --seconds 5
   scripts/voice_chat.py --wav in.wav          # без микрофона
@@ -22,6 +26,10 @@ mic -> whisper.cpp ASR -> tokshit persistent chat -> Piper TTS -> speaker
   scripts/voice_chat.py --check               # зависимости
   scripts/voice_chat.py --no-guard ...        # пропустить probe движка
 
+TUI: Enter/Space record, s stop, f fast, c clear, q quit, ? help,
+PgUp/PgDn scroll. Кнопки: RECORD STOP FAST CLEAR QUIT (мышь, если терминал
+её отдаёт; Termux часто не отдаёт — клавиши работают всегда).
+
 Аудио — ~/audio/{asr.sh,tts.sh}; они только вызываются, не меняются.
 """
 
@@ -29,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import curses
 import html
 import importlib.util
 import json
@@ -45,8 +54,10 @@ import threading
 import time
 import warnings
 import wave
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 HOME = Path(os.environ.get("HOME", "/data/data/com.termux/files/home"))
 AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", HOME / "audio"))
@@ -200,6 +211,15 @@ class Console:
             self._turn_open = False
             self._flush_locked()
 
+    def user(self, text: str) -> None:
+        """Пользовательская реплика: в TUI это сообщение в транскрипте."""
+        if not text:
+            return
+        with self._lock:
+            self._clear_status_locked()
+            self._flush_locked()
+            print(f"You: {text}", file=sys.stderr, flush=True)
+
     def log(self, msg: str, *, defer: bool = False) -> None:
         with self._lock:
             self._clear_status_locked()
@@ -208,6 +228,9 @@ class Console:
                 return
             self._flush_locked()
             print(msg, file=sys.stderr, flush=True)
+
+    def stats(self, stats: "TurnStats", no_play: bool) -> None:
+        turn_summary(stats, no_play, self)
 
     def status(self, msg: str) -> None:
         with self._lock:
@@ -336,7 +359,7 @@ class SentenceStreamer:
         "etc", "e.g", "i.e", "fig", "approx", "no", "vol", "ch",
     }
 
-    def __init__(self, max_buf: int = 240):
+    def __init__(self, max_buf: int = 84, clause_min: int = 26):
         self._buf: list[str] = []
         self._in_fence = False
         self._ticks = 0
@@ -346,6 +369,7 @@ class SentenceStreamer:
         self._emitted = False
         self._drop_rest = False
         self._max_buf = max_buf
+        self._clause_min = clause_min
 
     def feed(self, text: str) -> list[str]:
         out: list[str] = []
@@ -400,6 +424,13 @@ class SentenceStreamer:
                     self._buf.append(ch)
                     continue
                 self._pending_punct = False
+
+            if ch in ",;:" and len(self._buf) >= self._clause_min:
+                # Первый звук не должен ждать точку: после запятой/точки с
+                # запятой/двоеточия кусок уже звучит как законченная клауза.
+                self._buf.append(ch)
+                self._flush(out)
+                continue
 
             self._buf.append(ch)
             if len(self._buf) >= self._max_buf:
@@ -627,8 +658,8 @@ def quality_guard(args: argparse.Namespace, console: Console) -> None:
             console.log("[guard] cached: engine answered Paris")
         else:
             console.log(
-                f"[guard] cached ⚠ engine answer: {cached.get('answer', '?')[:120]!r}"
-                " — build may be broken"
+                f"[guard] cached WARN engine answer: "
+                f"{cached.get('answer', '?')[:120]!r} - build may be broken"
             )
         return
 
@@ -653,11 +684,11 @@ def quality_guard(args: argparse.Namespace, console: Console) -> None:
     if rc != 0 and not answer:
         console.log(f"[guard] probe failed rc={rc}: {err.strip()[-200:]}")
     elif ok:
-        console.log(f"[guard] ok · Paris · {wall:.1f}s")
+        console.log(f"[guard] ok | Paris | {wall:.1f}s")
     else:
         console.log(
-            f"[guard] ⚠ expected Paris, got {answer[:140]!r} ({wall:.1f}s) "
-            "— perf build may be broken; continuing"
+            f"[guard] WARN expected Paris, got {answer[:140]!r} ({wall:.1f}s) "
+            "- perf build may be broken; continuing"
         )
     if args.verbose and answer:
         console.log(f"[guard] full answer: {answer!r}")
@@ -692,11 +723,24 @@ def record_wav(
     max_seconds: float,
     hands_free: bool,
     console: Console,
+    stop_event: threading.Event | None = None,
+    on_tick: Callable[[float], None] | None = None,
 ) -> tuple[Path | None, float, float]:
-    """Записать с микрофона -> (16 kHz WAV|None, длительность, секунды записи)."""
+    """Записать с микрофона -> (16 kHz WAV|None, длительность, секунды записи).
+
+    TUI передаёт stop_event/on_tick: без input(), с ручной остановкой и
+    тиками прошедшего времени. Без stop_event поведение старое (Enter/таймер).
+    """
     rec = workdir / f"mic-{int(time.time())}.m4a"
     raw = workdir / f"mic-{int(time.time())}.wav"
-    limit = int(seconds) if seconds > 0 else max(0, int(max_seconds))
+    fixed = seconds > 0
+    tui_driven = stop_event is not None
+    if fixed:
+        limit = int(seconds)
+    elif tui_driven:
+        limit = max(0, int(max_seconds))
+    else:
+        limit = 0
     cmd = [
         "termux-microphone-record",
         "-f", str(rec),
@@ -704,48 +748,77 @@ def record_wav(
         "-r", os.environ.get("VOICE_REC_RATE", "16000"),
         "-c", "1",
         "-b", os.environ.get("VOICE_REC_BITRATE", "48"),
-        "-l", str(limit if limit > 0 else 0),
+        "-l", str(limit),
     ]
-    console.log(f"🎤 запись {limit or max_seconds:.0f} с" if seconds > 0 else "🎤 запись…")
+    if fixed:
+        console.log(f"[mic] recording {seconds:.0f}s (Enter/STOP to stop early)")
+    elif tui_driven:
+        console.log(f"[mic] recording... auto-stop {max_seconds:.0f}s")
+    else:
+        console.log("[mic] recording...")
     t0 = time.monotonic()
     rc, _, err = run_cmd(cmd, timeout=10)
     if rc == 124:
         raise VoiceError(
-            "termux-microphone-record завис (нет Termux:API или висит диалог "
-            "разрешения микрофона)."
+            "termux-microphone-record hung (no Termux:API or a mic permission "
+            "dialog is blocking)."
         )
     if rc != 0:
         raise VoiceError(
-            "termux-microphone-record не запустился. Проверь Termux:API и "
-            f"разрешение RECORD_AUDIO.\n{err.strip()}"
+            "termux-microphone-record failed to start. Check Termux:API and "
+            f"the RECORD_AUDIO permission.\n{err.strip()}"
         )
     global _RECORDING
     _RECORDING = True
 
-    if seconds > 0:
-        remaining = seconds
-        try:
-            if not hands_free:
-                console.log(f"   … говори, стоп через {seconds:.0f} с (или Enter)")
-            while remaining > 0:
+    try:
+        if fixed:
+            if not hands_free and not tui_driven:
+                console.log(f"   ... speak; stops in {seconds:.0f}s (or Enter)")
+        elif not tui_driven:
+            if not hands_free and sys.stdin.isatty():
+                input(
+                    f"   ... Enter to stop (auto-stop {max_seconds:.0f}s): "
+                )
+
+        deadline = t0 + (seconds if fixed else max_seconds)
+        last_tick = -1.0
+        while True:
+            now = time.monotonic()
+            elapsed = now - t0
+            if on_tick is not None and elapsed - last_tick >= 0.1:
+                last_tick = elapsed
+                on_tick(elapsed)
+            if fixed and elapsed >= seconds:
+                break
+            if tui_driven:
+                if stop_event is not None and stop_event.wait(0.05):
+                    break
+                if not fixed and elapsed >= max_seconds:
+                    break
+                continue
+            # Старый линейный режим: фиксированное время или Enter/сон.
+            if fixed:
                 time.sleep(0.1)
-                remaining -= 0.1
                 if not hands_free and sys.stdin.isatty():
                     if select.select([sys.stdin], [], [], 0)[0]:
                         sys.stdin.readline()
                         break
-        except KeyboardInterrupt:
-            stop_recorder()
-            raise
-    else:
-        try:
-            if sys.stdin.isatty():
-                input(f"   … Enter — остановить (автостоп {max_seconds:.0f} с): ")
             else:
-                time.sleep(max_seconds)
-        except EOFError:
-            pass
-    stop_recorder()
+                # input() уже отработал; не-TTY просто ждёт автостоп.
+                if not sys.stdin.isatty():
+                    time.sleep(min(0.1, max(0.0, deadline - now)))
+                    if now >= deadline:
+                        break
+                else:
+                    break
+    except KeyboardInterrupt:
+        stop_recorder()
+        raise
+    finally:
+        stop_recorder()
+        if on_tick is not None:
+            on_tick(time.monotonic() - t0)
     rec_s = time.monotonic() - t0
 
     for _ in range(20):
@@ -754,8 +827,8 @@ def record_wav(
         time.sleep(0.1)
     if not rec.is_file() or rec.stat().st_size == 0:
         raise VoiceError(
-            "микрофон не создал файл. Проверь разрешение RECORD_AUDIO у "
-            "Termux:API (Настройки Android → Приложения → Termux:API)."
+            "the microphone produced no file. Check the RECORD_AUDIO "
+            "permission for Termux:API."
         )
 
     af = (
@@ -780,11 +853,14 @@ def record_wav(
             timeout=60,
         )
     if rc != 0 or not raw.is_file():
-        raise VoiceError(f"ffmpeg не смог конвертировать запись:\n{err.strip()}")
+        raise VoiceError(f"ffmpeg could not convert the recording:\n{err.strip()}")
 
     dur = wav_duration(raw)
-    console.log(f"[mic] {dur:.1f} s · запись {rec_s:.1f} s")
-    return (None if dur < 0.35 else raw), dur, rec_s
+    if dur < 0.35:
+        console.log(f"[mic] silence ({dur:.2f}s audio) - nothing to transcribe")
+        return None, dur, rec_s
+    console.log(f"[mic] {dur:.1f}s audio | recorded {rec_s:.1f}s")
+    return raw, dur, rec_s
 
 
 def transcribe(wav: Path, model_name: str, *, verbose: bool,
@@ -800,7 +876,8 @@ def transcribe(wav: Path, model_name: str, *, verbose: bool,
         console.log(f"[asr] stderr: {err.strip()[:300]}")
     rate = dur / dt if dt > 0 else 0.0
     console.log(
-        f"[asr] {model_name} · {dt * 1000:.0f} ms · {rate:.1f}× realtime · {dur:.2f} s audio"
+        f"[asr] {model_name} | {dt * 1000:.0f} ms | {rate:.1f}x realtime | "
+        f"{dur:.2f}s audio"
     )
     return text, dt, dur
 
@@ -1110,13 +1187,15 @@ class SpeechPipeline:
 
     def __init__(self, workdir: Path, console: Console, stats: TurnStats,
                  no_play: bool, warm_event: threading.Event | None = None,
-                 piper: PiperTTS | None = None):
+                 piper: PiperTTS | None = None,
+                 abort_event: threading.Event | None = None):
         self.workdir = workdir
         self.console = console
         self.stats = stats
         self.no_play = no_play
         self.warm_event = warm_event
         self.piper = piper
+        self.abort_event = abort_event
         self.text_q: queue.Queue = queue.Queue()
         self.audio_q: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -1130,8 +1209,11 @@ class SpeechPipeline:
         self.tts_thread.start()
         self.play_thread.start()
 
+    def _aborted(self) -> bool:
+        return self.abort_event is not None and self.abort_event.is_set()
+
     def push(self, sentence: str) -> None:
-        if self.stop_event.is_set() or self._closed:
+        if self.stop_event.is_set() or self._closed or self._aborted():
             return
         if not sentence.strip():
             return
@@ -1164,7 +1246,7 @@ class SpeechPipeline:
         else:
             use_piper = False
         try:
-            while not self.stop_event.is_set():
+            while not self.stop_event.is_set() and not self._aborted():
                 sentence = self.text_q.get()
                 if sentence is None:
                     break
@@ -1172,7 +1254,7 @@ class SpeechPipeline:
                 if not spoken:
                     continue
                 for part in split_for_tts(spoken):
-                    if self.stop_event.is_set():
+                    if self.stop_event.is_set() or self._aborted():
                         break
                     chunk_no += 1
                     out = self.workdir / f"tts-{chunk_no}.wav"
@@ -1216,9 +1298,11 @@ class SpeechPipeline:
 
     def _play_loop(self) -> None:
         try:
-            while not self.stop_event.is_set():
+            while not self.stop_event.is_set() and not self._aborted():
                 item = self.audio_q.get()
                 if item is None:
+                    break
+                if self._aborted():
                     break
                 if self.player is not None:
                     self.player.play(*item)
@@ -1290,11 +1374,14 @@ class EngineSession:
         self.prefix_done = False
         self.fewshot = os.environ.get(
             "VOICE_FEWSHOT",
-            "Q: Hello\\nA: Hi! How can I help?\\nQ: 2 + 2?\\nA: 4.",
+            "Q: Hello\\nA: Hi! How can I help you today?\\n"
+            "Q: Tell me about Paris.\\nA: Paris is the capital of France. "
+            "It is known for the Eiffel Tower and the Louvre.",
         )
         self._expect_prefix = bool(self.fewshot) and not args.chat_template
         self.ready_event = threading.Event()
         self.loaded = False
+        self.prefix_tokens = 0
         self.lock_wait = False
         self._lock_logged = False
         self._stderr: list[str] = []
@@ -1350,6 +1437,27 @@ class EngineSession:
                 "VOICE_FAST_WORKERS", "6"
             )
 
+        # Default: полный ответ до EOG/--max-new. Единственный штатный
+        # маркер — "Q:" (защита от эха few-shot). Раньше здесь стоял
+        # TOKSHIT_STOP_AT2=\n, который резал ответ на первой строке/первом
+        # предложении; это ломало многофразные ответы.
+        stop_at = os.environ.get("VOICE_STOP_AT", "Q:")
+        env.pop("TOKSHIT_STOP_AT", None)
+        if stop_at:
+            env["TOKSHIT_STOP_AT"] = stop_at
+        stop_at2 = os.environ.get("VOICE_STOP_AT2", "")
+        env.pop("TOKSHIT_STOP_AT2", None)
+        if stop_at2:
+            env["TOKSHIT_STOP_AT2"] = stop_at2
+
+        one_sentence = bool(
+            getattr(self.args, "one_sentence", False)
+            or os.environ.get("VOICE_ONE_SENTENCE", "").strip() not in ("", "0")
+        )
+        env.pop("TOKSHIT_STOP_SENTENCE", None)
+        if one_sentence:
+            env["TOKSHIT_STOP_SENTENCE"] = "1"
+
         if self.args.chat_template:
             # Opt-in: нативный шаблон Inkling (видимый reasoning — на любителя).
             env.pop("TOKSHIT_RAW_PROMPT", None)
@@ -1370,14 +1478,6 @@ class EngineSession:
             env["TOKSHIT_CHAT_UNESCAPE"] = "1"
             if self.fewshot:
                 env["TOKSHIT_CHAT_PREFIX"] = self.fewshot
-            stop_at = os.environ.get("VOICE_STOP_AT", "Q:")
-            if stop_at:
-                env["TOKSHIT_STOP_AT"] = stop_at
-            # Второй маркер: конец сообщения/перевод строки. Ведущие \n
-            # игнорируются движком, поэтому пустого ответа не будет.
-            stop_at2 = os.environ.get("VOICE_STOP_AT2", r"\n")
-            if stop_at2:
-                env["TOKSHIT_STOP_AT2"] = stop_at2
         if os.environ.get("VOICE_REASONING_BUDGET"):
             env["TOKSHIT_REASONING_BUDGET"] = os.environ["VOICE_REASONING_BUDGET"]
 
@@ -1440,10 +1540,12 @@ class EngineSession:
                 m = PREFIX_RE.search(line)
                 if m:
                     self.prefix_done = True
+                    self.prefix_tokens = int(m.group(1))
                     self.prefix_s = float(m.group(2))
                     self.console.clear_status()
                     self.console.log(
-                        f"[engine] prefix {m.group(1)} tok / {self.prefix_s:.1f}s"
+                        f"[engine] prefix {self.prefix_tokens} tok / "
+                        f"{self.prefix_s:.1f}s"
                     )
                     self._maybe_ready()
 
@@ -1607,6 +1709,87 @@ class EngineSession:
                     kill_proc(self.proc)
                     raise VoiceError("engine turn timed out")
 
+    def query_stats(self, timeout: float = 0.8) -> dict:
+        """Спросить движок `/stats` между ходами (TUI: cache/rss/ctx).
+
+        Chat-протокол отвечает на /stats в stdout без RS. Читаем до короткой
+        паузы; после этого буфер протокола снова пуст.
+        """
+        if not self.ready_event.is_set():
+            return {}
+        if self.proc is None or self.proc.poll() is not None:
+            return {}
+        if self._outbuf or self.proc.stdin is None or self.proc.stdout is None:
+            return {}
+        try:
+            self.proc.stdin.write(b"/stats\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return {}
+        fd = self.proc.stdout.fileno()
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        data = ""
+        quiet_at: float | None = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                r, _, _ = select.select([fd], [], [], 0.05)
+            except InterruptedError:
+                continue
+            if r:
+                try:
+                    raw = os.read(fd, 8192)
+                except OSError:
+                    break
+                if not raw:
+                    break
+                data += dec.decode(raw)
+                quiet_at = time.monotonic() + 0.12
+            elif quiet_at is not None and time.monotonic() >= quiet_at:
+                break
+        text = strip_ansi(data)
+        if not text:
+            return {}
+        out: dict = {}
+        # hit/miss counts печатаются даже когда rate = "—" (0 обращений).
+        m = re.search(r"\(hit\s+(\d+)\s*/\s*miss\s+(\d+)\)", text)
+        if m:
+            hit = int(m.group(1))
+            miss = int(m.group(2))
+            out["cache_hit"] = hit
+            out["cache_miss"] = miss
+            out["cache_rate"] = (
+                100.0 * hit / (hit + miss) if hit + miss else 0.0
+            )
+        else:
+            m = re.search(r"кэш\s+([\d.]+)%", text)
+            if m:
+                out["cache_rate"] = float(m.group(1))
+        m = re.search(r"RSS\s+(\d+)\s*MB", text)
+        if m:
+            out["rss_mb"] = int(m.group(1))
+        m = re.search(r"MemAvailable\s+(\d+)\s*MB", text)
+        if m:
+            out["mem_avail_mb"] = int(m.group(1))
+        m = re.search(r"контекст\s+(\d+)", text)
+        if m:
+            out["ctx_pos"] = int(m.group(1))
+        m = re.search(r"prefill\s+([\d.]+)s", text)
+        if m:
+            out["prefill_s"] = float(m.group(1))
+        m = re.search(r"последняя:\s*([\d.]+)\s*tok/s", text)
+        if m:
+            out["tok_s"] = float(m.group(1))
+        m = re.search(r"сгенерировано\s+(\d+)\s+токенов", text)
+        if m:
+            out["total_tokens"] = int(m.group(1))
+        m = re.search(r"(\d+)\s+ходов", text)
+        if m:
+            out["turns"] = int(m.group(1))
+        if not out and self.console.verbose:
+            self.console.log(f"[engine] /stats unparsed: {text[:200]!r}")
+        return out
+
     def stop(self) -> None:
         self._status_stop.set()
         if self.proc is not None:
@@ -1625,7 +1808,7 @@ class EngineSession:
 
 # ────────────────────────────── turn ──────────────────────────────
 
-def turn_summary(stats: TurnStats, no_play: bool) -> None:
+def turn_summary(stats: TurnStats, no_play: bool, console: Console) -> None:
     def ms(x: float | None) -> str:
         return f"{x * 1000:.0f} ms" if x else "n/a"
 
@@ -1636,21 +1819,20 @@ def turn_summary(stats: TurnStats, no_play: bool) -> None:
         f"tts {ms(stats.tts_s)}",
         f"total {ms(stats.total_s)}",
     ]
-    print("[summary] " + " · ".join(parts), file=sys.stderr, flush=True)
+    console.log("[summary] " + " | ".join(parts))
     if not no_play:
-        print(
-            f"[summary] play {ms(stats.play_s)} · {stats.audio_out_s:.1f} s audio",
-            file=sys.stderr, flush=True,
+        console.log(
+            f"[summary] play {ms(stats.play_s)} | {stats.audio_out_s:.1f}s audio"
         )
     m = stats.engine_metrics
     tok = (
-        f"{m.get('gen_tokens', 0)} tok · {m.get('tok_s', 0):.2f} tok/s"
+        f"{m.get('gen_tokens', 0)} tok | {m.get('tok_s', 0):.2f} tok/s"
         if m.get("gen_tokens") else "tok/s n/a"
     )
-    print(
-        f"[stats]   {tok} · {stats.chars} chars · "
-        f"{stats.tts_chunks} tts chunks · {stats.audio_out_s:.1f} s audio",
-        file=sys.stderr, flush=True,
+    console.log(
+        f"[stats]   prefill {m.get('prefill_tokens', 0)} tok | "
+        f"{m.get('prefill_s', 0):.2f}s | gen {tok} | {stats.chars} chars | "
+        f"{stats.tts_chunks} tts chunks | {stats.audio_out_s:.1f}s audio"
     )
     first = (
         f"first token {stats.first_token_s:.2f}s (engine)"
@@ -1661,14 +1843,14 @@ def turn_summary(stats: TurnStats, no_play: bool) -> None:
             f" / {stats.engine_ask_start + stats.first_token_s - stats.t_start:.2f}s (turn)"
         )
     if stats.first_tts_s is not None:
-        first += f" · first tts {stats.first_tts_s - stats.t_start:.2f}s (turn)"
+        first += f" | first tts {stats.first_tts_s - stats.t_start:.2f}s (turn)"
     if stats.first_audio_s is not None:
-        first += f" · first audio {stats.first_audio_turn_s:.2f}s (turn)"
+        first += f" | first audio {stats.first_audio_turn_s:.2f}s (turn)"
         if stats.engine_ask_start:
             first += f" / {stats.first_audio_s - stats.engine_ask_start:.2f}s (engine)"
-    print(f"[latency] {first}", file=sys.stderr, flush=True)
+    console.log(f"[latency] {first}")
     for err in stats.errors:
-        print(f"[error]   {err}", file=sys.stderr, flush=True)
+        console.log(f"[error]   {err}")
 
 
 def one_turn(
@@ -1683,6 +1865,7 @@ def one_turn(
     piper: PiperTTS | None = None,
     wav: Path | None = None,
     text: str | None = None,
+    abort_event: threading.Event | None = None,
 ) -> TurnStats:
     stats = TurnStats(t_start=time.monotonic(), asr_model=model_name)
     turn_dir = workdir / f"turn-{turn_no}"
@@ -1696,18 +1879,19 @@ def one_turn(
         )
         stats.asr_s = asr_s
         if is_blank_transcript(transcript):
-            console.log("[asr] тишина/не распознано — пропускаю")
+            console.log("[asr] silence / no speech recognized - skipping turn")
             stats.blank = True
             stats.total_s = time.monotonic() - stats.t_start
             return stats
     else:
         transcript = text.strip()
 
-    console.log(f"🗣  {transcript}")
+    console.user(transcript)
     if text is not None:
         stats.asr_model = ""
     pipeline = SpeechPipeline(
-        turn_dir, console, stats, args.no_play, warm_event, piper
+        turn_dir, console, stats, args.no_play, warm_event, piper,
+        abort_event=abort_event,
     )
     streamer = SentenceStreamer()
     pipeline.start()
@@ -1735,7 +1919,7 @@ def one_turn(
     stats.total_s = time.monotonic() - stats.t_start
     if rc != 0:
         stats.errors.append(f"engine rc={rc}")
-    turn_summary(stats, args.no_play)
+    console.stats(stats, args.no_play)
     if args.verbose:
         tail = engine.stderr_tail(8)
         if tail:
@@ -1774,6 +1958,1386 @@ def session_summary(turns: list[TurnStats], load_s: float, prefix_s: float) -> N
         )
 
 
+# ────────────────────────────── TUI ──────────────────────────────
+
+EMOJI_ASCII = {
+    "\U0001f3a4": "mic",
+    "\U0001f5e3": "user",
+    "\u26a0": "WARN",
+    "\u2717": "x",
+    "\u2705": "ok",
+    "\u2192": "->",
+    "\u00b7": "|",
+    "\u00d7": "x",
+    "\u2026": "...",
+    "\u2022": "*",
+}
+
+
+def sanitize_ui_text(text: str) -> str:
+    s = strip_ansi(text)
+    for src, dst in EMOJI_ASCII.items():
+        s = s.replace(src, dst)
+    return s
+
+
+def fmt_sec(x: float | None) -> str:
+    if x is None or x <= 0:
+        return "n/a"
+    if x < 1.0:
+        return f"{x * 1000:.0f}ms"
+    return f"{x:.2f}s"
+
+
+def fmt_mb(mb: float) -> str:
+    if not mb or mb <= 0:
+        return "n/a"
+    if mb >= 1024:
+        return f"{mb / 1024:.1f}G"
+    return f"{mb:.0f}M"
+
+
+def read_rss_mb(pid: int | None = None) -> float:
+    path = "/proc/self/status" if pid is None else f"/proc/{pid}/status"
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def proc_tree_rss_mb(root_pid: int | None) -> float:
+    if not root_pid:
+        return 0.0
+    total = 0.0
+    seen: set[int] = set()
+    stack = [root_pid]
+    while stack and len(seen) < 64:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        total += read_rss_mb(pid)
+        try:
+            raw = Path(f"/proc/{pid}/task/{pid}/children").read_text()
+        except OSError:
+            continue
+        for part in raw.split():
+            try:
+                stack.append(int(part))
+            except ValueError:
+                pass
+    return total
+
+
+def thermal_max_c() -> float | None:
+    best: float | None = None
+    try:
+        zones = Path("/sys/class/thermal").glob("thermal_zone*/temp")
+    except OSError:
+        return None
+    for z in zones:
+        try:
+            raw = z.read_text().strip()
+            value = float(raw)
+        except (OSError, ValueError):
+            continue
+        if abs(value) > 200:
+            value /= 1000.0
+        if -40.0 <= value <= 150.0:
+            best = value if best is None else max(best, value)
+    return best
+
+
+def env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip() not in ("", "0")
+
+
+def apply_mode_env(fast: bool) -> None:
+    """FAST/LOSSLESS переключают только env движка; перезапуск делает TUI."""
+    if fast:
+        os.environ["VOICE_FAST"] = "1"
+        os.environ["TOKSHIT_DRAFT_TOPK"] = os.environ.get("VOICE_TOPK", "4")
+        os.environ.pop("TOKSHIT_HOT_Q4", None)
+        os.environ.pop("TOKSHIT_INK_PASSES", None)
+        os.environ["TOKSHIT_POOL_WORKERS"] = "6"
+        os.environ["VOICE_POOL_WORKERS"] = "6"
+        os.environ["VOICE_FAST_WORKERS"] = "6"
+    else:
+        os.environ.pop("VOICE_FAST", None)
+        os.environ.pop("TOKSHIT_DRAFT_TOPK", None)
+        os.environ.pop("TOKSHIT_HOT_Q4", None)
+        os.environ.pop("TOKSHIT_INK_PASSES", None)
+        os.environ.pop("VOICE_FAST_WORKERS", None)
+        os.environ["TOKSHIT_POOL_WORKERS"] = "4"
+        os.environ["VOICE_POOL_WORKERS"] = "4"
+
+
+def stop_label(args: argparse.Namespace) -> str:
+    stop = os.environ.get("VOICE_STOP_AT", "Q:")
+    parts = [stop if stop else "off"]
+    stop2 = os.environ.get("VOICE_STOP_AT2", "")
+    if stop2:
+        shown = stop2.replace("\\", "/").replace("\n", "\\n")
+        parts.append(f"stop2={shown}")
+    one = bool(
+        getattr(args, "one_sentence", False)
+        or env_truthy("VOICE_ONE_SENTENCE")
+    )
+    parts.append(f"one-sentence {'on' if one else 'off'}")
+    return " | ".join(parts)
+
+
+def wrap_ui_line(text: str, width: int) -> list[str]:
+    if width < 1:
+        return [text]
+    s = text.replace("\t", "    ").replace("\r", "")
+    if not s:
+        return [""]
+    out: list[str] = []
+    cur = ""
+    for word in s.split(" "):
+        if not word:
+            if cur:
+                cur += " "
+            continue
+        while len(word) > width:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(word[:width])
+            word = word[width:]
+        if not cur:
+            cur = word
+        elif len(cur) + 1 + len(word) <= width:
+            cur += " " + word
+        else:
+            out.append(cur)
+            cur = word
+    if cur or not out:
+        out.append(cur)
+    return out
+
+
+@dataclass
+class UiMessage:
+    role: str
+    text: str = ""
+    done: bool = True
+
+
+class UiState:
+    """Состояние TUI. Меняется из воркеров под lock, curses рисует main."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.messages: list[UiMessage] = []
+        self.log_lines: deque[str] = deque(maxlen=80)
+        self.status = ""
+        self.notice = ""
+        self.notice_until = 0.0
+        self.phase = "LOADING"
+        self.ready = False
+        self.busy = False
+        self.recording = False
+        self.rec_elapsed = 0.0
+        self.restarting = False
+        self.fast = False
+        self.load_s = 0.0
+        self.prefix_s = 0.0
+        self.prefix_tokens = 0
+        self.turn_no = 0
+        self.scroll = 0
+        self.last_stats: dict = {}
+        self.engine_stats: dict = {}
+        self.abort_event: threading.Event | None = None
+        self._stream_idx: int | None = None
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            msgs = [
+                (m.role, m.text, m.done) for m in self.messages[-120:]
+            ]
+            return {
+                "messages": msgs,
+                "logs": list(self.log_lines),
+                "status": self.status,
+                "notice": self.notice,
+                "notice_until": self.notice_until,
+                "phase": self.phase,
+                "ready": self.ready,
+                "busy": self.busy,
+                "recording": self.recording,
+                "rec_elapsed": self.rec_elapsed,
+                "restarting": self.restarting,
+                "fast": self.fast,
+                "load_s": self.load_s,
+                "prefix_s": self.prefix_s,
+                "prefix_tokens": self.prefix_tokens,
+                "turn_no": self.turn_no,
+                "scroll": self.scroll,
+                "last_stats": dict(self.last_stats),
+                "engine_stats": dict(self.engine_stats),
+            }
+
+    def user(self, text: str) -> None:
+        if not text:
+            return
+        clean = sanitize_ui_text(text).strip()
+        with self.lock:
+            if self._stream_idx is not None:
+                self.messages[self._stream_idx].done = True
+                self._stream_idx = None
+            self.messages.append(UiMessage("user", clean))
+            self.scroll = 0
+            self.status = ""
+            self.notice = ""
+
+    def answer(self, text: str) -> None:
+        if not text:
+            return
+        with self.lock:
+            if self._stream_idx is None:
+                self.messages.append(UiMessage("assistant", "", False))
+                self._stream_idx = len(self.messages) - 1
+            self.messages[self._stream_idx].text += text
+
+    def end_answer(self) -> None:
+        with self.lock:
+            if self._stream_idx is not None:
+                self.messages[self._stream_idx].done = True
+                self._stream_idx = None
+
+    def log(self, msg: str, *, defer: bool = False) -> None:
+        del defer
+        clean = sanitize_ui_text(str(msg))
+        with self.lock:
+            for line in clean.splitlines() or [""]:
+                self.log_lines.append(line)
+
+    def set_status(self, msg: str) -> None:
+        with self.lock:
+            self.status = sanitize_ui_text(msg)
+
+    def clear_status(self) -> None:
+        with self.lock:
+            self.status = ""
+
+    def notice_msg(self, msg: str, ttl: float = 5.0) -> None:
+        with self.lock:
+            self.notice = sanitize_ui_text(msg)
+            self.notice_until = time.monotonic() + ttl if ttl > 0 else 0.0
+
+    def clear_notice(self) -> None:
+        with self.lock:
+            self.notice = ""
+            self.notice_until = 0.0
+
+    def record_tick(self, elapsed: float) -> None:
+        with self.lock:
+            self.rec_elapsed = elapsed
+
+    def set_stats(self, stats: "TurnStats", no_play: bool) -> None:
+        m = stats.engine_metrics or {}
+        first_turn = None
+        if stats.first_token_s is not None and stats.engine_ask_start:
+            first_turn = stats.engine_ask_start + stats.first_token_s - stats.t_start
+        first_tts_turn = (
+            stats.first_tts_s - stats.t_start
+            if stats.first_tts_s is not None else None
+        )
+        with self.lock:
+            self.last_stats = {
+                "audio_s": stats.audio_s,
+                "asr_s": stats.asr_s,
+                "asr_model": stats.asr_model,
+                "engine_s": stats.engine_s,
+                "first_token_s": stats.first_token_s,
+                "first_token_turn_s": first_turn,
+                "first_tts_turn_s": first_tts_turn,
+                "first_audio_turn_s": stats.first_audio_turn_s,
+                "tts_s": stats.tts_s,
+                "tts_chunks": stats.tts_chunks,
+                "audio_out_s": stats.audio_out_s,
+                "play_s": stats.play_s,
+                "total_s": stats.total_s,
+                "chars": stats.chars,
+                "prefill_tokens": int(m.get("prefill_tokens", 0) or 0),
+                "prefill_s": float(m.get("prefill_s", 0.0) or 0.0),
+                "gen_tokens": int(m.get("gen_tokens", 0) or 0),
+                "gen_s": float(m.get("gen_s", 0.0) or 0.0),
+                "tok_s": float(m.get("tok_s", 0.0) or 0.0),
+                "no_play": no_play,
+                "blank": stats.blank,
+                "errors": list(stats.errors),
+            }
+
+    def set_engine_stats(self, stats: dict) -> None:
+        if not stats:
+            return
+        with self.lock:
+            for key, value in stats.items():
+                if value is not None:
+                    self.engine_stats[key] = value
+
+    def set_scroll(self, value: int) -> None:
+        with self.lock:
+            self.scroll = max(0, value)
+
+    def clear(self) -> None:
+        with self.lock:
+            self.messages.clear()
+            self.log_lines.clear()
+            self.scroll = 0
+            self.status = ""
+            self.notice = ""
+            self.notice_until = 0.0
+            self._stream_idx = None
+
+
+class TuiConsole(Console):
+    """Console для воркеров: никакого curses/stderr, только UiState."""
+
+    def __init__(self, state: UiState, verbose: bool = False):
+        self.state = state
+        self.verbose = verbose
+
+    def answer(self, text: str) -> None:
+        self.state.answer(text)
+
+    def end_answer(self) -> None:
+        self.state.end_answer()
+
+    def user(self, text: str) -> None:
+        self.state.user(text)
+
+    def log(self, msg: str, *, defer: bool = False) -> None:
+        self.state.log(msg, defer=defer)
+
+    def status(self, msg: str) -> None:
+        self.state.set_status(msg)
+
+    def clear_status(self) -> None:
+        self.state.clear_status()
+
+    def stats(self, stats: "TurnStats", no_play: bool) -> None:
+        self.state.set_stats(stats, no_play)
+
+
+class EngineHolder:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.engine: EngineSession | None = None
+
+    def get(self) -> EngineSession | None:
+        with self.lock:
+            return self.engine
+
+    def set(self, engine: EngineSession | None) -> None:
+        with self.lock:
+            self.engine = engine
+
+    def swap(self, engine: EngineSession | None) -> EngineSession | None:
+        with self.lock:
+            old = self.engine
+            self.engine = engine
+            return old
+
+
+class TuiApp:
+    BUTTONS = [
+        ("record", "[ RECORD ]"),
+        ("stop", "[ STOP ]"),
+        ("fast", "[ FAST ]"),
+        ("clear", "[ CLEAR ]"),
+        ("quit", "[ QUIT ]"),
+    ]
+
+    HELP_LINES = [
+        "KEYS",
+        "  Enter / Space   start recording",
+        "  s               stop recording / stop audio",
+        "  f               toggle FAST / LOSSLESS (engine restart)",
+        "  c               clear transcript",
+        "  q / Ctrl-C      quit",
+        "  PgUp / PgDn     scroll transcript",
+        "  ?               this help",
+        "",
+        "BUTTONS",
+        "  Tap or click the button row if the terminal reports mouse events.",
+        "  Termux may not report taps; the keys above always work.",
+    ]
+
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        model_name: str,
+        workdir: Path,
+        console: TuiConsole,
+        state: UiState,
+    ):
+        self.args = args
+        self.model_name = model_name
+        self.workdir = workdir
+        self.console = console
+        self.state = state
+        self.holder = EngineHolder()
+        self.events: queue.Queue = queue.Queue()
+        self.stop_flag = threading.Event()
+        self.warm_event = threading.Event()
+        self.piper: PiperTTS | None = None
+        self.fast = bool(
+            getattr(args, "fast", False) or env_truthy("VOICE_FAST")
+        )
+        self.state.fast = self.fast
+        self.running = True
+        self.help = False
+        self.color = False
+        self.turn_no = 0
+        self.rec_stop_event: threading.Event | None = None
+        self.abort_event: threading.Event | None = None
+        self.initial_tasks: list[tuple[str, str]] = [
+            ("text", t) for t in args.text
+        ]
+        if args.wav is not None:
+            self.initial_tasks.append(("wav", args.wav))
+        self.had_initial = bool(self.initial_tasks)
+        self.initial_done = not self.had_initial
+        self._buttons: list[tuple[int, int, int, str]] = []
+        self._page = 10
+        self._last_click = (0, 0, 0.0)
+        self._sys: dict = {}
+        self._sys_at = 0.0
+        self._auto_at = 0.0
+        self.startup_thread: threading.Thread | None = None
+        self.restart_thread: threading.Thread | None = None
+
+    # ----- lifecycle -------------------------------------------------
+
+    def run(self) -> None:
+        try:
+            curses.wrapper(self._run)
+        except curses.error as exc:
+            raise VoiceError(f"curses TUI failed: {exc}")
+        finally:
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        self.running = False
+        self.stop_flag.set()
+        if self.rec_stop_event is not None:
+            self.rec_stop_event.set()
+        if self.abort_event is not None:
+            self.abort_event.set()
+        engine = self.holder.get()
+        if engine is not None:
+            engine.stop()
+        shutdown_procs()
+        # Стартовый/restart-поток мог пройти проверку stop_flag и запустить
+        # движок уже после первого kill. Ждём его и гасим ещё раз.
+        current = threading.current_thread()
+        for th in (self.startup_thread, self.restart_thread):
+            if th is not None and th is not current:
+                th.join(timeout=5.0)
+        engine = self.holder.get()
+        if engine is not None:
+            engine.stop()
+        shutdown_procs()
+
+    def _init_curses(self, stdscr) -> None:
+        stdscr.keypad(True)
+        stdscr.timeout(100)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_CYAN, -1)
+                curses.init_pair(2, curses.COLOR_GREEN, -1)
+                curses.init_pair(3, curses.COLOR_YELLOW, -1)
+                curses.init_pair(4, curses.COLOR_RED, -1)
+                self.color = True
+        except curses.error:
+            self.color = False
+        try:
+            curses.mouseinterval(0)
+        except curses.error:
+            pass
+        try:
+            mask = curses.ALL_MOUSE_EVENTS
+            mask |= getattr(curses, "REPORT_MOUSE_POSITION", 0)
+            curses.mousemask(mask)
+        except curses.error:
+            pass
+
+    def _run(self, stdscr) -> None:
+        self._init_curses(stdscr)
+        self.startup_thread = threading.Thread(
+            target=self._startup, daemon=True
+        )
+        self.startup_thread.start()
+        while self.running:
+            try:
+                self._drain_events()
+                self._sync_engine()
+                self._maybe_initial()
+                self._maybe_hands_free()
+                self._expire_notice()
+                self._draw(stdscr)
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                self._quit()
+                break
+            self._handle_key(key)
+
+    def _startup(self) -> None:
+        try:
+            quality_guard(self.args, self.console)
+            if self.stop_flag.is_set():
+                return
+            apply_mode_env(self.fast)
+            tts_mode = os.environ.get("VOICE_TTS", "inproc").lower()
+            if tts_mode != "script":
+                self.piper = PiperTTS(self.console)
+                self.piper.start()
+            if self.stop_flag.is_set():
+                return
+            engine = EngineSession(self.args, self.console)
+            self.holder.set(engine)
+            with self.state.lock:
+                self.state.phase = "LOADING"
+            self.console.log("[engine] starting persistent chat")
+            engine.start()
+            if self.stop_flag.is_set():
+                engine.stop()
+                return
+            if self.piper is None:
+                threading.Thread(
+                    target=tts_warmup,
+                    args=(engine, self.workdir, self.console, self.warm_event),
+                    daemon=True,
+                ).start()
+            self.events.put(("startup_ok", None))
+        except Exception as exc:  # noqa: BLE001 - поток не должен падать
+            self.console.log(f"ERROR: {exc}")
+            with self.state.lock:
+                self.state.phase = "ERROR"
+                self.state.ready = False
+            self.events.put(("startup_error", str(exc)))
+
+    # ----- state/events ----------------------------------------------
+
+    def _sync_engine(self) -> None:
+        engine = self.holder.get()
+        if engine is None:
+            return
+        proc = engine.proc
+        if proc is not None and proc.poll() is not None:
+            with self.state.lock:
+                if self.state.phase != "ERROR":
+                    self.state.phase = "ERROR"
+                    self.state.ready = False
+                    self.console.log(
+                        f"ERROR: engine exited (rc={proc.returncode})"
+                    )
+            return
+        if engine.ready_event.is_set():
+            with self.state.lock:
+                self.state.ready = True
+                self.state.phase = "READY"
+                self.state.load_s = engine.child_load_s or engine.load_s
+                self.state.prefix_s = engine.prefix_s
+                self.state.prefix_tokens = engine.prefix_tokens
+        else:
+            with self.state.lock:
+                self.state.ready = False
+                if not self.state.restarting and self.state.phase != "ERROR":
+                    self.state.phase = "LOADING"
+
+    def _drain_events(self) -> None:
+        while True:
+            try:
+                kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "startup_error":
+                self.state.notice_msg(f"Engine failed: {payload}", ttl=0)
+            elif kind == "restart_ok":
+                with self.state.lock:
+                    self.state.restarting = False
+                    self.state.phase = "LOADING"
+                self.console.log("[engine] restart complete; loading")
+            elif kind == "restart_error":
+                with self.state.lock:
+                    self.state.restarting = False
+                    self.state.phase = "ERROR"
+                    self.state.ready = False
+                self.console.log(f"ERROR: engine restart failed: {payload}")
+                self.state.notice_msg("Engine restart failed - see log", ttl=0)
+            elif kind == "record_done":
+                self._handle_record_done(payload)
+            elif kind == "record_error":
+                with self.state.lock:
+                    self.state.recording = False
+                    self.state.rec_elapsed = 0.0
+                    self.state.status = ""
+                self.rec_stop_event = None
+                self.console.log(f"ERROR: microphone: {payload}")
+                self.state.notice_msg("Microphone error - see log", ttl=6)
+                if self.args.hands_free:
+                    self._auto_at = time.monotonic() + 5.0
+            elif kind == "turn_done":
+                stats = payload
+                with self.state.lock:
+                    self.state.busy = False
+                    self.state.abort_event = None
+                    self.state.scroll = 0
+                self.abort_event = None
+                if getattr(stats, "blank", False):
+                    self.state.notice_msg(
+                        "Silence / no speech recognized - try again", ttl=5
+                    )
+                if self.args.once:
+                    self._quit()
+                elif self.args.hands_free:
+                    self._auto_at = time.monotonic() + 0.4
+            elif kind == "turn_error":
+                with self.state.lock:
+                    self.state.busy = False
+                    self.state.abort_event = None
+                self.abort_event = None
+                self.console.log(f"ERROR: turn failed: {payload}")
+                self.state.notice_msg("Turn failed - see log", ttl=8)
+                if self.args.hands_free:
+                    self._auto_at = time.monotonic() + 5.0
+                if self.args.once:
+                    self._quit()
+            elif kind == "startup_ok":
+                pass
+
+    def _expire_notice(self) -> None:
+        with self.state.lock:
+            if self.state.notice and self.state.notice_until:
+                if time.monotonic() >= self.state.notice_until:
+                    self.state.notice = ""
+                    self.state.notice_until = 0.0
+
+    def _maybe_initial(self) -> None:
+        with self.state.lock:
+            ready = self.state.ready
+            busy = self.state.busy
+            recording = self.state.recording
+            restarting = self.state.restarting
+        if self.initial_done or not ready or busy or recording or restarting:
+            return
+        if not self.initial_tasks:
+            self.initial_done = True
+            if self.args.once and self.had_initial:
+                self._quit()
+            return
+        kind, value = self.initial_tasks.pop(0)
+        if kind == "text":
+            self._start_turn(text=value)
+        else:
+            self._start_turn(wav=Path(value))
+
+    def _maybe_hands_free(self) -> None:
+        if not self.args.hands_free:
+            return
+        with self.state.lock:
+            ready = self.state.ready
+            busy = self.state.busy
+            recording = self.state.recording
+            restarting = self.state.restarting
+        if not ready or busy or recording or restarting or not self.initial_done:
+            return
+        if time.monotonic() < self._auto_at:
+            return
+        self._auto_at = 0.0
+        self._start_recording()
+
+    # ----- actions ---------------------------------------------------
+
+    def _start_recording(self) -> None:
+        with self.state.lock:
+            ready = self.state.ready
+            busy = self.state.busy
+            recording = self.state.recording
+            restarting = self.state.restarting
+        if not ready or busy or recording or restarting:
+            self.state.notice_msg("Engine is not ready for recording", ttl=3)
+            return
+        ev = threading.Event()
+        self.rec_stop_event = ev
+        with self.state.lock:
+            self.state.recording = True
+            self.state.rec_elapsed = 0.0
+            self.state.notice = ""
+            self.state.notice_until = 0.0
+            self.state.status = "SPEAK NOW"
+
+        def work() -> None:
+            try:
+                wav, dur, rec_s = record_wav(
+                    self.workdir,
+                    seconds=self.args.seconds,
+                    max_seconds=self.args.max_seconds,
+                    hands_free=self.args.hands_free,
+                    console=self.console,
+                    stop_event=ev,
+                    on_tick=self.state.record_tick,
+                )
+                self.events.put(("record_done", (wav, dur, rec_s)))
+            except Exception as exc:  # noqa: BLE001
+                self.events.put(("record_error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _handle_record_done(self, payload) -> None:
+        wav, _dur, _rec_s = payload
+        with self.state.lock:
+            self.state.recording = False
+            self.state.rec_elapsed = 0.0
+            self.state.status = ""
+        self.rec_stop_event = None
+        if wav is None:
+            self.state.notice_msg(
+                "Silence detected - nothing transcribed. Try again.", ttl=6
+            )
+            self.console.log("[mic] silence - turn skipped")
+            if self.args.once:
+                self._quit()
+            elif self.args.hands_free:
+                self._auto_at = time.monotonic() + 1.0
+            return
+        self._start_turn(wav=wav)
+
+    def _start_turn(
+        self, *, text: str | None = None, wav: Path | None = None
+    ) -> None:
+        engine = self.holder.get()
+        with self.state.lock:
+            ready = self.state.ready
+            busy = self.state.busy
+            recording = self.state.recording
+            restarting = self.state.restarting
+        if engine is None or not ready or busy or recording or restarting:
+            self.state.notice_msg("Engine is busy - wait for the turn to finish", ttl=3)
+            return
+        abort = threading.Event()
+        self.abort_event = abort
+        self.turn_no += 1
+        self.state.turn_no = self.turn_no
+        with self.state.lock:
+            self.state.busy = True
+            self.state.abort_event = abort
+            self.state.scroll = 0
+            self.state.status = ""
+        self._auto_at = 0.0
+
+        def work() -> None:
+            try:
+                stats = one_turn(
+                    self.args,
+                    engine,
+                    self.console,
+                    self.model_name,
+                    self.workdir,
+                    self.turn_no,
+                    warm_event=self.warm_event,
+                    piper=self.piper,
+                    wav=wav,
+                    text=text,
+                    abort_event=abort,
+                )
+                try:
+                    eng_stats = engine.query_stats()
+                    if eng_stats:
+                        self.state.set_engine_stats(eng_stats)
+                except Exception as exc:  # noqa: BLE001
+                    self.console.log(f"[stats] engine /stats failed: {exc}")
+                self.events.put(("turn_done", stats))
+            except Exception as exc:  # noqa: BLE001
+                self.console.log(f"ERROR: {exc}")
+                self.events.put(("turn_error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _stop(self) -> None:
+        if self.rec_stop_event is not None:
+            self.rec_stop_event.set()
+            self.state.notice_msg("Stopping recording...", ttl=2)
+            return
+        if self.abort_event is not None:
+            self.abort_event.set()
+            self.state.notice_msg("Stopped audio; engine finishes the text", ttl=4)
+            return
+        self.state.notice_msg("Nothing to stop", ttl=2)
+
+    def _toggle_fast(self) -> None:
+        with self.state.lock:
+            if self.state.restarting:
+                return
+            if self.state.recording or self.state.busy:
+                self.state.notice_msg("Finish the current turn before switching mode", ttl=4)
+                return
+            if not self.state.ready:
+                self.state.notice_msg("Engine is still loading", ttl=3)
+                return
+            new_fast = not self.state.fast
+            self.state.fast = new_fast
+            self.state.restarting = True
+            self.state.ready = False
+            self.state.phase = "LOADING"
+            self.state.status = ""
+            self.fast = new_fast
+        mode = "FAST" if new_fast else "LOSSLESS"
+        self.console.log(f"[engine] switching to {mode}; restarting...")
+        self.restart_thread = threading.Thread(
+            target=self._restart_engine, args=(new_fast,), daemon=True
+        )
+        self.restart_thread.start()
+
+    def _restart_engine(self, fast: bool) -> None:
+        try:
+            old = self.holder.swap(None)
+            if old is not None:
+                old.stop()
+            if self.stop_flag.is_set():
+                return
+            apply_mode_env(fast)
+            engine = EngineSession(self.args, self.console)
+            self.holder.set(engine)
+            engine.start()
+            if self.stop_flag.is_set():
+                engine.stop()
+                return
+            self.events.put(("restart_ok", None))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("restart_error", str(exc)))
+
+    def _clear(self) -> None:
+        self.state.clear()
+        self.state.notice_msg("Transcript cleared", ttl=2)
+
+    def _quit(self) -> None:
+        self.running = False
+        self.stop_flag.set()
+        if self.rec_stop_event is not None:
+            self.rec_stop_event.set()
+        if self.abort_event is not None:
+            self.abort_event.set()
+
+    # ----- input -----------------------------------------------------
+
+    def _handle_key(self, key) -> None:
+        if self.help:
+            if key in ("?", "\x1b"):
+                self.help = False
+            elif key in ("q", "Q", "\x03"):
+                self._quit()
+            return
+        if isinstance(key, int):
+            if key == curses.KEY_MOUSE:
+                self._handle_mouse()
+            elif key in (curses.KEY_PPAGE, curses.KEY_UP):
+                self._scroll(self._page)
+            elif key in (curses.KEY_NPAGE, curses.KEY_DOWN):
+                self._scroll(-self._page)
+            elif key == curses.KEY_HOME:
+                self._scroll(10 ** 6)
+            elif key == curses.KEY_END:
+                self._scroll(-10 ** 6)
+            return
+        if key in ("\x03",):
+            self._quit()
+        elif key in ("q", "Q"):
+            self._quit()
+        elif key in ("\n", "\r", " "):
+            self._start_recording()
+        elif key in ("s", "S"):
+            self._stop()
+        elif key in ("f", "F"):
+            self._toggle_fast()
+        elif key in ("c", "C"):
+            self._clear()
+        elif key == "?":
+            self.help = True
+
+    def _handle_mouse(self) -> None:
+        try:
+            _, mx, my, _, bstate = curses.getmouse()
+        except curses.error:
+            return
+        if self.help:
+            self.help = False
+            return
+        mask = 0
+        for name in (
+            "BUTTON1_CLICKED", "BUTTON1_PRESSED", "BUTTON1_RELEASED",
+            "BUTTON1_DOUBLE_CLICKED",
+        ):
+            mask |= getattr(curses, name, 0)
+        if not (bstate & mask):
+            return
+        now = time.monotonic()
+        lx, ly, lt = self._last_click
+        if now - lt < 0.30 and (mx, my) == (lx, ly):
+            return
+        self._last_click = (mx, my, now)
+        for by, x0, x1, action in self._buttons:
+            if my == by and x0 <= mx <= x1:
+                if action == "record":
+                    self._start_recording()
+                elif action == "stop":
+                    self._stop()
+                elif action == "fast":
+                    self._toggle_fast()
+                elif action == "clear":
+                    self._clear()
+                elif action == "quit":
+                    self._quit()
+                return
+
+    def _scroll(self, delta: int) -> None:
+        with self.state.lock:
+            self.state.scroll = max(0, self.state.scroll + delta)
+
+    # ----- drawing ---------------------------------------------------
+
+    def _attr(self, pair: int = 0, bold: bool = False) -> int:
+        attr = curses.A_BOLD if bold else 0
+        if self.color and pair:
+            attr |= curses.color_pair(pair)
+        return attr
+
+    def _put(self, scr, y: int, x: int, text: str, attr: int = 0) -> None:
+        try:
+            h, w = scr.getmaxyx()
+        except curses.error:
+            return
+        if y < 0 or y >= h or x < 0 or x >= w or not text:
+            return
+        maxlen = w - x
+        if y == h - 1:
+            maxlen -= 1
+        if maxlen <= 0:
+            return
+        try:
+            scr.addstr(y, x, text[:maxlen], attr)
+        except curses.error:
+            pass
+
+    def _line(self, scr, y: int, text: str, attr: int = 0) -> None:
+        try:
+            _, w = scr.getmaxyx()
+        except curses.error:
+            return
+        self._put(scr, y, 0, text[:w].ljust(w), attr)
+
+    def _separator(self, scr, y: int, label: str, right: str = "") -> None:
+        try:
+            _, w = scr.getmaxyx()
+        except curses.error:
+            return
+        self._line(scr, y, "-" * w, curses.A_DIM)
+        self._put(scr, y, 0, f"[{label}]", self._attr(bold=True))
+        if right:
+            self._put(scr, y, max(0, w - len(right) - 1), right, curses.A_DIM)
+
+    def _update_sys(self) -> None:
+        now = time.monotonic()
+        if now - self._sys_at < 0.7:
+            return
+        self._sys_at = now
+        engine = self.holder.get()
+        pid = engine.proc.pid if engine is not None and engine.proc is not None else None
+        self._sys = {
+            "thermal": thermal_max_c(),
+            "self_mb": read_rss_mb(),
+            "engine_mb": proc_tree_rss_mb(pid),
+        }
+
+    def _engine_state(self, snap: dict) -> str:
+        if snap["phase"] == "ERROR":
+            return "ERROR"
+        if snap["busy"]:
+            return "BUSY"
+        if snap["restarting"] or not snap["ready"]:
+            return "LOADING"
+        return "READY"
+
+    def _metric_lines(self, snap: dict) -> list[str]:
+        m = snap["last_stats"] or {}
+        e = snap["engine_stats"] or {}
+        rec = snap["recording"]
+        mic = f"REC {snap['rec_elapsed']:.1f}s" if rec else "idle"
+        if m:
+            asr_s = float(m.get("asr_s") or 0.0)
+            audio_s = float(m.get("audio_s") or 0.0)
+            model = m.get("asr_model") or ""
+            if asr_s:
+                rate = audio_s / asr_s if asr_s else 0.0
+                asr = (
+                    f"ASR {model} {asr_s * 1000:.0f}ms {rate:.1f}x | "
+                    f"audio {audio_s:.2f}s"
+                )
+            else:
+                asr = f"ASR text | audio {audio_s:.2f}s"
+            first = m.get("first_token_turn_s")
+            if first is None:
+                first = m.get("first_token_s")
+            first_s = fmt_sec(first) if first else "n/a"
+            pf_t = int(m.get("prefill_tokens") or 0)
+            pf_s = float(m.get("prefill_s") or 0.0)
+            gen_t = int(m.get("gen_tokens") or 0)
+            tok_s = float(m.get("tok_s") or 0.0)
+            tts_chunks = int(m.get("tts_chunks") or 0)
+            tts_s = float(m.get("tts_s") or 0.0)
+            audio_out = float(m.get("audio_out_s") or 0.0)
+            play_s = float(m.get("play_s") or 0.0)
+            total = float(m.get("total_s") or 0.0)
+            engine_s = float(m.get("engine_s") or 0.0)
+            chars = int(m.get("chars") or 0)
+            gen = (
+                f"gen {gen_t}t {tok_s:.1f}t/s" if gen_t else "gen n/a"
+            )
+            line1 = f"MIC {mic} | {asr}"
+            line2 = (
+                f"GEN pf {pf_t}t/{fmt_sec(pf_s)} | 1st {first_s} | {gen}"
+            )
+            line3 = (
+                f"TTS {tts_chunks}ch/{fmt_sec(tts_s)} | audio {audio_out:.1f}s"
+                f" | play {play_s:.1f}s | chars {chars}"
+            )
+            total_part = (
+                f"TOTAL {fmt_sec(total)} | engine {fmt_sec(engine_s)}"
+            )
+        else:
+            line1 = f"MIC {mic} | ASR n/a | audio n/a"
+            line2 = "GEN pf n/a | 1st n/a | gen n/a"
+            line3 = "TTS n/a | audio n/a | play n/a"
+            total_part = "TOTAL n/a | engine n/a"
+        rss_self = self._sys.get("self_mb") or 0.0
+        rss_engine = (
+            float(e.get("rss_mb") or 0.0)
+            or float(self._sys.get("engine_mb") or 0.0)
+        )
+        thermal = self._sys.get("thermal")
+        thermal_s = f"{thermal:.1f}C" if thermal is not None else "n/a"
+        line4 = (
+            f"{total_part} | rss {fmt_mb(rss_self)}/{fmt_mb(rss_engine)}"
+            f" | therm {thermal_s} | turn {snap['turn_no']}"
+        )
+        hit = e.get("cache_hit")
+        miss = e.get("cache_miss")
+        if hit is not None and miss is not None:
+            try:
+                rate = float(e.get("cache_rate") or 0.0)
+                cache = f"{rate:.1f}% hit{int(hit)} miss{int(miss)}"
+            except (TypeError, ValueError):
+                cache = "n/a"
+        else:
+            cache = "n/a"
+        ctx = e.get("ctx_pos")
+        ctx_s = str(ctx) if ctx is not None else "n/a"
+        gen_total = e.get("total_tokens")
+        gen_s = str(gen_total) if gen_total is not None else "-"
+        line5 = f"CACHE {cache} | ctx {ctx_s} | session gen {gen_s}"
+        line6 = (
+            f"CFG stop {stop_label(self.args)} | max_new {self.args.max_new}"
+        )
+        return [line1, line2, line3, line4, line5, line6]
+
+    def _draw(self, scr) -> None:
+        snap = self.state.snapshot()
+        self._update_sys()
+        try:
+            h, w = scr.getmaxyx()
+        except curses.error:
+            return
+        if h < 8 or w < 24:
+            try:
+                scr.erase()
+                self._put(
+                    scr, 0, 0,
+                    f"terminal too small: {w}x{h} (need at least 24x8)",
+                    curses.A_BOLD,
+                )
+                scr.refresh()
+            except curses.error:
+                pass
+            return
+        try:
+            scr.erase()
+        except curses.error:
+            return
+        header_h = 3 if h >= 18 else 2
+        button_rows = self._build_button_rows(w)
+        b_h = len(button_rows)
+        if h >= 24:
+            desired_d = 9
+        elif h >= 20:
+            desired_d = 6
+        elif h >= 16:
+            desired_d = 4
+        else:
+            desired_d = 2
+        d_h = min(desired_d, max(1, h - header_h - b_h - 4 - 2))
+        t_h = h - header_h - b_h - d_h - 4
+        while t_h < 1 and d_h > 1:
+            d_h -= 1
+            t_h += 1
+        t_h = max(1, t_h)
+
+        engine = self.holder.get()
+        estate = self._engine_state(snap)
+        mode = "FAST" if snap["fast"] else "LOSSLESS"
+        load_s = snap["load_s"]
+        if not snap["ready"] and engine is not None and engine.started_at:
+            load_s = time.monotonic() - engine.started_at
+        prefix_s = fmt_sec(snap["prefix_s"]) if snap["prefix_tokens"] else "n/a"
+        workers = "6" if snap["fast"] else "4"
+        batch = os.environ.get("VOICE_PREFILL_BATCH", "16")
+        thermal = self._sys.get("thermal")
+        thermal_s = f"{thermal:.1f}C" if thermal is not None else "n/a"
+        e = snap["engine_stats"] or {}
+        rss_self = self._sys.get("self_mb") or 0.0
+        rss_engine = (
+            float(e.get("rss_mb") or 0.0)
+            or float(self._sys.get("engine_mb") or 0.0)
+        )
+        ctx = e.get("ctx_pos")
+        ctx_s = str(ctx) if ctx is not None else "n/a"
+        mic = (
+            f"REC {snap['rec_elapsed']:.1f}s"
+            if snap["recording"] else "idle"
+        )
+
+        line0 = (
+            f"TOKSHIT VOICE | {estate} | {mode} | turn {snap['turn_no']}"
+            f" | max_new {self.args.max_new}"
+        )
+        self._line(scr, 0, line0, curses.A_REVERSE | curses.A_BOLD)
+        line1 = (
+            f"load {fmt_sec(load_s)} | prefix {snap['prefix_tokens']}t/{prefix_s}"
+            f" | workers {workers} | batch {batch} | therm {thermal_s}"
+        )
+        self._line(scr, 1, line1, self._attr(bold=True))
+        if header_h >= 3:
+            line2 = (
+                f"rss {fmt_mb(rss_self)}/{fmt_mb(rss_engine)} | ctx {ctx_s}"
+                f" | mic {mic} | turn {snap['turn_no']}"
+            )
+            self._line(scr, 2, line2, self._attr(bold=True))
+
+        scroll = snap["scroll"]
+        right = f"scroll {scroll} " if scroll else ""
+        self._separator(scr, header_h, "TRANSCRIPT", right)
+        top = header_h + 1
+        self._draw_transcript(scr, top, t_h, w, snap)
+
+        det_head = top + t_h
+        self._separator(scr, det_head, "DETAILS")
+        det_top = det_head + 1
+        self._draw_details(scr, det_top, d_h, w, snap)
+
+        status_y = det_top + d_h
+        self._draw_status(scr, status_y, w, snap)
+
+        btn_y = status_y + 1
+        self._draw_buttons(scr, btn_y, w, snap, button_rows)
+
+        hint_y = btn_y + b_h
+        hints = (
+            "Enter/Space record | s stop | f fast | c clear | q quit"
+            " | ? help | PgUp/PgDn scroll"
+        )
+        self._line(scr, hint_y, hints, curses.A_DIM)
+        if self.help:
+            self._draw_help(scr)
+        try:
+            scr.refresh()
+        except curses.error:
+            pass
+
+    def _draw_transcript(self, scr, top: int, height: int, w: int,
+                         snap: dict) -> None:
+        try:
+            for yy in range(top, top + height):
+                self._put(scr, yy, 0, " " * w)
+        except curses.error:
+            pass
+        lines: list[tuple[str, str, str]] = []
+        for role, text, _done in snap["messages"][-80:]:
+            label = "You: " if role == "user" else "Tokshit: "
+            body = sanitize_ui_text(str(text)) if text else ""
+            first = True
+            for raw in (body.split("\n") if body else [""]):
+                chunks = wrap_ui_line(raw, max(1, w - len(label)))
+                for chunk in chunks:
+                    if first:
+                        lines.append((role, label, chunk))
+                        first = False
+                    else:
+                        lines.append((role, " " * len(label), chunk))
+            lines.append(("", "", ""))
+        if not lines:
+            self._put(
+                scr, top, 1,
+                "Press Enter/Space or tap RECORD to speak.",
+                self._attr(bold=True),
+            )
+            return
+        max_scroll = max(0, len(lines) - height)
+        scroll = min(snap["scroll"], max_scroll)
+        if scroll != snap["scroll"]:
+            self.state.set_scroll(scroll)
+        end = len(lines) - scroll
+        start = max(0, end - height)
+        visible = lines[start:end]
+        self._page = max(3, height - 2)
+        for i, (role, label, content) in enumerate(visible[:height]):
+            y = top + i
+            if role == "user":
+                attr = self._attr(1, bold=True)
+            elif role == "assistant":
+                attr = self._attr(2, bold=True)
+            else:
+                attr = 0
+            self._put(scr, y, 0, label, attr)
+            self._put(scr, y, len(label), content, 0)
+
+    def _draw_details(self, scr, top: int, height: int, w: int,
+                      snap: dict) -> None:
+        metrics = self._metric_lines(snap)
+        logs = [
+            sanitize_ui_text(x) for x in snap["logs"][-3:]
+        ]
+        if height >= 6:
+            n_logs = min(3, len(logs))
+            budget = max(0, height - n_logs)
+            if budget >= len(metrics):
+                out = metrics[:]
+            else:
+                order = [0, 1, 5, 2, 3, 4]
+                out = [metrics[i] for i in order[:budget]]
+            out.extend(f"LOG {line}" for line in logs[-n_logs:])
+        else:
+            order = [1, 5, 0, 2, 3, 4]
+            out = [metrics[i] for i in order[:height]]
+        for i in range(height):
+            y = top + i
+            text = out[i] if i < len(out) else ""
+            self._put(scr, y, 0, text[: max(0, w - 1)])
+
+    def _draw_status(self, scr, y: int, w: int, snap: dict) -> None:
+        if snap["notice"]:
+            text = snap["notice"]
+            attr = self._attr(3, bold=True)
+        elif snap["recording"]:
+            text = (
+                f"SPEAK NOW  {snap['rec_elapsed']:.1f}s  |  "
+                f"auto-stop {self.args.max_seconds:.0f}s  |  STOP / s"
+            )
+            attr = curses.A_REVERSE | self._attr(3, bold=True)
+        elif snap["busy"]:
+            text = "BUSY: streaming answer and speech..."
+            attr = self._attr(3, bold=True)
+        elif snap["restarting"]:
+            text = "Restarting engine..."
+            attr = self._attr(3, bold=True)
+        elif snap["status"]:
+            text = snap["status"]
+            attr = self._attr(bold=True)
+        elif not snap["ready"]:
+            text = f"Loading engine... {fmt_sec(snap['load_s'])}"
+            attr = self._attr(3, bold=True)
+        else:
+            text = "READY - press Enter/Space or tap RECORD"
+            attr = self._attr(2, bold=True)
+        self._put(scr, y, 0, text[: max(0, w - 1)], attr)
+
+    def _build_button_rows(self, w: int) -> list[list[tuple[str, str, int]]]:
+        rows: list[list[tuple[str, str, int]]] = []
+        row: list[tuple[str, str, int]] = []
+        used = 0
+        for action, label in self.BUTTONS:
+            need = len(label) + (1 if row else 0)
+            if row and used + need > w:
+                rows.append(row)
+                row = []
+                used = 0
+                need = len(label)
+            x = used + (1 if row else 0)
+            row.append((action, label, x))
+            used = x + len(label)
+        if row:
+            rows.append(row)
+        return rows
+
+    def _draw_buttons(self, scr, top: int, w: int, snap: dict,
+                      rows: list[list[tuple[str, str, int]]]) -> None:
+        self._buttons = []
+        for ri, row in enumerate(rows):
+            y = top + ri
+            self._put(scr, y, 0, " " * w)
+            for action, label, x in row:
+                enabled = True
+                if action == "record":
+                    enabled = (
+                        snap["ready"] and not snap["busy"]
+                        and not snap["recording"] and not snap["restarting"]
+                    )
+                elif action == "stop":
+                    enabled = snap["recording"] or snap["busy"]
+                elif action == "fast":
+                    enabled = (
+                        snap["ready"] and not snap["busy"]
+                        and not snap["recording"] and not snap["restarting"]
+                    )
+                attr = curses.A_REVERSE
+                if enabled:
+                    attr |= curses.A_BOLD
+                else:
+                    attr |= curses.A_DIM
+                self._put(scr, y, x, label, attr)
+                self._buttons.append((y, x, x + len(label) - 1, action))
+
+    def _draw_help(self, scr) -> None:
+        try:
+            h, w = scr.getmaxyx()
+        except curses.error:
+            return
+        body = self.HELP_LINES
+        box_w = min(max(len(x) for x in body) + 4, w - 2)
+        box_h = min(len(body) + 2, h - 2)
+        if box_w < 20 or box_h < 5:
+            return
+        y0 = max(0, (h - box_h) // 2)
+        x0 = max(0, (w - box_w) // 2)
+        for yy in range(y0, y0 + box_h):
+            self._put(scr, yy, x0, " " * box_w)
+        self._put(scr, y0, x0, "+" + "-" * (box_w - 2) + "+", curses.A_BOLD)
+        self._put(
+            scr, y0 + box_h - 1, x0,
+            "+" + "-" * (box_w - 2) + "+", curses.A_BOLD,
+        )
+        for i, line in enumerate(body[: box_h - 2]):
+            self._put(scr, y0 + 1 + i, x0, "|", curses.A_BOLD)
+            self._put(scr, y0 + 1 + i, x0 + 2, line[: box_w - 4])
+            self._put(scr, y0 + 1 + i, x0 + box_w - 1, "|", curses.A_BOLD)
+        self._put(scr, y0, x0 + 2, " HELP ", curses.A_REVERSE | curses.A_BOLD)
+
+
 # ────────────────────────────── main ──────────────────────────────
 
 def main() -> int:
@@ -1810,20 +3374,34 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="check dependencies and exit")
     ap.add_argument("--clean-text", metavar="TEXT",
                     help="print the TTS-cleaned version of TEXT and exit")
+    tui_group = ap.add_mutually_exclusive_group()
+    tui_group.add_argument("--tui", action="store_true",
+                           help="force the curses TUI (requires a TTY)")
+    tui_group.add_argument("--no-tui", action="store_true",
+                           help="force line mode")
+    ap.add_argument("--fast", action="store_true",
+                    help="FAST mode: top-4 draft experts, 6 workers (lossy)")
+    ap.add_argument("--one-sentence", action="store_true",
+                    help="stop the answer after one sentence (TOKSHIT_STOP_SENTENCE=1)")
     args = ap.parse_args()
 
     if args.clean_text is not None:
         print(clean_for_speech(args.clean_text))
         return 0
     if any(not t.strip() for t in args.text):
-        print("✗ --text is empty", file=sys.stderr)
+        print("ERROR: --text is empty", file=sys.stderr)
         return 2
     if args.max_new < 1:
-        print("✗ --max-new must be >= 1", file=sys.stderr)
+        print("ERROR: --max-new must be >= 1", file=sys.stderr)
         return 2
     if args.hands_free and args.seconds <= 0:
-        print("✗ --hands-free requires --seconds N", file=sys.stderr)
+        print("ERROR: --hands-free requires --seconds N", file=sys.stderr)
         return 2
+
+    args.fast = bool(args.fast or env_truthy("VOICE_FAST"))
+    args.one_sentence = bool(
+        args.one_sentence or env_truthy("VOICE_ONE_SENTENCE")
+    )
 
     deps = check_assets(args)
     if args.check:
@@ -1831,11 +3409,18 @@ def main() -> int:
         return 2 if deps["problems"] else 0
     if deps["problems"]:
         for p in deps["problems"]:
-            print(f"✗ {p}", file=sys.stderr)
-        print("подсказка: scripts/voice_chat.py --check", file=sys.stderr)
+            print(f"ERROR: {p}", file=sys.stderr)
+        print("hint: scripts/voice_chat.py --check", file=sys.stderr)
         return 2
 
-    console = Console(verbose=args.verbose)
+    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+    use_tui = is_tty and not args.no_tui
+    if use_tui and not args.tui and (args.text or args.wav is not None):
+        use_tui = False
+    if args.tui and not is_tty:
+        print("TUI needs stdin+stdout on a TTY; using line mode", file=sys.stderr)
+        use_tui = False
+
     model_name, _ = pick_asr_model(args.asr_model)
     workdir = Path(tempfile.mkdtemp(prefix="voice-chat-"))
     cleaned = False
@@ -1852,10 +3437,31 @@ def main() -> int:
         else:
             print(f"files kept in {workdir}", file=sys.stderr)
 
+    if use_tui:
+        if args.wav is not None and not Path(args.wav).is_file():
+            print(f"ERROR: no such wav: {args.wav}", file=sys.stderr)
+            cleanup()
+            return 2
+        state = UiState()
+        tui_console = TuiConsole(state, verbose=args.verbose)
+        app = TuiApp(args, model_name, workdir, tui_console, state)
+        try:
+            app.run()
+        except KeyboardInterrupt:
+            return 130
+        except VoiceError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            cleanup()
+        return 0
+
+    console = Console(verbose=args.verbose)
     engine: EngineSession | None = None
     turns: list[TurnStats] = []
     try:
         quality_guard(args, console)
+        apply_mode_env(args.fast)
         tts_mode = os.environ.get("VOICE_TTS", "inproc").lower()
         piper: PiperTTS | None = None
         warm_event = threading.Event()
@@ -1881,13 +3487,13 @@ def main() -> int:
             wav = Path(args.wav)
             if not wav.is_file():
                 raise VoiceError(f"no such wav: {wav}")
-            console.log(f"[wav] {wav.name} · {wav_duration(wav):.2f} s")
+            console.log(f"[wav] {wav.name} | {wav_duration(wav):.2f}s")
             turns.append(one_turn(
                 args, engine, console, model_name, workdir, 1,
                 warm_event=warm_event, piper=piper, wav=wav
             ))
         else:
-            console.log("голосовой чат tokshit · q/Ctrl-C — выход")
+            console.log("voice chat tokshit | Enter to record | q quits")
             empty_streak = 0
             turn_no = 0
             while True:
@@ -1897,7 +3503,7 @@ def main() -> int:
                     time.sleep(0.4)
                 elif sys.stdin.isatty():
                     try:
-                        line = input("\n🎤 Enter — записать, q — выход: ").strip()
+                        line = input("\n[mic] Enter to record, q to quit: ").strip()
                     except EOFError:
                         break
                     if line.lower() in ("q", "quit", "exit", "/q", "/exit"):
@@ -1938,7 +3544,7 @@ def main() -> int:
         console.log("[stop] Ctrl-C")
         return 130
     except VoiceError as exc:
-        console.log(f"✗ {exc}")
+        console.log(f"ERROR: {exc}")
         return 1
     finally:
         if engine is not None:

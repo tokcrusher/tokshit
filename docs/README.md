@@ -12,6 +12,11 @@ dot-product и стримит экспертов с флеша через пос
 1. [README.ru.md](../README.ru.md) — установка, первый запуск, статус.
 2. [CLI.md](CLI.md) — флаги, пресеты, TUI, `safe_run.sh`.
 
+## Голос
+
+- [VOICE_CHAT.md](VOICE_CHAT.md) — `scripts/chat`: TUI, микрофон,
+  streaming TTS, lossless и fast tier.
+
 ## Архитектура
 
 3. [ARCHITECTURE.ru.md](ARCHITECTURE.ru.md) — модули, загрузка, инварианты.

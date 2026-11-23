@@ -72,17 +72,30 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   prompts. Logits are not bit-exact (max|dlogit|≈0.36 at tap 22), so keep
   the token-identity check when changing kernels. Prefill is compute-bound
   at the same 3.06 Gweight/token; batching does not reduce MACs.
-- **Voice** (`scripts/voice_chat.py`): one persistent `build/tokshit` chat
-  process per session (no 9–11 s reload per turn), `TOKSHIT_CHAT_PROTOCOL=1`
-  (stdout turn framing with `0x1e`), streaming token output, sentence-level
-  streaming TTS. Verified raw few-shot recipe:
-  `TOKSHIT_RAW_PROMPT=1 TOKSHIT_CHAT_UNESCAPE=1 TOKSHIT_STOP_AT=Q:`
-  with first turn `Q: Capital of Germany?\nA: Berlin.\nQ: <user>\nA:` and later
-  turns `\nQ: <user>\nA:`; answers are ~8–10 tokens and direct, no visible
-  reasoning preamble. `TOKSHIT_STOP_AT2` adds a second stop marker.
-  `TOKSHIT_CHAT_PREFIX` prefills the few-shot at engine startup (12 tok in
-  3.3 s, overlapped with mic/ASR), so the first turn only prefills the
-  question (13 tok / 2.7 s in the test; answers `Paris.` / `Rome.`).
+- **Voice** (`scripts/chat`, curses TUI over `scripts/voice_chat.py`):
+  one persistent `build/tokshit` chat process per session (no 9–11 s reload
+  per turn), `TOKSHIT_CHAT_PROTOCOL=1` (stdout turn framing with `0x1e`),
+  streaming token output into the transcript, clause/sentence-level
+  streaming TTS. `scripts/chat` adds `--tui` and is the only entry point
+  users need; `--text`, `--wav`, `--check`, `--no-play`, `--seconds`,
+  `--verbose`, `--one-sentence` and `--fast` pass through to the backend.
+  TUI: header (engine/mode/thermal), transcript, details (mic/ASR/prefill/
+  first token/decode/TTS/audio/total/RSS/expert hit-miss), buttons
+  `[ RECORD ]`, `[ STOP ]`, `[ FAST ]`, `[ CLEAR ]`, `[ QUIT ]`, keys
+  Enter/Space, `s`, `f`, `c`, `q`, PgUp/PgDn. Docs: `docs/VOICE_CHAT.md`.
+  Verified raw few-shot recipe:
+  `TOKSHIT_RAW_PROMPT=1 TOKSHIT_CHAT_UNESCAPE=1 TOKSHIT_STOP_AT=Q:`;
+  later turns are `\nQ: <user>\nA:`, with no visible reasoning preamble.
+  The current default prefix is the Paris two-sentence example; answers run
+  to EOG or `--max-new` and are streamed to TTS as clauses and sentences
+  complete.
+  `TOKSHIT_STOP_AT` is `Q:` only; `TOKSHIT_STOP_AT2` is unset by default
+  (a newline stop cut live answers to 3–5 tokens, never set it).
+  `--one-sentence` / `VOICE_ONE_SENTENCE=1` is the opt-in for
+  `TOKSHIT_STOP_SENTENCE=1`.
+  `TOKSHIT_CHAT_PREFIX` prefills the few-shot at engine startup, overlapped
+  with mic/ASR, so the first turn only prefills the question (13 tok / 2.7 s
+  in the test).
   Keep `TOKSHIT_POOL_WORKERS=4` for chat decode (A/B: W=4 4.1–4.2,
   W=5 3.8–3.9, W=6 3.8–3.9); prefill can use 6 workers but decode is the
   long pole.
@@ -90,22 +103,26 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   | mode | tok/s | quality |
   |---|---:|---|
   | lossless top-8 / 3 passes | **5.5** | reference |
-  | top-4 / **3 passes** (`run_inkling2_fast.sh`, `VOICE_FAST=1`) | 6.2–6.7 | readable; LOSSY 4/8 experts |
+  | top-4 / **3 passes** (`scripts/chat --fast`, `VOICE_FAST=1`) | 6.2–6.7 | readable; LOSSY 4/8 experts |
   | top-8 or top-4 / **2 passes** | 6.4–9.2 | loops on many prompts |
   | top-2 / 2 passes + Q4 dense | 13.3 | garbage |
   The 2-pass modes are the quality cliff, not the expert count. Never
   default them for voice/code. Lossless voice uses top-8/3 passes; the
-  coherent fast voice tier is top-4/3 passes via `VOICE_FAST=1`.
+  coherent fast voice tier is top-4/3 passes via `scripts/chat --fast`
+  (`VOICE_FAST=1`).
 - **Voice latency** (persistent, prefix warmup, base ASR, streaming TTS):
   first token after the question **2.7 s**, first TTS ~3.2 s; second turn
   **1.9 s** to first token / **2.45 s** to audio. Engine load 4.4 s + prefix
   3.4 s happen at script start / while the user speaks.
-- Audio: `~/audio` has whisper.cpp ASR + Piper TTS; `scripts/voice_chat.py`
-  and `voice_chat.md` are the bridge. The Termux:API APK is downloaded to
+- Audio: `~/audio` has whisper.cpp ASR + Piper TTS; `scripts/chat` (TUI
+  wrapper around `scripts/voice_chat.py`) and `docs/VOICE_CHAT.md` are the
+  entry point and docs. The Termux:API APK is downloaded to
   `~/storage/downloads/termux-api-0.53.0.apk` (checksum verified) and the
   installer was opened; the user must tap Install and grant Microphone.
   `termux-api` CLI package is installed; the APK was missing, which is why
-  `termux-microphone-record` hung.
+  `termux-microphone-record` hung. Mic check:
+  `termux-microphone-record -f "$TMPDIR/mic-test.m4a" -l 5`, then wait for
+  the recorder to finalize the file before ASR.
 
 ## Goal
 
@@ -132,7 +149,8 @@ Remaining non-lossy levers, in order:
 3. LTO / inlining of `dot_row` in the pool tasks.
 4. Previous-token/next-layer expert prefetch was neutral; do not spend more.
 5. Keep the lossy 10 tok/s profile clearly marked; never call it lossless.
-6. Audio: `~/audio` + `scripts/voice_chat.*`; do not use llama.cpp.
+6. Audio: `~/audio` + `scripts/chat` (docs: `docs/VOICE_CHAT.md`); do not
+   use llama.cpp.
 7. Hundreds of prefill tok/s is also compute-bound (same 3.06 Gweight/token);
    batching is exact in ids but does not reduce MACs. Measured prefill is
    3.2 → 4.5–5.0 tok/s after the MoE B× fix. Even the fastest existing
