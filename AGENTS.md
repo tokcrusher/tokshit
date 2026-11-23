@@ -68,8 +68,9 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
 
 ## Goal
 
-10 tok/s has been reached with the **LOSSY** profile. Do not stop here if the
-user wants a lossless 10: remaining non-lossy levers, in order:
+The current lossy 10.5 profile is NOT the goal. The order is **15 tok/s
+lossless**: keep top-8 experts, 3 passes, Q2_K_XL weights and greedy output.
+Remaining non-lossy levers, in order:
 
 1. Fix/benchmark 4-row IQ2_XXS; optimize IQ1_S/Q2_0/NVFP4 table kernels.
 2. i8mm for dense Q6K/Q4K/Q8_0 (measure cold; `TOKSHIT_I8MM=1` was slower in
@@ -78,6 +79,7 @@ user wants a lossless 10: remaining non-lossy levers, in order:
 4. Previous-token/next-layer expert prefetch (`TOKSHIT_INK_PREFETCH_PREV`)
    was inconclusive; re-test with the new A720 pinning.
 5. Keep the lossy 10 tok/s profile clearly marked; never call it lossless.
+6. Audio: `~/audio` + `scripts/voice_chat.*`; do not use llama.cpp as the engine.
 
 ## Rules
 
