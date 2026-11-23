@@ -77,8 +77,8 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   per turn), `TOKSHIT_CHAT_PROTOCOL=1` (stdout turn framing with `0x1e`),
   streamed tokens, clause/sentence-level streaming TTS. There is no startup
   prefix: `VOICE_FEWSHOT` defaults empty and `TOKSHIT_CHAT_PREFIX` is not
-  set. Startup is load-only, ready ~7–10 s (was 20–30 s with the removed
-  prefix); the TUI accepts recording during `WARMING` and queues the turn.
+  set. Startup is load-only, ready ~7–10 s; the TUI accepts recording
+  during `WARMING` and queues the turn.
   `scripts/chat` adds `--tui`; `--text`, `--wav`, `--check`, `--no-play`,
   `--seconds`, `--verbose`, `--fast`, `--ru`, `--lang` and `--one-sentence`
   pass through.
@@ -117,7 +117,7 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   The first turn is load-bound; recording during `WARMING` queues it. These
   numbers are thermal-sensitive: compare at a similar phone temperature,
   use the TUI `therm` field, and do not treat single runs as A/B medians.
-  All old prefix-based latency rows are obsolete.
+  All older warmup-based latency rows are obsolete.
 - Audio: `~/audio` has whisper.cpp ASR + Piper TTS; `scripts/chat` (TUI
   wrapper around `scripts/voice_chat.py`) and `docs/VOICE_CHAT.md` are the
   entry point and docs. Russian mode uses whisper base with `ASR_LANG=ru`
