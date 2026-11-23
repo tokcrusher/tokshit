@@ -1,11 +1,15 @@
-# Voice chat with tokshit (TUI)
+# Voice chat with tokshit (TUI, EN/RU)
 
-`mic -> whisper.cpp -> tokshit persistent chat -> Piper TTS -> speaker`
+`mic -> whisper.cpp ASR -> tokshit persistent chat -> Piper TTS -> speaker`
 
 One user-facing command: `scripts/chat`. It opens the curses TUI and keeps
 one engine process for the whole session, so the model and KV cache survive
 between turns. Tokens appear as they are generated. TTS starts at the first
 completed clause or sentence, not after the whole answer.
+
+There is no startup prefix. The engine loads the model and is ready; the
+first turn is load-bound only. `VOICE_FEWSHOT` defaults to empty and exists
+only as a power-user override.
 
 ```
 scripts/chat                 # TUI, mic, persistent engine
@@ -28,19 +32,24 @@ All arguments after the script name reach the backend unchanged.
 cd ~/tokshit
 
 scripts/chat --check          # dependencies, engine, models, player; no TUI
-scripts/chat                  # interactive TUI
+scripts/chat                  # interactive TUI, English
+scripts/chat --ru             # Russian ASR + Russian TTS + RU fast experts
+scripts/chat --lang ru        # same language switch
 scripts/chat --fast           # fast voice tier; see the LOSSY warning below
+scripts/chat --ru --fast      # Russian fast tier: top-6 experts
 scripts/chat --one-sentence   # opt-in: stop after the first sentence
 scripts/chat --seconds 5      # record exactly 5 s, then process the turn
 scripts/chat --hands-free --seconds 5
 
 # no microphone: WAV -> ASR -> engine -> TTS -> play
 scripts/chat --wav "$TMPDIR/question.wav"
+scripts/chat --ru --wav "$TMPDIR/question.wav"
 
-# no ASR: text turn in the same persistent session
+# no ASR: text turns in the same persistent session
 scripts/chat --text "What is the capital of France?"
-scripts/chat --text "What is the capital of France?" \
-             --text "And Italy?" --verbose
+scripts/chat --ru --text "Привет, как дела?"
+scripts/chat --ru --text "Привет, как дела?" \
+             --text "Расскажи о Париже" --verbose
 
 # synthesize without playback
 scripts/chat --text "Hello" --no-play
@@ -51,28 +60,30 @@ scripts/chat --no-guard --text "Hello"
 
 The backend accepts `--max-new`, `--max-seconds`, `--hands-free`,
 `--one-sentence`, `--once`, `--keep`, `--asr-model`, `--engine`,
-`--chat-template`, `--clean-text`, and the environment variables listed
-below. Only the flags above are part of the normal TUI workflow.
+`--chat-template`, `--clean-text`, `--ru`, `--lang en|ru`, `--fast`,
+`--tui`/`--no-tui`, and the environment variables listed below.
 
 ## TUI
 
-The screen has four regions: a header with engine, mode and thermal state;
-the transcript; a details panel with per-turn timings and memory; and a
-button row with key hints.
+The screen has a header (phase, mode, language, load, workers, thermal,
+RSS/context/mic), the transcript, a details panel with per-turn timings and
+memory, and a button row with key hints.
 
 ```
 +----------------------------------------------------------------------+
-| tokshit voice chat   engine: build/tokshit   mode: lossless   38 C   |
+| TOKSHIT VOICE | READY | FAST | turn 2 | max_new 64                  |
+| lang ru | load 7.8s | workers 6 | batch 16 | therm 39.4C            |
+| rss 310/7100 MB | ctx 42 | mic idle | turn 2                        |
 +----------------------------------------------------------------------+
-| YOU  What is the capital of France?                                  |
-| INK  Paris is the capital of France. It has the Eiffel Tower.        |
-| YOU  And Italy?                                                      |
-| INK  Rome is the capital of Italy. It has the Colosseum.             |
+| YOU  Привет, как дела?                                               |
+| INK  Привет! Хорошо, спасибо. А у тебя?                               |
+| YOU  Расскажи о Париже                                               |
+| INK  В Париже много музеев и театров.                                |
 |                                                                      |
 +----------------------------------------------------------------------+
-| mic 1.6 s | ASR 2.9 s | prefill 13 tok / 2.8 s | first token 2.7 s   |
-| decode 6.8 tok/s | TTS 1.1 s | audio 3.2 s | total 5.8 s             |
-| RSS 7.1 GB | experts hit 87% / miss 13%                              |
+| mic 1.6 s | ASR 2.9 s | first token 2.7 s | decode 6.2 tok/s         |
+| TTS 1.1 s | audio 3.2 s | total 5.4 s | RSS 7.1 GB                   |
+| experts hit 87% / miss 13%                                           |
 +----------------------------------------------------------------------+
 | [ RECORD ] [ STOP ] [ FAST ] [ CLEAR ] [ QUIT ]                      |
 | Enter/Space record  s stop  f fast  c clear  q quit  PgUp/PgDn scroll|
@@ -81,15 +92,16 @@ button row with key hints.
 
 Header fields:
 
-- `engine`: the backend binary in use.
-- `mode`: `lossless` (default) or `fast` (LOSSY, 4 of 8 experts).
-- `thermal`: phone temperature when the backend can read it.
+- phase: `WARMING`, `READY`, `RECORDING`, `THINKING` or `ERROR`.
+- mode: `LOSSLESS` or `FAST`.
+- language: `en` or `ru`.
+- load, workers, batch, thermal: startup and phone state.
+- RSS/context/mic: process memory, KV position and microphone state.
 
-Details panel fields, per turn:
+Details panel, per turn:
 
 - `mic`: seconds recorded.
 - `ASR`: whisper wall time.
-- `prefill`: question tokens and seconds.
 - `first token`: seconds from the question to the first generated token.
 - `decode`: generated tokens per second.
 - `TTS`: synthesis wall time.
@@ -105,14 +117,48 @@ Buttons and keys:
 | `Enter`, `Space` | start recording |
 | `s` | stop the active stage (recording, generation or playback) |
 | `f` | toggle fast mode |
-| `c` | clear the transcript |
+| `c` | send `/clear`: clear engine KV and transcript, reset the turn |
 | `q` | quit |
 | `PgUp`, `PgDn` | scroll the transcript |
 
-The transcript keeps the user question and the full answer. The answer is
-appended token by token as it arrives, so streaming text grows in place.
+The transcript keeps the original user text and the full answer. The answer
+is appended token by token as it arrives.
 
-## Streaming
+## Language: English and Russian
+
+The default language is English. Three equivalent switches select Russian:
+
+```bash
+scripts/chat --ru
+scripts/chat --lang ru
+VOICE_LANG=ru scripts/chat
+```
+
+| setting | English default | Russian mode |
+|---|---|---|
+| `ASR_LANG` | `en` | `ru` |
+| `TTS_VOICE` | `en_US-lessac-medium` | `ru_RU-irina-medium` |
+| fast experts | top-4 | top-6 |
+| language directive | `Answer in English.` | `Отвечай по-русски.` |
+
+`ru_RU-irina-medium` is installed: 63 MB, 22 kHz. If the model is missing,
+the backend warns and keeps the current English voice.
+
+The language is anchored inside each user turn, not in a startup prefix.
+The engine payload is:
+
+```
+English: \nQ: Answer in English. <user text>\nA:
+Russian: \nQ: Отвечай по-русски. <user text>\nA:
+```
+
+The leading `\n` is used on every turn, including the first. The directive
+stays inside the engine payload; the transcript shows the original ASR or
+typed text without it. If the text has no terminal punctuation, the backend
+adds a period in the payload only. The per-turn directive fixes English
+drifting to French and stabilizes Russian.
+
+## Streaming and TTS
 
 The engine runs with `TOKSHIT_CHAT_PROTOCOL=1`: each turn is framed on
 stdout with `0x1e`, and tokens are forwarded to the TUI as they are decoded.
@@ -120,10 +166,11 @@ The transcript therefore grows during generation.
 
 By default the engine generates until EOG or `--max-new`; it does not stop
 at a newline. `--one-sentence` (`VOICE_ONE_SENTENCE=1`) is the opt-in that
-sets `TOKSHIT_STOP_SENTENCE=1` and stops after the first sentence. In both
-cases the visible answer is fed to TTS as clauses and sentences complete.
+sets `TOKSHIT_STOP_SENTENCE=1` and stops after the first sentence.
+`TOKSHIT_STOP_SENTENCE` is unset by default. Default stops are `Q:`, `\nQ`
+and `\nA`; they cut next-turn echo, not ordinary words.
 
-The same token stream feeds the TTS splitter:
+The token stream feeds the TTS splitter:
 
 ```
 engine stdout -> SentenceStreamer -> clause/sentence queue
@@ -142,96 +189,82 @@ engine stdout -> SentenceStreamer -> clause/sentence queue
   capped at 84 characters.
 - TTS starts at the first completed clause or sentence while the engine is
   still decoding. A short sentence takes 0.10-0.35 s with in-process Piper.
-  `VOICE_TTS=script` falls back to `~/audio/tts.sh` with a new process per
-  chunk (1.8-2.7 s under load).
+  Russian chunks use `ru_RU-irina-medium` at 22 kHz. `VOICE_TTS=script`
+  falls back to `~/audio/tts.sh` with a new process per chunk.
 - A single `ffplay -f s16le -ar 22050 -ch_layout mono pipe:0` starts on the
   first chunk and receives the PCM of later chunks. There is no second
   player and no overlapping voice.
 - `--no-play` still synthesizes and logs chunk texts, which is useful for
   checking the split.
 
+### TTS duplicate guard
+
+The guard normalizes each sentence (case, punctuation and zero-width
+characters are ignored) and compares it with the previous spoken sentence.
+
+- an identical consecutive sentence is dropped;
+- after two duplicate sentences in a row, TTS stops for the rest of the
+  turn;
+- the transcript keeps the full generated text; only audio is cut;
+- generation is not stopped, so `--max-new` and EOG still apply.
+
+This is separate from `--one-sentence`, which changes generation.
+
 ## Fast mode
 
 `scripts/chat --fast` (or `VOICE_FAST=1`) selects the faster voice tier:
-top-4 of the 8 experts selected per token, 3 loop passes, original dense
-weights (unchanged), 6 workers. The model has 128 experts and normally uses
-top-8.
+3 loop passes, original dense weights, 6 workers. Expert count depends on
+language. Both variants are LOSSY.
 
 | mode | experts/token | passes | dense weights | measured decode | quality |
 |---|---|---:|---|---:|---|
 | default | top-8 | 3 | original | ~5.5 tok/s | reference, lossless |
-| `--fast` | top-4 | 3 | original | 6.2-6.7 tok/s | readable; **LOSSY** (4 of 8) |
+| EN `--fast` | top-4 | 3 | original | 6.2-6.7 tok/s | readable; **LOSSY** (4 of 8) |
+| RU `--fast` | top-6 | 3 | original | not separately benched | readable; **LOSSY** (6 of 8); top-4 loops on turn 2 |
 | forbidden | top-2 | 2 | Q4 | 13.3 tok/s | loops: "Capital capital capital..." |
 
-Fast mode is not lossless. Dropping 4 of 8 experts changes the model output;
-it stays readable for voice, but do not use it for code, benchmarks or
-quality comparisons. The dense path remains the original weights, but that
-does not make the mode lossless.
+Fast mode is not lossless. The dense path stays original, but expert
+pruning changes model output. Do not use fast mode for code, benchmarks or
+quality comparisons. Russian fast uses top-6 because top-4 looped on the
+second Russian turn. `VOICE_TOPK` is an explicit override; leave it unset
+to get top-4 for English and top-6 for Russian.
 
 The quality cliff is the 2-pass loop, not only the expert count:
 
-- top-8 or top-4 with 3 passes: coherent, 5.5-6.7 tok/s.
-- top-8 or top-4 with 2 passes: 6.4-9.2 tok/s, loops on many prompts.
+- top-8 or top-4/top-6 with 3 passes: coherent.
+- top-8 or top-4/top-6 with 2 passes: 6.4-9.2 tok/s, loops on many prompts.
 - top-2 with 2 passes: garbage.
 
 top-2/2-pass configurations are forbidden for voice and for code.
 
 ## Measurements
 
-Conditions: Termux on the 16 GB LPDDR5X phone, warm page cache,
-`Inkling-2-Mini-UD-Q2_K_XL.gguf`, current build (batched prefill B=16 plus
-`TOKSHIT_CHAT_PREFIX`), persistent chat, `W=4`, `--max-new 64`, Piper
-`en_US-lessac-medium` in-process, `ffplay`, whisper `base`. The table is a
-historical run with the older short prefix `Q: 2 + 2?\nA: 4.`; the current
-default prefix is the Paris two-sentence example, so its prefix is longer.
-Per-turn decode and TTS timings remain representative.
+Startup is load-only. The old startup prefix is gone; the old 20-30 s
+startup numbers and all prefix-based latency tables are obsolete and were
+removed.
 
-Guard: **13.5 s**, answer `Paris, a major city in Europe.` (ok, cached).
-Engine start in that run: **load 3.8 s + prefix 14 tok / 3.3 s** = ready
-in 7.1 s. The run reports `[engine] ready in 8.2 s`; about 1 s is another
-process holding the model lock. Piper session: **1.19 s**.
+| mode | ready (load-only) | notes |
+|---|---:|---|
+| English default/fast | 7-10 s | no startup prefix |
+| Russian fast | 6.8-9.1 s | no startup prefix |
 
-| turn | prefix | question prefill | first token (engine/turn) | engine | first TTS | TTS | first audio | total |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1. "What is the capital of France?" -> `Paris.` | 14 tok / 3.3 s | 13 tok / 3.3 s | 3.32 / 11.56 s | 3.88 s | 12.33 s | 0.21 s | **12.34 s** | 14.12 s |
-| 2. "And Italy?" -> `Rome.` | - | 9 tok / 2.0 s | 2.02 / 2.03 s | 2.48 s | 2.59 s | 0.10 s | **2.59 s** | 3.61 s |
+The TUI allows recording during `WARMING`; the turn queues and runs when
+the engine is ready. The first turn waits only for model load.
 
-The first turn is measured from process start: turn-relative
-`first token 11.56 s` includes load + prefix (7.1 s) and the question
-prefill (3.3 s). In a live mic session, load + prefix overlap the user's
-speech and ASR, so after speech ends only the question prefill (3.3 s) and
-TTS (0.2 s) remain. The second turn is **2.59 s** from speech end to audio.
-In that run both answers were one sentence, so TTS started after the
-sentence ended.
+Verified Russian fast turns:
 
-Streaming on two sentences ("Tell me two short facts about Paris", same
-in-process TTS): engine **12.17 s**, first TTS **15.97 s** while generation
-ends at ~17.6 s, so first audio arrives **1.6 s before** generation ends.
-TTS took 0.70 + 0.20 s for two chunks; total 21.0 s, including 5.1 s of
-playback for 3.7 s of audio.
+| turn | user text | answer | tokens | TTS chunks |
+|---|---|---|---:|---:|
+| 1 | `Привет, как дела?` | `Привет! Хорошо, спасибо. А у тебя?` | 15 | 3 |
+| 2 | `Расскажи о Париже` | `В Париже много музеев и театров.` | 16 | 1 |
 
-WAV path (`--wav`, 1.59 s clip, "What is the capital of France?"):
-ASR base **2.99 s** (0.5x realtime on a short clip because whisper pads to
-a 30 s window), engine load 5.2 s + prefix 4.2 s (overlapped with ASR),
-question prefill 13 tok / 2.8 s, first token 2.82 s (engine) / 12.33 s
-(turn), TTS 0.24 s, first audio **13.02 s** (3.51 s after engine start),
-total 14.55 s. Answer: `Paris.`
+TTS chunks are sentence chunks; the first chunk starts playback while the
+rest of the answer is still being generated.
 
-ASR: `base` is the default. On an 11 s phrase it runs at about 3x realtime;
-on a 1.6 s clip the fixed 30 s whisper window dominates, hence 0.5x.
-`small` (~0.65x realtime) takes the big cores and slows the turn down.
-Use `--asr-model small` / `VOICE_ASR_MODEL=small` only when accuracy
-matters more than latency.
-
-TTS: in-process Piper gives 0.10-0.35 s per short sentence (0.9 s for two)
-against 1.8-2.7 s for `tts.sh` with a new process and `nice/ionice`.
-Prefill: prefix 14 tok / 3.3 s, question 13 tok / 2.8-3.3 s, repeat turn
-9 tok / 2.0 s (B=16, ~4-6 tok/s).
-
-> If another agent holds the `safe_run` lock, the backend logs
-> `[engine] waiting for model lock...` and tens of seconds are added. This
-> is not model loading and such runs are excluded from the table. The first
-> run above includes about 1 s of lock wait.
+Thermal caveat: this phone throttles. The TUI header shows temperature;
+compare runs at a similar thermal state. Single runs are not A/B medians.
+ASR, TTS and decode share the big cores, and a hot phone can halve
+throughput.
 
 ## How it works
 
@@ -248,73 +281,50 @@ TOKSHIT_CHAT_PROTOCOL=1     # stdout: <answer>\n\x1e per turn
 TOKSHIT_CHAT_MAX_NEW=64     # --max-new
 TOKSHIT_RAW_PROMPT=1        # no Inkling template
 TOKSHIT_CHAT_UNESCAPE=1     # literal \n in the stdin line -> newline
-TOKSHIT_CHAT_PREFIX=...     # hidden prefill at startup, no generation
-TOKSHIT_STOP_AT=Q:          # only default stop marker
-# TOKSHIT_STOP_AT2 is unset by default: no newline stop
-# TOKSHIT_STOP_SENTENCE=1   # opt-in via --one-sentence / VOICE_ONE_SENTENCE=1
+TOKSHIT_STOP_AT=Q:          # default stop marker
+TOKSHIT_STOP_AT2=\nQ        # next bare Q line
+TOKSHIT_STOP_AT3=\nA        # next bare A line
 TOKSHIT_POOL_WORKERS=4      # A/B: 4 is faster than 5 on persistent chat
 TOKSHIT_INK_PREFILL_BATCH=16
 ```
 
-`TOKSHIT_CHAT_PREFIX` is prefilled into the KV cache before stdin is read;
-the engine generates nothing for it. Startup is:
+There is no startup prefix: `TOKSHIT_CHAT_PREFIX` is not set. The engine
+loads the model, then reports ready:
 
 ```
-[engine] loaded in 3.8s
-[engine] prefix <N> tok / <T>s
-[engine] ready
+[engine] loaded in 6.8s
+[engine] ready in 7.3s
 ```
 
-The prefix token count and time depend on `VOICE_FEWSHOT`. The historical
-run below used a 14-token prefix (3.3 s); the Paris default is longer.
-In mic mode prefixing overlaps speech and ASR. The first question is
-prefilled separately (9-13 tokens).
+`VOICE_FEWSHOT` defaults to empty and is a power-user override only. If set,
+the old few-shot path and its startup stage return, but that is not the
+default or recommended voice setup.
 
 Each turn is one stdin line (`\n` means two literal characters):
 
 ```
-\nQ: <user>\nA:
+\nQ: Answer in English. <user text>\nA:
 ```
 
-The first turn also starts with `\nQ:` because the few-shot text is in the
-prefix. The current default prefix teaches a two-sentence answer with a
-Paris example:
-
-```
-Q: Hello\nA: Hi! How can I help you today?\nQ: Tell me about Paris.\nA: Paris is the capital of France. It is known for the Eiffel Tower and the Louvre.
-```
-
-It is sent as one `TOKSHIT_CHAT_PREFIX` value with literal `\n` separators.
-Override with `VOICE_FEWSHOT='Q: ...\nA: ...'`; an empty value disables the
-prefix and the first turn starts with `Q:`.
-
-`Q:` is the only default stop marker: the engine returns the answer up to
-`Q:` and does not print the marker itself. `TOKSHIT_STOP_AT2` is empty by
-default. A newline second marker cut live answers to 3-5 tokens, so do not
-set one. `--one-sentence` (`VOICE_ONE_SENTENCE=1`) is the explicit opt-in:
-it sets `TOKSHIT_STOP_SENTENCE=1` and stops after the first sentence.
-Without it, generation runs to EOG or `--max-new` and is streamed to TTS
-as clauses and sentences complete, so a two-sentence answer starts speaking
-before it finishes. A legitimate `Q:` inside an answer is still truncated; this is a
-deliberate trade-off for voice.
+The leading newline is required even on the first turn; without it the
+model drifts. `Q:` and the two newline markers are stop markers: the engine
+returns the answer up to the marker and does not print the marker itself.
 
 `--chat-template` enables the native Inkling template (system prompt plus
-`TOKSHIT_THINK_EFFORT=0.2`). It usually prints a visible reasoning preamble
-("The user asks..."), so it is off by default.
+`TOKSHIT_THINK_EFFORT=0.2`) instead of the raw Q/A path. It usually prints
+a visible reasoning preamble, so it is off by default.
 
-### TTS streaming
+## Clear context
 
-See the diagram and splitter rules in the Streaming section.
+`c` or `[ CLEAR ]` sends `/clear` to the engine, drains the reply, clears
+the KV cache and transcript, and resets the turn counter. Verified in a
+Russian session: the model recalled `Алекс` before clear and did not recall
+it after clear.
 
-### Output
-
-The TUI owns the screen. The answer is written to the transcript as it
-arrives, and the details panel summarizes the turn. The backend keeps its
-full logs on stderr; `--verbose` enables the detailed backend log, including
-TTS chunk texts, sentence boundaries and the engine's stderr tail.
-
-`--no-play` still runs synthesis so the TTS timings and chunking can be
-verified without audio.
+If a turn or recording is active, clear is refused with a notice:
+`Cannot clear context during a turn or recording`. Finish the turn first.
+If the engine does not answer `/clear`, the transcript is still cleared and
+the TUI reports that engine clearing failed.
 
 ## Environment variables
 
@@ -323,40 +333,48 @@ verified without audio.
 | `VOICE_ENGINE` / `--engine` | `~/tokshit/build/tokshit` | persistent chat binary (not the launcher) |
 | `VOICE_MODEL` | `~/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf` | GGUF |
 | `VOICE_MAX_NEW` | `64` | tokens per turn |
+| `VOICE_LANG` | `en` | `en` or `ru`; `--ru` wins, then `--lang` |
 | `VOICE_ASR_MODEL` | auto: base -> tiny; small only if explicit | whisper model; small is slow |
-| `VOICE_FEWSHOT` | `Q: Hello\\nA: Hi! How can I help you today?\\nQ: Tell me about Paris.\\nA: Paris is the capital of France. It is known for the Eiffel Tower and the Louvre.` | hidden startup prefix (`TOKSHIT_CHAT_PREFIX`); empty disables |
-| `VOICE_FAST` | `0` | `1` = top-4 experts, 3 passes, original dense weights, 6 workers; readable LOSSY mode |
-| `VOICE_TOPK` | `4` | experts per token in `VOICE_FAST` (not 2: top-2 loops) |
+| `VOICE_FEWSHOT` | empty | power-user few-shot override; normally unset |
+| `VOICE_FAST` | `0` | `1` = 3 passes, original dense, 6 workers; top-4 EN / top-6 RU; LOSSY |
+| `VOICE_TOPK` | auto | expert override; normally unset (4 EN, 6 RU) |
 | `VOICE_FAST_WORKERS` | `6` | workers in `VOICE_FAST` |
 | `VOICE_POOL_WORKERS` | `4` | lossless voice; do not raise: 5 was slower in A/B |
-| `VOICE_PREFILL_BATCH` | `16` | `TOKSHIT_INK_PREFILL_BATCH` |
+| `VOICE_PREFILL_BATCH` | `16` | `TOKSHIT_INK_PREFILL_BATCH` for the question |
 | `VOICE_TTS` | `inproc` | `inproc` (Piper in-process) or `script` (`tts.sh`) |
-| `VOICE_STOP_AT` | `Q:` | default stop marker (empty disables) |
-| `VOICE_STOP_AT2` | empty | optional second stop marker; do not set a newline stop |
-| `VOICE_ONE_SENTENCE` | `0` | `1` sets `TOKSHIT_STOP_SENTENCE=1`: stop after the first sentence |
+| `VOICE_STOP_AT` | `Q:` | first stop marker (empty disables) |
+| `VOICE_STOP_AT2` | `\nQ` | second stop marker (empty disables) |
+| `VOICE_STOP_AT3` | `\nA` | third stop marker (empty disables) |
+| `VOICE_ONE_SENTENCE` | `0` | `1` sets `TOKSHIT_STOP_SENTENCE=1` |
 | `VOICE_TEMPERATURE` | `0` | sampling |
 | `VOICE_PLAYER` | `auto` | `ffplay`, `termux`, `none` |
 | `VOICE_REC_ENCODER` | `aac` | `aac`, `opus`, `amr_wb`, `amr_nb` |
 | `VOICE_REC_RATE` | `16000` | use `44100` if the device cannot record 16 kHz |
 | `VOICE_REC_BITRATE` | `48` | kbit/s |
 | `VOICE_THINK_EFFORT` | `0.2` | only with `--chat-template` |
-| `TTS_VOICE` | `en_US-lessac-medium` | `.onnx` in `~/audio/models` |
-| `ASR_THREADS`, `ASR_LANG` | 6, auto | read by `asr.sh` |
+| `TTS_VOICE` | `en_US-lessac-medium` | `.onnx` in `~/audio/models`; RU mode uses `ru_RU-irina-medium` |
+| `ASR_LANG` | `en` | `ru` in Russian mode |
 
 ## Dependencies
 
 - `~/tokshit/build/tokshit`, `scripts/safe_run.sh`, the GGUF model;
 - `~/audio/asr.sh`, `whisper-cli`;
-- `~/audio/models/ggml-base.bin` (default) or `ggml-tiny.bin`;
-  `ggml-small.bin` only as an explicit opt-in (slow on this phone);
-- `~/audio/lib/piper_tts.py`, `~/audio/models/en_US-lessac-medium.onnx`
-  and `.json` for in-process TTS; `~/audio/tts.sh` as fallback;
 - `ffmpeg`/`ffplay`, `python` with `onnxruntime` and `numpy`,
   `espeak-ng`;
 - `termux-api` CLI plus the Termux:API APK for the microphone;
 - `flock` for `safe_run.sh`.
 
-### Microphone
+Voice and ASR models:
+
+| component | model | size | rate | notes |
+|---|---|---|---:|---|
+| ASR default | `ggml-base.bin` | 283 MB (74M params) | 16 kHz input | ~3x realtime on an 11 s phrase; whisper pads to 30 s |
+| ASR fallback | `ggml-tiny.bin` | not listed | 16 kHz input | used when base is unavailable |
+| ASR optional | `ggml-small.bin` | 244M params | 16 kHz input | ~0.65x realtime; takes the big cores; opt-in |
+| TTS English | `en_US-lessac-medium.onnx` | not listed | 22.05 kHz | default |
+| TTS Russian | `ru_RU-irina-medium.onnx` | 63 MB | 22 kHz | installed; used by `--ru`/`--lang ru` |
+
+## Microphone
 
 Android needs both the Termux:API APK and the Microphone permission:
 
@@ -379,34 +397,33 @@ but no file appears, try `VOICE_REC_RATE=44100`.
 ## Quality guard
 
 Before a voice session, once per build (keyed by the binary mtime), the
-backend runs:
-
-```
-TOKSHIT_RAW_PROMPT=1 scripts/run_inkling2.sh \
-  "Question: What is the capital of France?\nAnswer:" 8
-```
-
-and checks that the answer contains `Paris`. The result is cached in
+backend runs a short capital-of-France probe and checks that the answer
+contains the expected capital. The result is cached in
 `$TMPDIR/voice-chat-guard.json`; a rebuild repeats the probe. A bad answer
-prints `[guard] warning: ...` but the session continues. `--no-guard`
-skips the probe. This catches the case where a parallel perf agent rebuilt
-the binary and the engine started answering "Neon" or "Napoleon".
+prints `[guard] WARN ...` but the session continues. `--no-guard` skips the
+probe. This catches the case where a parallel perf agent rebuilt the binary
+and the engine started producing broken answers.
 
 ## Troubleshooting
 
 | symptom | cause / fix |
 |---|---|
+| startup takes 20-30 s | current startup is load-only and normally 7-10 s. Check `[engine] waiting for model lock` and thermal throttling; there is no extra warmup stage to wait for. |
 | `[engine] waiting for model lock` | another tokshit process holds the `safe_run` lock. Wait or stop it; this is not model loading. |
-| prefix stage hangs | the binary does not support `TOKSHIT_CHAT_PREFIX`, or the prefix did not parse. `VOICE_FEWSHOT=` disables it; the first turn starts with `Q:`. |
 | ASR `small` slows the turn | `base` is the default (3x realtime on 11 s); `small` is ~0.65x and takes the big cores. Use `--asr-model small` only for accuracy. |
 | `termux-microphone-record` hangs | Termux:API APK or RECORD_AUDIO permission is missing. Install the APK and grant Microphone. Test with `termux-microphone-record -f "$TMPDIR/mic-test.m4a" -l 5`. |
 | microphone produced no file | permission problem or 16 kHz AAC is unsupported. Try `VOICE_REC_RATE=44100`. |
 | ASR `rc=1` but text exists | `asr.sh` bug: the EXIT trap overwrites the status. The backend reads stdout and tolerates it. |
-| answer cut at `Q:` | a stop marker fired. `VOICE_STOP_AT=` disables the default; leave `VOICE_STOP_AT2` empty. |
-| answer cut after 3-5 tokens | a second stop marker is set, usually a newline. `VOICE_STOP_AT2` is empty by default; unset it. Use `--one-sentence` only when a one-sentence answer is intended. |
+| answer cut at `Q:` or a newline marker | a stop marker fired. Tune `VOICE_STOP_AT` / `VOICE_STOP_AT2` / `VOICE_STOP_AT3`; empty disables one. |
+| answer stops after 3-5 tokens | a stop marker matched too early. Check the three stop values; leave the defaults unless you have a measured reason. |
 | answer stops mid-word | `--max-new` is too low; raise it. |
-| `[guard] warning` | bad engine build. Rebuild HEAD and remove the guard cache. |
-| TTS mangles non-English text | the voice is English. Install a matching Piper model and set `TTS_VOICE`. |
+| English answer drifts to French | use the default English directive; do not put a prefix or a non-English directive into `VOICE_FEWSHOT`. |
+| Russian answer drifts or mixes English | start with `scripts/chat --ru` or `--lang ru`; check `ASR_LANG=ru` and `TTS_VOICE=ru_RU-irina-medium`. |
+| Russian fast loops on turn 2 | top-4 is too small for Russian; use `--ru --fast` (top-6) and leave `VOICE_TOPK` unset. |
+| TTS sounds English in Russian mode | `ru_RU-irina-medium` is missing; install it in `~/audio/models`, or set `TTS_VOICE` explicitly. |
+| TTS stops mid-answer | the duplicate guard dropped repeated sentences and stopped audio for the turn. The transcript keeps the full text; this is not a generation stop. |
+| `Cannot clear context during a turn or recording` | finish the current turn or stop recording, then press `c` again. |
+| `[guard] WARN` | bad engine build. Rebuild HEAD and remove the guard cache. |
 | ffplay is silent or busy | use `VOICE_PLAYER=termux` (Android media session) or `none`. |
 | echo between microphone and speaker | there is no AEC. Use headphones, record shorter, or pause in hands-free mode. |
 
@@ -420,9 +437,9 @@ request it.
 
 ```bash
 scripts/chat --check
-scripts/chat --clean-text '**Paris** ```code``` 1. one 2. two'
+scripts/chat --clean-text '**Hello** ```code``` 1. one 2. two'
 scripts/chat --no-guard --no-play --text "Hello" --text "Again"
-scripts/chat --text "What is the capital of France?" \
-             --text "And Italy?" --verbose
+scripts/chat --ru --text "Привет, как дела?"
+scripts/chat --ru --text "Расскажи о Париже"
 scripts/chat --wav "$TMPDIR/question.wav"
 ```

@@ -75,27 +75,27 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
 - **Voice** (`scripts/chat`, curses TUI over `scripts/voice_chat.py`):
   one persistent `build/tokshit` chat process per session (no 9–11 s reload
   per turn), `TOKSHIT_CHAT_PROTOCOL=1` (stdout turn framing with `0x1e`),
-  streaming token output into the transcript, clause/sentence-level
-  streaming TTS. `scripts/chat` adds `--tui` and is the only entry point
-  users need; `--text`, `--wav`, `--check`, `--no-play`, `--seconds`,
-  `--verbose`, `--one-sentence` and `--fast` pass through to the backend.
-  TUI: header (engine/mode/thermal), transcript, details (mic/ASR/prefill/
-  first token/decode/TTS/audio/total/RSS/expert hit-miss), buttons
-  `[ RECORD ]`, `[ STOP ]`, `[ FAST ]`, `[ CLEAR ]`, `[ QUIT ]`, keys
-  Enter/Space, `s`, `f`, `c`, `q`, PgUp/PgDn. Docs: `docs/VOICE_CHAT.md`.
-  Verified raw few-shot recipe:
-  `TOKSHIT_RAW_PROMPT=1 TOKSHIT_CHAT_UNESCAPE=1 TOKSHIT_STOP_AT=Q:`;
-  later turns are `\nQ: <user>\nA:`, with no visible reasoning preamble.
-  The current default prefix is the Paris two-sentence example; answers run
-  to EOG or `--max-new` and are streamed to TTS as clauses and sentences
-  complete.
-  `TOKSHIT_STOP_AT` is `Q:` only; `TOKSHIT_STOP_AT2` is unset by default
-  (a newline stop cut live answers to 3–5 tokens, never set it).
-  `--one-sentence` / `VOICE_ONE_SENTENCE=1` is the opt-in for
-  `TOKSHIT_STOP_SENTENCE=1`.
-  `TOKSHIT_CHAT_PREFIX` prefills the few-shot at engine startup, overlapped
-  with mic/ASR, so the first turn only prefills the question (13 tok / 2.7 s
-  in the test).
+  streamed tokens, clause/sentence-level streaming TTS. There is no startup
+  prefix: `VOICE_FEWSHOT` defaults empty and `TOKSHIT_CHAT_PREFIX` is not
+  set. Startup is load-only, ready ~7–10 s (was 20–30 s with the removed
+  prefix); the TUI accepts recording during `WARMING` and queues the turn.
+  `scripts/chat` adds `--tui`; `--text`, `--wav`, `--check`, `--no-play`,
+  `--seconds`, `--verbose`, `--fast`, `--ru`, `--lang` and `--one-sentence`
+  pass through.
+  Per-turn language directive: EN payload
+  `\nQ: Answer in English. <text>\nA:`, RU payload
+  `\nQ: Отвечай по-русски. <text>\nA:`. The transcript keeps the original
+  ASR/typed text. `--ru` / `--lang ru` / `VOICE_LANG=ru` set `ASR_LANG=ru`
+  and `TTS_VOICE=ru_RU-irina-medium` (installed, 63 MB, 22 kHz).
+  TUI: header (phase/mode/lang/load/thermal/RSS/ctx/mic), transcript,
+  details (mic/ASR/first token/decode/TTS/audio/total/RSS/expert
+  hit-miss), buttons `[ RECORD ]`, `[ STOP ]`, `[ FAST ]`, `[ CLEAR ]`,
+  `[ QUIT ]`, keys Enter/Space, `s`, `f`, `c`, `q`, PgUp/PgDn. `c` sends
+  `/clear`, drains output, clears KV+transcript+turn; busy/recording shows
+  a notice. TTS duplicate guard drops identical consecutive sentences and
+  stops TTS for the turn after two duplicates; transcript stays intact.
+  Stops are `Q:`, `\nQ`, `\nA`; `TOKSHIT_STOP_SENTENCE` is unset by
+  default. `--one-sentence` / `VOICE_ONE_SENTENCE=1` is opt-in.
   Keep `TOKSHIT_POOL_WORKERS=4` for chat decode (A/B: W=4 4.1–4.2,
   W=5 3.8–3.9, W=6 3.8–3.9); prefill can use 6 workers but decode is the
   long pole.
@@ -103,20 +103,26 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   | mode | tok/s | quality |
   |---|---:|---|
   | lossless top-8 / 3 passes | **5.5** | reference |
-  | top-4 / **3 passes** (`scripts/chat --fast`, `VOICE_FAST=1`) | 6.2–6.7 | readable; LOSSY 4/8 experts |
-  | top-8 or top-4 / **2 passes** | 6.4–9.2 | loops on many prompts |
+  | EN fast top-4 / **3 passes** (`scripts/chat --fast`) | 6.2–6.7 | readable; LOSSY 4/8 experts |
+  | RU fast top-6 / **3 passes** (`scripts/chat --ru --fast`) | not separately benched | readable; LOSSY 6/8; top-4 loops on Russian turn 2 |
+  | top-8 or top-4/top-6 / **2 passes** | 6.4–9.2 | loops on many prompts |
   | top-2 / 2 passes + Q4 dense | 13.3 | garbage |
   The 2-pass modes are the quality cliff, not the expert count. Never
   default them for voice/code. Lossless voice uses top-8/3 passes; the
-  coherent fast voice tier is top-4/3 passes via `scripts/chat --fast`
-  (`VOICE_FAST=1`).
-- **Voice latency** (persistent, prefix warmup, base ASR, streaming TTS):
-  first token after the question **2.7 s**, first TTS ~3.2 s; second turn
-  **1.9 s** to first token / **2.45 s** to audio. Engine load 4.4 s + prefix
-  3.4 s happen at script start / while the user speaks.
+  coherent fast voice tier uses 3 passes, original dense weights and 6
+  workers: top-4 for English, top-6 for Russian. Both fast variants are
+  LOSSY and must never be called lossless.
+- **Voice latency** (persistent, no startup prefix, base ASR, streaming TTS):
+  startup is load-only, ready ~7–10 s; Russian fast measured 6.8–9.1 s.
+  The first turn is load-bound; recording during `WARMING` queues it. These
+  numbers are thermal-sensitive: compare at a similar phone temperature,
+  use the TUI `therm` field, and do not treat single runs as A/B medians.
+  All old prefix-based latency rows are obsolete.
 - Audio: `~/audio` has whisper.cpp ASR + Piper TTS; `scripts/chat` (TUI
   wrapper around `scripts/voice_chat.py`) and `docs/VOICE_CHAT.md` are the
-  entry point and docs. The Termux:API APK is downloaded to
+  entry point and docs. Russian mode uses whisper base with `ASR_LANG=ru`
+  and the installed `ru_RU-irina-medium` Piper voice (63 MB, 22 kHz). The
+  Termux:API APK is downloaded to
   `~/storage/downloads/termux-api-0.53.0.apk` (checksum verified) and the
   installer was opened; the user must tap Install and grant Microphone.
   `termux-api` CLI package is installed; the APK was missing, which is why
