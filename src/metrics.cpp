@@ -114,7 +114,8 @@ std::vector<uint32_t> cpu_freqs() noexcept {
 
 void metrics_reset() noexcept {
   Metrics& m = metrics();
-  m.t_attn = 0; m.t_mm = 0; m.c_mm_bytes = 0;
+  m.t_attn = 0; m.t_mm = 0; m.c_mm_bytes = 0; m.c_dot_fallback = 0;
+  for (auto& q : m.c_fallback_q) q.store(0, std::memory_order_relaxed);
   m.t_attn_mm = 0; m.t_attn_core = 0; m.t_ffn = 0;
   m.t_head = 0; m.t_embd = 0; m.t_router = 0;
   m.t_expert = 0; m.t_shexp = 0; m.t_load = 0;

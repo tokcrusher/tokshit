@@ -13,6 +13,8 @@ struct Metrics {
   std::atomic<uint64_t> t_attn{0};
   std::atomic<uint64_t> t_mm{0};
   std::atomic<uint64_t> c_mm_bytes{0};
+  std::atomic<uint64_t> c_dot_fallback{0};
+  std::atomic<uint64_t> c_fallback_q[64]{};
   std::atomic<uint64_t> t_attn_mm{0};
   std::atomic<uint64_t> t_attn_core{0};
   std::atomic<uint64_t> t_ffn{0};

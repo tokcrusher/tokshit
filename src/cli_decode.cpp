@@ -87,6 +87,8 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
         options.token_debug ? metrics().t_expert_mm.load() : 0;
     const uint64_t mb_t0 =
         options.token_debug ? metrics().c_mm_bytes.load() : 0;
+    const uint64_t fb_t0 =
+        options.token_debug ? metrics().c_dot_fallback.load() : 0;
     const uint64_t dw_t0 = metrics().t_down_wait.load();
     const uint64_t hit_t0 = metrics().c_expert_hit.load();
     const uint64_t miss_t0 = metrics().c_expert_miss.load();
@@ -103,11 +105,12 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
           std::chrono::duration<double>(Clock::now() - t_tok).count();
       std::fprintf(
           stderr,
-          "[tok %zu] %.0fms io=%.1fMB w=%.1fMB load=%.0fms exmm=%.0fms "
+          "[tok %zu] %.0fms io=%.1fMB w=%.1fMB fb=%llu load=%.0fms exmm=%.0fms "
           "dw=%.0fms minf=%llu majf=%llu rss=%lluMB hit=%llu miss=%llu\n",
           result.generated, dt * 1e3,
           static_cast<double>(io_read_bytes() - io_t0) / 1e6,
           static_cast<double>(m.c_mm_bytes.load() - mb_t0) / 1e6,
+          static_cast<unsigned long long>(m.c_dot_fallback.load() - fb_t0),
           static_cast<double>(m.t_load.load() - ld_t0) / 1e6,
           static_cast<double>(m.t_expert_mm.load() - mm_t0) / 1e6,
           static_cast<double>(m.t_down_wait.load() - dw_t0) / 1e6,

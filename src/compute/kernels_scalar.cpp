@@ -7,6 +7,7 @@
 
 #include "tokshit/dequant.hpp"
 #include "tokshit/kernels.hpp"
+#include "tokshit/metrics.hpp"
 #include "tokshit/quant.hpp"
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -83,6 +84,11 @@ float dot_fallback(QuantType quant, std::span<const uint8_t> row, size_t rb,
                    std::span<const float> x, const ActQ8& act, size_t in_dim,
                    std::vector<float>& scratch) {
   (void)x;
+  metrics().c_dot_fallback.fetch_add(1, std::memory_order_relaxed);
+  const int qi = static_cast<int>(quant);
+  if (qi >= 0 && qi < 64) {
+    metrics().c_fallback_q[qi].fetch_add(1, std::memory_order_relaxed);
+  }
   const size_t expected = expected_row_bytes(quant, in_dim);
   const size_t needed = expected == 0 ? rb : std::min(rb, expected);
 
