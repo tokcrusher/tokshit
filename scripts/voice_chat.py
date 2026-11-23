@@ -1289,7 +1289,8 @@ class EngineSession:
         self.prefix_s = 0.0
         self.prefix_done = False
         self.fewshot = os.environ.get(
-            "VOICE_FEWSHOT", "Q: 2 + 2?\\nA: 4."
+            "VOICE_FEWSHOT",
+            "Q: Hello\\nA: Hi! How can I help?\\nQ: 2 + 2?\\nA: 4.",
         )
         self._expect_prefix = bool(self.fewshot) and not args.chat_template
         self.ready_event = threading.Event()
@@ -1337,6 +1338,17 @@ class EngineSession:
         env["TOKSHIT_INK_PREFILL_BATCH"] = os.environ.get("VOICE_PREFILL_BATCH", "16")
         env.setdefault("TOKSHIT_POOL_PIN", "1")
         env.setdefault("TOKSHIT_TEMPERATURE", env.get("VOICE_TEMPERATURE", "0"))
+
+        # VOICE_FAST=1: top-4 experts, still 3 passes, original dense weights.
+        # This is the only lossy tier that kept voice text readable in tests;
+        # top-2 and/or 2 passes looped ("Capital capital capital...").
+        if os.environ.get("VOICE_FAST", "").strip() not in ("", "0"):
+            env["TOKSHIT_DRAFT_TOPK"] = os.environ.get("VOICE_TOPK", "4")
+            env.pop("TOKSHIT_HOT_Q4", None)
+            env.pop("TOKSHIT_INK_PASSES", None)  # keep the trained 3 passes
+            env["TOKSHIT_POOL_WORKERS"] = os.environ.get(
+                "VOICE_FAST_WORKERS", "6"
+            )
 
         if self.args.chat_template:
             # Opt-in: нативный шаблон Inkling (видимый reasoning — на любителя).

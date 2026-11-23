@@ -72,13 +72,16 @@ TOKSHIT_INK_PREFILL_BATCH=16
 \nQ: <user>\nA:
 ```
 
-Первый ход тоже начинается с `\nQ:` — few-shot уже в prefix. Короткий
-нейтральный пример (`Q: 2 + 2?\nA: 4.`) выбран после теста: Germany-пример
-отвечал «Paris» на вопрос, но на statement про Францию выдавал
-«The capital of Germany is Berlin». Нейтральный отвечает «Paris» и на
-вопрос, и на statement. Свой prefix — `VOICE_FEWSHOT='Q: ...\nA: ...'`;
-пустой `VOICE_FEWSHOT=` отключает prefix (тогда первый ход начинается
-с `Q:`).
+Первый ход тоже начинается с `\nQ:` — few-shot уже в prefix. Дефолтный
+prefix:
+```
+Q: Hello\nA: Hi! How can I help?\nQ: 2 + 2?\nA: 4.
+```
+Greeting-пример добавлен после теста: без него «Hello» просто эхом
+возвращалось, а длинное «Hello. Hi. Hello.» уходило в цикл. Germany-пример
+смещал ответы про Францию, поэтому его нет. Свой prefix —
+`VOICE_FEWSHOT='Q: ...\nA: ...'`; пустой `VOICE_FEWSHOT=` отключает
+prefix (тогда первый ход начинается с `Q:`).
 
 `Q:` и `\n` — стоп-маркеры: движок отдаёт ответ до маркера и не печатает
 сам маркер. Если в ответе легитимно есть `Q:`, он обрежется — это
@@ -204,8 +207,11 @@ TTS: in-process Piper даёт **0.10–0.35 s** на короткое пред�
 | `VOICE_MODEL` | `~/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf` | GGUF |
 | `VOICE_MAX_NEW` | `64` | токенов на ход |
 | `VOICE_ASR_MODEL` | auto: base → tiny; small только явно | whisper; small медленный |
-| `VOICE_FEWSHOT` | `Q: 2 + 2?\\nA: 4.` | скрытый startup prefix (`TOKSHIT_CHAT_PREFIX`); пусто = выкл |
-| `VOICE_POOL_WORKERS` | `4` | не поднимать: 5 медленнее (A/B) |
+| `VOICE_FEWSHOT` | `Q: Hello\\nA: Hi! How can I help?\\nQ: 2 + 2?\\nA: 4.` | скрытый startup prefix (`TOKSHIT_CHAT_PREFIX`); пусто = выкл |
+| `VOICE_FAST` | `0` | `1` = top-4 experts, 3 passes, lossless dense, 6 workers; читаемый LOSSY-режим |
+| `VOICE_TOPK` | `4` | экспертов на токен в `VOICE_FAST` (не 2: top-2 даёт циклы) |
+| `VOICE_FAST_WORKERS` | `6` | воркеров в `VOICE_FAST` |
+| `VOICE_POOL_WORKERS` | `4` | lossless voice; не поднимать: 5 медленнее (A/B) |
 | `VOICE_PREFILL_BATCH` | `16` | `TOKSHIT_INK_PREFILL_BATCH` |
 | `VOICE_TTS` | `inproc` | `inproc` (Piper в процессе) или `script` (tts.sh) |
 | `VOICE_STOP_AT` | `Q:` | первый стоп-маркер (пусто = выкл) |
