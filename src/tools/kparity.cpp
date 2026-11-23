@@ -72,6 +72,7 @@ int main() {
   for (auto [q, bs, id] : {
            std::tuple{QuantType::Iq2S, 82, 512},
            std::tuple{QuantType::Iq2Xxs, 66, 512},
+           std::tuple{QuantType::Iq2Xs, 74, 512},
            std::tuple{QuantType::Iq1S, 50, 512},
            std::tuple{QuantType::Mxfp4, 17, 512},
            std::tuple{QuantType::Nvfp4, 36, 512},

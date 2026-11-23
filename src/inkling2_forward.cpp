@@ -34,6 +34,15 @@ double g_prof_q_ns[64] = {};
 std::uint64_t g_prof_q_bytes[64] = {};
 std::uint64_t g_prof_q_rows[64] = {};
 std::atomic<std::uint64_t> g_prof_expert_bytes{0};
+std::atomic<std::uint64_t> g_prof_exq_ns[64] = {};
+std::atomic<std::uint64_t> g_prof_exq_bytes[64] = {};
+double g_prof_situ_ns = 0.0;
+double g_prof_gu_ns = 0.0;
+double g_prof_dn_ns = 0.0;
+std::atomic<std::uint64_t> g_situ_math_ns{0};
+std::atomic<std::uint64_t> g_situ_q_ns{0};
+std::atomic<std::uint64_t> g_situ_tasks{0};
+double g_prof_mix_ns = 0.0;
 
 // F32/BF16 dense rows: raw float dot, no activation quantization. Used by the
 // router, loop controllers and other F32/BF16 weights that used to run scalar.
@@ -234,6 +243,7 @@ void expert_task(void* ctx, std::size_t t) {
   const tokshit::kernels::ActQ8& a =
       j.act_block != nullptr ? j.act_block[slot] : *j.act;
   thread_local std::vector<float> scratch;
+  const auto t_ex0 = std::chrono::steady_clock::now();
   // 4-row kernels for iq2_s/q8_0/q4_0/q4_k/q6_k; other quants fall back to
   // dot_row inside dot_rows. The expert chunk reads each weight row once.
   tokshit::kernels::dot_rows(
@@ -242,6 +252,63 @@ void expert_task(void* ctx, std::size_t t) {
           base + static_cast<std::size_t>(r0) * j.rb,
           static_cast<std::size_t>(n) * j.rb),
       j.rb, n, std::span<const float>(xv, j.in), a, j.in, yv, scratch);
+  {
+    const int qi = static_cast<int>(j.quant);
+    if (qi >= 0 && qi < 64) {
+      g_prof_exq_ns[qi].fetch_add(
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t_ex0)
+                  .count()),
+          std::memory_order_relaxed);
+      g_prof_exq_bytes[qi].fetch_add(static_cast<std::uint64_t>(n) * j.rb,
+                                     std::memory_order_relaxed);
+    }
+  }
+}
+
+struct SituJob {
+  const float* gu = nullptr;
+  float* act = nullptr;
+  tokshit::kernels::ActQ8* q8 = nullptr;
+  const int* ids = nullptr;
+  const float* gu_scale = nullptr;
+  std::uint32_t nff = 0;
+  float beta = 0.0F;
+  float lin_beta = 0.0F;
+};
+
+// situ + activation quantisation for one selected expert. Independent per
+// expert, so it runs on the pool instead of serialising 8*nff transcendentals
+// on the main thread between the two expert matvecs.
+void situ_task(void* ctx, std::size_t k) {
+  const SituJob& j = *static_cast<const SituJob*>(ctx);
+  const std::size_t e = j.ids != nullptr ? static_cast<std::size_t>(j.ids[k]) : k;
+  const float gs = j.gu_scale != nullptr ? j.gu_scale[e] : 1.0F;
+  const float* gu = j.gu + k * 2 * j.nff;
+  float* dst = j.act + k * j.nff;
+  const auto tm0 = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < j.nff; ++i) {
+    const float gi = gu[i] * gs;
+    const float ui = gu[j.nff + i] * gs;
+    float act = j.beta * std::tanh(gi / j.beta) /
+                 (1.0F + std::exp(-gi));
+    act *= j.lin_beta > 0.0F ? j.lin_beta * std::tanh(ui / j.lin_beta) : ui;
+    dst[i] = act;
+  }
+  const auto tm1 = std::chrono::steady_clock::now();
+  tokshit::kernels::quantize_into(
+      std::span<const float>(dst, j.nff), j.q8[k]);
+  const auto tm2 = std::chrono::steady_clock::now();
+  g_situ_math_ns.fetch_add(
+      static_cast<std::uint64_t>(std::chrono::duration_cast<
+          std::chrono::nanoseconds>(tm1 - tm0).count()),
+      std::memory_order_relaxed);
+  g_situ_q_ns.fetch_add(
+      static_cast<std::uint64_t>(std::chrono::duration_cast<
+          std::chrono::nanoseconds>(tm2 - tm1).count()),
+      std::memory_order_relaxed);
+  g_situ_tasks.fetch_add(1, std::memory_order_relaxed);
 }
 
 struct MultiJob {
@@ -673,6 +740,7 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     }
   }
 
+  const auto t_gu0 = std::chrono::steady_clock::now();
   {
     ExpertJob job;
     job.data = data_ + L.gate_up_exps.base;
@@ -693,23 +761,28 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     pool::run_tasks(tasks, expert_task, &job);
   }
 
-  for (std::size_t k = 0; k < used; ++k) {
-    const std::size_t e = static_cast<std::size_t>(top_[k]);
-    const float* gu = gu_all_.data() + k * 2 * nff;
-    const float gs = L.gate_up_scale.empty() ? 1.0F : L.gate_up_scale[e];
-    float* dst = act_all_.data() + k * nff;
-    for (std::size_t i = 0; i < nff; ++i) {
-      const float gi = gu[i] * gs;
-      const float ui = gu[nff + i] * gs;
-      float act = situ_beta_ * std::tanh(gi / situ_beta_) * sigmoidf(gi);
-      act *= situ_linear_beta_ > 0.0F
-                 ? situ_linear_beta_ * std::tanh(ui / situ_linear_beta_)
-                 : ui;
-      dst[i] = act;
-    }
-    kernels::quantize_into(std::span<const float>(dst, nff), act_all_q8_[k]);
+  g_prof_gu_ns += std::chrono::duration<double, std::nano>(
+                      std::chrono::steady_clock::now() - t_gu0)
+                      .count();
+  const auto t_situ0 = std::chrono::steady_clock::now();
+  {
+    SituJob job;
+    job.gu = gu_all_.data();
+    job.act = act_all_.data();
+    job.q8 = act_all_q8_.data();
+    job.ids = top_.data();
+    job.gu_scale =
+        L.gate_up_scale.empty() ? nullptr : L.gate_up_scale.data();
+    job.nff = static_cast<std::uint32_t>(nff);
+    job.beta = situ_beta_;
+    job.lin_beta = situ_linear_beta_;
+    pool::run_tasks(used, situ_task, &job);
   }
 
+  g_prof_dn_ns += std::chrono::duration<double, std::nano>(
+                      std::chrono::steady_clock::now() - t_situ0)
+                      .count();
+  const auto t_dn0 = std::chrono::steady_clock::now();
   {
     ExpertJob job;
     job.data = data_ + L.down_exps.base;
@@ -730,12 +803,22 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     pool::run_tasks(tasks, expert_task, &job);
   }
 
+  g_prof_dn_ns += std::chrono::duration<double, std::nano>(
+                      std::chrono::steady_clock::now() - t_dn0)
+                      .count();
+  const auto t_mix0 = std::chrono::steady_clock::now();
   for (std::size_t k = 0; k < used; ++k) {
     const std::size_t e = static_cast<std::size_t>(top_[k]);
     const float w = wts_[k] * (L.down_scale.empty() ? 1.0F : L.down_scale[e]);
     const float* src = down_all_.data() + k * h;
     for (std::size_t i = 0; i < h; ++i) out[i] += w * src[i];
   }
+  g_prof_mix_ns += std::chrono::duration<double, std::nano>(
+                       std::chrono::steady_clock::now() - t_mix0)
+                       .count();
+  g_prof_situ_ns += std::chrono::duration<double, std::nano>(
+                        t_dn0 - t_situ0)
+                        .count();
 }
 
 void Inkling2::set_tap_slots(std::span<const uint32_t> slots) {
@@ -821,6 +904,13 @@ void Inkling2::embed(uint32_t token) {
 
 void Inkling2::token_logits(uint32_t token, std::size_t pos,
                             std::vector<float>& out) {
+  // One-shot CLI mode never calls pool::set_active(true); the workers then
+  // sleep 1 ms between matvec campaigns, which costs ~50 ms/token in barrier
+  // latency alone. Chat mode already does this; make the forward pass do it
+  // for every caller. Scheduling only, no numerics.
+  static const bool pool_active =
+      std::getenv("TOKSHIT_INK_NO_POOL_ACTIVE") == nullptr;
+  if (pool_active) tokshit::pool::set_active(true);
   if (pos == 0) reset();
   if (pos >= kv_ctx_ || token >= vocab_unpadded_) {
     std::fill(out.begin(), out.end(), -1e30F);
@@ -1295,10 +1385,21 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
     std::fprintf(stderr, "[logits] token=%u pos=%zu pre min=%.3f max=%.3f mean|x|=%.3f\n", token, pos, lo, hi, sum / static_cast<double>(vocab_padded_));
   }
   if (final_softcap_ > 0.0F) {
-    for (std::size_t i = 0; i < vocab_padded_; ++i) {
-      logits_[i] =
-          final_softcap_ * std::tanh(logits_[i] / final_softcap_);
-    }
+    struct CapJob {
+      float* v;
+      std::size_t n;
+      float cap;
+    } cj{logits_.data(), vocab_padded_, final_softcap_};
+    pool::run_tasks((vocab_padded_ + 8191) / 8192,
+                    [](void* ctx, std::size_t t) {
+                      const CapJob& j = *static_cast<const CapJob*>(ctx);
+                      const std::size_t b = t * 8192;
+                      const std::size_t e = std::min(b + 8192, j.n);
+                      for (std::size_t i = b; i < e; ++i) {
+                        j.v[i] = j.cap * std::tanh(j.v[i] / j.cap);
+                      }
+                    },
+                    &cj);
   }
   if (std::getenv("TOKSHIT_INK_PROF") != nullptr) {
     std::fprintf(stderr,
@@ -1306,6 +1407,24 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
                  token, pos, prof_mv_ns_ / 1e6, prof_moe_ns_ / 1e6,
                  static_cast<double>(g_prof_expert_bytes.load(
                      std::memory_order_relaxed)) / 1e6);
+    std::fprintf(stderr,
+                 "[profs] situ=%.1fms mix=%.1fms gu=%.1fms dn=%.1fms "
+                 "math=%.1fms q=%.1fms tasks=%llu\n",
+                 g_prof_situ_ns / 1e6, g_prof_mix_ns / 1e6,
+                 g_prof_gu_ns / 1e6, g_prof_dn_ns / 1e6,
+                 static_cast<double>(g_situ_math_ns.load(
+                     std::memory_order_relaxed)) / 1e6,
+                 static_cast<double>(g_situ_q_ns.load(
+                     std::memory_order_relaxed)) / 1e6,
+                 static_cast<unsigned long long>(g_situ_tasks.load(
+                     std::memory_order_relaxed)));
+    g_situ_math_ns.store(0, std::memory_order_relaxed);
+    g_situ_q_ns.store(0, std::memory_order_relaxed);
+    g_situ_tasks.store(0, std::memory_order_relaxed);
+    g_prof_situ_ns = 0.0;
+    g_prof_mix_ns = 0.0;
+    g_prof_gu_ns = 0.0;
+    g_prof_dn_ns = 0.0;
     g_prof_expert_bytes.store(0, std::memory_order_relaxed);
     if (std::getenv("TOKSHIT_INK_PROF_Q") != nullptr) {
       for (int qi = 0; qi < 64; ++qi) {
@@ -1323,6 +1442,21 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
         g_prof_q_ns[qi] = 0.0;
         g_prof_q_bytes[qi] = 0;
         g_prof_q_rows[qi] = 0;
+      }
+      for (int qi = 0; qi < 64; ++qi) {
+        const std::uint64_t ns =
+            g_prof_exq_ns[qi].load(std::memory_order_relaxed);
+        if (ns == 0) continue;
+        const std::uint64_t b =
+            g_prof_exq_bytes[qi].load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[profx] %-8s %.1fms(cpu) %lluMB %.1f GB/s(task)\n",
+                     std::string(quant_name(static_cast<QuantType>(qi))).c_str(),
+                     static_cast<double>(ns) / 1e6,
+                     static_cast<unsigned long long>(b / 1000000ULL),
+                     static_cast<double>(b) / (ns > 1 ? ns : 1));
+        g_prof_exq_ns[qi].store(0, std::memory_order_relaxed);
+        g_prof_exq_bytes[qi].store(0, std::memory_order_relaxed);
       }
     }
     prof_mv_ns_ = 0.0;

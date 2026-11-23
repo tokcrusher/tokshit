@@ -61,6 +61,8 @@ void dot_rows_iq3xxs(const uint8_t* rows, size_t rb, size_t nrows,
 // iq2_s, iq2_xxs, iq1_s, mxfp4, q6_k
 void dot_rows_iq2s(const uint8_t* rows, size_t rb, size_t nrows,
                    const ActQ8& act, size_t in_dim, float* out) noexcept;
+void dot_rows_iq2xs(const uint8_t* rows, size_t rb, size_t nrows,
+                    const ActQ8& act, size_t in_dim, float* out) noexcept;
 void dot_rows_iq2xxs(const uint8_t* rows, size_t rb, size_t nrows,
                      const ActQ8& act, size_t in_dim, float* out) noexcept;
 void dot_rows_iq1s(const uint8_t* rows, size_t rb, size_t nrows,

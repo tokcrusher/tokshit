@@ -62,6 +62,12 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
   m->data_ = reinterpret_cast<const uint8_t*>(mm.bytes().data());
   m->data_len_ = mm.bytes().size();
 
+  // Ask for 2 MB pages on the weight mapping. Harmless when the kernel or the
+  // filesystem refuses it; measurable only if THP applies to file mappings.
+  if (std::getenv("TOKSHIT_INK_NO_HUGEPAGE") == nullptr) {
+    (void)mm.advise_hugepage();
+  }
+
   TOKSHIT_TRY(arch_v, gguf.get("general.architecture"));
   const auto arch = arch_v->as_str();
   if (!arch.has_value() || *arch != "inkling2") {

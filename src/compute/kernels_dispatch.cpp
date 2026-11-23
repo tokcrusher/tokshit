@@ -36,6 +36,12 @@ int env_flag(const char* name) noexcept {
 
 // диагностический гейт: TOKSHIT_SCALAR_DENSE=1 отключает neon-ядра q5_k/bf16
 // (dense attention), чтобы сравнить со старым scalar-путём end-to-end
+// default-on gate: unset = enabled, "0" = disabled (experiments)
+bool env_on_by_default(const char* name) noexcept {
+  const char* v = std::getenv(name);
+  return !(v != nullptr && v[0] == '0');
+}
+
 bool scalar_dense() noexcept {
   static const bool v = env_flag("TOKSHIT_SCALAR_DENSE") != 0;
   return v;
@@ -415,6 +421,16 @@ void dot_rows(QuantType quant, std::span<const uint8_t> rows, size_t rb,
     }
     if (quant == QuantType::Mxfp4 && in_dim % 32 == 0) {
       neon::dot_rows_mxfp4(rows.data(), rb, nrows, act, in_dim, out);
+      return;
+    }
+    if (quant == QuantType::Iq2Xxs && in_dim % 256 == 0 &&
+        env_on_by_default("TOKSHIT_INK_IQ2XXS2")) {
+      neon::dot_rows_iq2xxs(rows.data(), rb, nrows, act, in_dim, out);
+      return;
+    }
+    if (quant == QuantType::Iq2Xs && in_dim % 256 == 0 &&
+        env_on_by_default("TOKSHIT_INK_IQ2XXS2")) {
+      neon::dot_rows_iq2xs(rows.data(), rb, nrows, act, in_dim, out);
       return;
     }
     if (use_iq2row() && in_dim % 256 == 0) {
