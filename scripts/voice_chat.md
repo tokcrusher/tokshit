@@ -54,23 +54,32 @@ TOKSHIT_CHAT_PROTOCOL=1     # stdout: <answer>\n\x1e на каждый ход
 TOKSHIT_CHAT_MAX_NEW=64     # --max-new
 TOKSHIT_RAW_PROMPT=1        # без шаблона Inkling
 TOKSHIT_CHAT_UNESCAPE=1     # литеральные \n в строке stdin -> newline
+TOKSHIT_CHAT_PREFIX=...     # скрытый prefill на старте, без генерации
 TOKSHIT_STOP_AT=Q:          # не давать модели продолжить следующий Q&A
 TOKSHIT_STOP_AT2=\n         # стоп на end_message/переводе строки
 TOKSHIT_POOL_WORKERS=4      # A/B: 4 быстрее 5 на persistent chat
+TOKSHIT_INK_PREFILL_BATCH=16
 ```
 
-Промпты (одна строка stdin, `\n` — литеральные два символа):
+`TOKSHIT_CHAT_PREFIX` движок префиллит в KV **до чтения stdin** и ничего
+не генерирует. На старте: `[engine] loaded in 3.8s`, затем
+`[engine] prefix 14 tok / 3.3s`, затем `[engine] ready`. В mic-режиме это
+перекрывается речью/ASR; первый вопрос префиллится отдельно, 9–13 токенов.
 
-* первый ход:
-  `Q: 2 + 2?\nA: 4.\nQ: <user>\nA:`
-* следующие:
-  `\nQ: <user>\nA:`
+Каждый ход — одна строка stdin (`\n` — литеральные два символа):
 
-Короткий few-shot — 15–17 токенов вместо 32 у длинного; prefill первого
-хода заметно дешевле. Нейтральный пример (`2+2`) выбран после теста:
-Germany-пример отвечал «Paris» на вопрос, но на statement про Францию
-выдавал «The capital of Germany is Berlin». Нейтральный отвечает «Paris»
-и на вопрос, и на statement. Свой префикс — `VOICE_FEWSHOT='Q: ...\nA: ...'`.
+```
+\nQ: <user>\nA:
+```
+
+Первый ход тоже начинается с `\nQ:` — few-shot уже в prefix. Короткий
+нейтральный пример (`Q: 2 + 2?\nA: 4.`) выбран после теста: Germany-пример
+отвечал «Paris» на вопрос, но на statement про Францию выдавал
+«The capital of Germany is Berlin». Нейтральный отвечает «Paris» и на
+вопрос, и на statement. Свой prefix — `VOICE_FEWSHOT='Q: ...\nA: ...'`;
+пустой `VOICE_FEWSHOT=` отключает prefix (тогда первый ход начинается
+с `Q:`).
+
 `Q:` и `\n` — стоп-маркеры: движок отдаёт ответ до маркера и не печатает
 сам маркер. Если в ответе легитимно есть `Q:`, он обрежется — это
 сознательный трейд-офф для голоса.
@@ -114,18 +123,20 @@ engine stdout ──> SentenceStreamer ──> очередь предложен
 Нормальный режим — стадии и одна сводка на ход, без стены метрик:
 
 ```
-[engine] ready in 4.3s
-[tts] in-process Piper ready in 1.14s
+[engine] loaded in 5.2s
+[engine] prefix 14 tok / 4.2s
+[engine] ready in 9.4s
+[tts] in-process Piper ready in 1.27s
 [wav] question.wav · 1.59 s
-[asr] base · 3278 ms · 0.5× realtime · 1.59 s audio
+[asr] base · 2992 ms · 0.5× realtime · 1.59 s audio
 🗣  What is the capital of France?
-[engine] first token 6.19s
+[engine] first token 2.82s
  Paris.
-[tts] first chunk at 12.08s (0.67s audio)
-[play] first audio at 12.08s (turn) · 6.89s after engine start
-[summary] asr 3278 ms (base) · engine 6673 ms · tts 213 ms · total 13611 ms
-[stats]   3 tok · 6.30 tok/s · 8 chars · 1 tts chunks · 0.7 s audio
-[latency] first token 6.19s · first tts 12.08s (turn) · first audio 12.08s (turn) / 6.89s (engine)
+[tts] first chunk at 13.02s (0.73s audio)
+[play] first audio at 13.02s (turn) · 3.51s after engine start
+[summary] asr 2992 ms (base) · engine 3262 ms · tts 240 ms · total 14546 ms
+[stats]   3 tok · 6.80 tok/s · 8 chars · 1 tts chunks · 0.7 s audio
+[latency] first token 2.82s (engine) / 12.33s (turn) · first tts 13.02s (turn) · first audio 13.02s (turn) / 3.51s (engine)
 ```
 
 `--verbose` добавляет тексты TTS-чанков, границы предложений и хвост
@@ -135,33 +146,40 @@ stderr движка. `[engine] loading model... / waiting for model lock...` —
 ## Замеры
 
 Условия: Termux, 16 ГБ LPDDR5X, `Inkling-2-Mini-UD-Q2_K_XL.gguf`,
-e60da2c (batched prefill B=16), persistent chat, W=4, короткий нейтральный
-few-shot, `--max-new 64`, Piper `en_US-lessac-medium` в процессе, ffplay,
-whisper `base`. Page cache тёплый, чужого `safe_run` lock нет.
+текущая сборка (batched prefill B=16 + `TOKSHIT_CHAT_PREFIX`), persistent
+chat, W=4, скрытый prefix `Q: 2 + 2?\nA: 4.`, `--max-new 64`, Piper
+`en_US-lessac-medium` in-process, ffplay, whisper `base`. Page cache тёплый.
 
-Guard: **13.5 s**, ответ `Paris, a major city in Europe.` (ok).
-Загрузка движка: **4.3 s**. TTS-сессия Piper: **1.14 s**.
+Guard: **13.5 s**, ответ `Paris, a major city in Europe.` (ok, закэширован).
+Старт движка: **load 3.8 s + prefix 14 tok / 3.3 s** = готовность 7.1 s
+(в прогоне ниже `[engine] ready in 8.2 s` — ~1 s чужого lock wait).
+Piper-сессия: **1.19 s**.
 
-| ход | prefill | first token | engine | first tts | tts | first audio | total |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 1. «What is the capital of France?» → `Paris.` | 27 tok / 6.6 s | 6.61 s | 7.14 s | 11.82 s | 0.33 s | **11.83 s** | 13.56 s |
-| 2. «And Italy?» → `Rome.` | 9 tok / 2.1 s | 2.10 s | 2.57 s | 2.67 s | 0.10 s | **2.67 s** | 3.70 s |
+| ход | prefix | question prefill | first token (engine/turn) | engine | first tts | tts | first audio | total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1. «What is the capital of France?» → `Paris.` | 14 tok / 3.3 s | 13 tok / 3.3 s | 3.32 / 11.56 s | 3.88 s | 12.33 s | 0.21 s | **12.34 s** | 14.12 s |
+| 2. «And Italy?» → `Rome.` | — | 9 tok / 2.0 s | 2.02 / 2.03 s | 2.48 s | 2.59 s | 0.10 s | **2.59 s** | 3.61 s |
 
-`first audio` первого хода включает 4.3 s загрузки и 6.6 s prefill; от
-старта движка это **7.48 s**. Второй ход — **2.67 s** от реплики до звука:
-prefill 9 токенов, декод 3 токена, TTS 0.10 s. Ответ — одно предложение,
-поэтому TTS не может стартовать раньше его конца.
+Первый ход в таблице считается от старта процесса: turn-relative
+`first token 11.56 s` включает load+prefix (7.1 s) и вопрос (3.3 s).
+В живом mic-режиме load+prefix идут, пока пользователь говорит и работает
+ASR, поэтому после конца речи остаётся prefill вопроса **3.3 s** + TTS
+**0.2 s**. Второй ход — **2.59 s** от реплики до звука. Ответы — одно
+предложение, поэтому TTS стартует после его конца.
 
-Стриминг на двух предложениях («Tell me two short facts about Paris»):
-engine **12.17 s**, first token 7.95 s, first tts **15.97 s** при turn
-start с загрузкой 5.4 s — то есть до engine end (~17.6 s) примерно на
-**1.6 s**. TTS: 0.70 s + 0.20 s на два чанка, first audio 15.97 s, всего
-21.0 s (из них 5.1 s — проигрывание 3.7 s аудио).
+Стриминг на двух предложениях («Tell me two short facts about Paris»,
+тот же in-process TTS; prefix добавляет только startup):
+engine **12.17 s**, first tts **15.97 s** при engine end ~17.6 s —
+first audio на **1.6 s раньше** конца генерации. TTS 0.70 + 0.20 s на два
+чанка, first audio 15.97 s, всего 21.0 s (из них 5.1 s — проигрывание
+3.7 s аудио).
 
 WAV-путь (`--wav`, 1.59 s, «What is the capital of France?»):
-ASR base **3.28 s**, engine 6.67 s, first token 6.19 s, first tts
-12.08 s, TTS 0.21 s, first audio **12.08 s**, total 13.61 s, ответ
-`Paris.`
+ASR base **2.99 s** (0.5× на коротком клипе; 30-секундное окно whisper),
+engine load 5.2 s + prefix 4.2 s (перекрываются с ASR), вопрос 13 tok /
+2.8 s, first token 2.82 s (engine) / 12.33 s (turn), TTS 0.24 s,
+first audio **13.02 s** (3.51 s от старта движка), total 14.55 s.
+Ответ `Paris.`
 
 ASR: base — дефолт. На 11-секундной фразе ~3× realtime; на короткой
 1.6-секундной доминирует фиксированное 30-секундное окно whisper, поэтому
@@ -170,12 +188,13 @@ ASR: base — дефолт. На 11-секундной фразе ~3× realtime;
 
 TTS: in-process Piper даёт **0.10–0.35 s** на короткое предложение
 (0.9 s на два) против 1.8–2.7 s у `tts.sh` с новым процессом и
-`nice/ionice`. Prefill: 27 токенов за 6.2–6.6 s, 9 токенов за 2.1 s
-(B=16, ~4–6 tok/s); короткий few-shot + вопрос дают 27 токенов, не 15–17.
+`nice/ionice`. Prefill: prefix 14 tok / 3.3 s, вопрос 13 tok / 2.8–3.3 s,
+повторный ход 9 tok / 2.0 s (B=16, ~4–6 tok/s).
 
-> Прогоны в момент, когда другой агент держал `safe_run` lock, дают
+> Если другой агент держит `safe_run` lock, появляется
 > `[engine] waiting for model lock...` и десятки секунд сверху. Это не
-> загрузка модели; в таблицу такие прогоны не включены.
+> загрузка модели; в таблицу такие прогоны не включены. В первом прогоне
+> выше осталось ~1 s lock wait — на цифры влияет мало.
 
 ## Переменные окружения
 
@@ -185,7 +204,7 @@ TTS: in-process Piper даёт **0.10–0.35 s** на короткое пред�
 | `VOICE_MODEL` | `~/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf` | GGUF |
 | `VOICE_MAX_NEW` | `64` | токенов на ход |
 | `VOICE_ASR_MODEL` | auto: base → tiny; small только явно | whisper; small медленный |
-| `VOICE_FEWSHOT` | `Q: 2 + 2?\\nA: 4.` | короткий префикс первого хода |
+| `VOICE_FEWSHOT` | `Q: 2 + 2?\\nA: 4.` | скрытый startup prefix (`TOKSHIT_CHAT_PREFIX`); пусто = выкл |
 | `VOICE_POOL_WORKERS` | `4` | не поднимать: 5 медленнее (A/B) |
 | `VOICE_PREFILL_BATCH` | `16` | `TOKSHIT_INK_PREFILL_BATCH` |
 | `VOICE_TTS` | `inproc` | `inproc` (Piper в процессе) или `script` (tts.sh) |
@@ -233,6 +252,8 @@ TOKSHIT_RAW_PROMPT=1 scripts/run_inkling2.sh \
 | симптом | причина / лечение |
 |---|---|
 | `[engine] waiting for model lock` | другой tokshit держит `safe_run` lock. Ждать или завершить его; это не загрузка модели. |
+| `[engine] prefix...` долго / висит | бинарь не поддерживает `TOKSHIT_CHAT_PREFIX` или prefix не распарсился. `VOICE_FEWSHOT=` отключает prefix, первый ход начинается с `Q:`. |
+| ASR `small` тормозит ход | base — дефолт (3× realtime на 11 s), small ~0.65× и забирает большие ядра. `--asr-model small` только если нужна точность. |
 | `termux-microphone-record завис` | нет Termux:API/разрешения RECORD_AUDIO. Выдать Microphone в Android Settings → Apps → Termux:API → Permissions. В этом окружении живой микрофон не протестирован. |
 | `микрофон не создал файл` | разрешение или 16 kHz AAC не поддержан. `VOICE_REC_RATE=44100`. |
 | ASR `rc=1`, но текст есть | баг `asr.sh`: EXIT-трап перебивает код. Скрипт читает stdout и терпит. |
@@ -254,6 +275,7 @@ Live VAD невозможен: Termux:API не отдаёт уровень си�
 scripts/voice_chat.py --check
 scripts/voice_chat.py --clean-text '**Paris** ```code``` 1. one 2. two'
 scripts/voice_chat.py --no-guard --no-play --text "Hello" --text "Again"
-scripts/voice_chat.py --text "What is the capital of France?" --verbose
+scripts/voice_chat.py --text "What is the capital of France?" \
+                      --text "And Italy?" --verbose
 scripts/voice_chat.py --wav "$TMPDIR/question.wav"
 ```
