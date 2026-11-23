@@ -62,11 +62,15 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   **10.04–10.56 tok/s** burst/short and **9.2–9.4 tok/s** on a 24-token
   coding prompt. Quality is visibly degraded; never present as lossless.
 - `--passes 2` alone ~2.5; top2+Q4+passes2 is the 9–10.5 configuration.
-  Batched prefill is now wired for Inkling2 (`TOKSHIT_INK_PREFILL_BATCH`,
-  default 16, `TOKSHIT_INK_PREFILL_ONLY_LAST`); it is exact but so far only
-  matches sequential speed (~3–4 tok/s), because MoE compute, not dense
-  weight streaming, dominates. Hundreds of tok/s requires faster expert
-  kernels, not just batching.
+  Batched prefill for Inkling2 is wired (`TOKSHIT_INK_PREFILL_BATCH`,
+  default 16, `TOKSHIT_INK_PREFILL_ONLY_LAST`): fixed a real bug where
+  `moe_batch()` ran inside the per-token loop (B× the MoE work). Measured
+  same-prompt, temperature 0: sequential 3.24 tok/s (61 tok in 18.8 s);
+  B=16 4.45 tok/s (13.7 s), B=64 4.92 tok/s (12.4 s); 197-token prompt:
+  B=16 5.00, B=64 4.97. Greedy ids were identical for B=0/16/32/64 on both
+  prompts. Logits are not bit-exact (max|dlogit|≈0.36 at tap 22), so keep
+  the token-identity check when changing kernels. Prefill is compute-bound
+  at the same 3.06 Gweight/token; batching does not reduce MACs.
 - **Voice** (`scripts/voice_chat.py`): one persistent `build/tokshit` chat
   process per session (no 9–11 s reload per turn), `TOKSHIT_CHAT_PROTOCOL=1`
   (stdout turn framing with `0x1e`), streaming token output, sentence-level
@@ -110,9 +114,14 @@ Remaining non-lossy levers, in order:
 5. Keep the lossy 10 tok/s profile clearly marked; never call it lossless.
 6. Audio: `~/audio` + `scripts/voice_chat.*`; do not use llama.cpp.
 7. Hundreds of prefill tok/s is also compute-bound (same 3.06 Gweight/token);
-   batching is exact but does not reduce MACs. Prefill hundreds would need
-   ~20× the current expert GEMV throughput; the practical target is the same
+   batching is exact in ids but does not reduce MACs. Measured prefill is
+   3.2 → 4.5–5.0 tok/s after the MoE B× fix. Even the fastest existing
+   kernels (Iq1S/Q2_0 ~34 Gweight/s) cap prefill at ~11 tok/s; hundreds would
+   need ~20× the expert GEMV throughput. The practical target is the same
    kernel ceiling as decode.
+8. Audio ASR: use whisper **base** (74M, ~3× realtime, 283 MB) as default;
+   small (244M) runs at 0.65× realtime on this phone and starves the LLM.
+   TTS Piper lessac-medium ≈2.5 s audio per wall second; round-trip WER 0 %.
 
 ## Rules
 
