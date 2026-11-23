@@ -22,12 +22,22 @@ Inkling-2-Mini, is measured separately below.
 The second target is Inkling-2-Mini UD-Q2_K_XL (9.14 GB): 24 physical
 blocks, 48 KV slots, 3 loop passes, 128 experts top-8, hidden 2304. Plain
 greedy is noisy: roughly 1.6–3.0 tok/s depending on thermals and cache
-(2.1–2.4 in the session-3 runs). The experimental DSpark draft
-(`--dspark`) is greedy-only and lossless on tested prompts, but sequential
-verify measured 1.23 tok/s against 1.65 tok/s plain on a coding prompt
-(24 tokens, K=3). A batched verify path exists and is the default, but it
-has no measured tok/s yet, so DSpark is not a speed win. Details:
-[PERF_SESSION3.md](PERF_SESSION3.md), [DSPARK.md](DSPARK.md).
+(1.61–1.72 in the 2026-11-22 runs). The experimental DSpark draft
+(`--dspark`) is greedy-only and lossless on tested prompts; sequential
+verify measured 0.72 tok/s and batched verify 0.52 tok/s against
+1.61–1.72 tok/s plain (16 tokens, K=3, acceptance 47.6 %), so DSpark is not
+a speed win. Details: [PERF_SESSION3.md](PERF_SESSION3.md),
+[DSPARK.md](DSPARK.md).
+
+New diagnostic (2026-11-23): `TOKSHIT_TOKEN_DEBUG=1` now prints `fb=`, the
+number of `dot_fallback` scalar calls per token. One normal-mode token gave
+`fb=34944` and `w=2801.5 MB`. That many scalar calls is direct evidence that
+the fallback is a major compute cost. Effective `10.6 GMAC/s` is ~1–2 % of
+the SDOT peak, not a hardware limit; if the fallback is removed, 10 tok/s
+is plausible. This is a **diagnosis pending measurement**, not a benchmark.
+The 5.5 GB/token budget is not the bottleneck; compute is. `--passes 2` and
+`--topk-experts 2` remain **LOSSY**: the varloop experiment measured
+1.97 → 2.52 tok/s, top-2/2-pass ~3.9–5.2 tok/s, and quality degrades.
 
 ## Flint token budget
 

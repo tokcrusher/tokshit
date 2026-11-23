@@ -31,6 +31,8 @@ GGUF — в [GGUF.md](GGUF.md); замеры — в
 24 физических блока, 48 KV-слотов, 3 loop-прохода по core-слотам 6..17,
 128 экспертов top-8, hidden 2304, 9.14 ГБ в UD-Q2_K_XL. У неё отдельный
 бэкенд и отдельный загрузчик; цифры Flint выше к ней не относятся.
+Attention: 20 локальных слоёв с окном 1024 и 4 глобальных физических слоя
+`[5, 11, 17, 23]`, которые видят полный контекст и не обрезаются до 1024.
 Замеры — в [PERF_SESSION3.md](PERF_SESSION3.md).
 
 ## модули
@@ -63,7 +65,7 @@ GGUF — в [GGUF.md](GGUF.md); замеры — в
 - `tokenizer.cpp` — BPE.
 - `spec_loop.cpp` — спекулятивный цикл.
 - `main.cpp` — CLI: флаги, пресеты, режимы.
-- `src/tools/` — qstat, kbench, vcheck, bwbench, pbench, ahbtest.
+- `src/tools/` — qstat, kbench, vcheck, bwbench, pbench, ahbtest, densebench, deweightbench, gather_bwbench, expert_loc, kparity.
 
 ## загрузка
 
@@ -255,10 +257,10 @@ AHB не ускоряет сам по себе: 328 КБ блоки читают
 Backbone draft-блока считает 8 позиций параллельно, цепочная только
 markov-голова. Greedy-ids совпадают с plain greedy на проверенных
 промптах. Verify умеет последовательный режим и батчевый
-(`inkling2_batch.cpp`, по умолчанию), но замер скорости есть только для
-последовательного: 1.23 против 1.65 tok/s plain greedy (coding-промпт,
-24 токена, K=3, chain acceptance 30.8 %). Батч-путь пока не показал
-выигрыша. Это эксперимент, не замена `--spec`; подробности — в
+(`inkling2_batch.cpp`, по умолчанию). Замеры 2026-11-22: plain 1.61–1.72,
+sequential 0.72, batched 0.52 tok/s (coding-промпт, 16 токенов, K=3,
+chain acceptance 47.6 %). Батч-путь даёт паритет и lossless, но выигрыша
+над plain нет. Это эксперимент, не замена `--spec`; подробности — в
 [DSPARK.md](DSPARK.md).
 
 ## ошибки

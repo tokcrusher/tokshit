@@ -118,12 +118,14 @@ DSpark требует полные 3 прохода (`--passes 3`, default).
 при `--temperature 0`. При другой температуре main печатает warning и
 уходит в обычный декод. Измеренные режимы на этом телефоне (warm cache, K=3):
 
-- plain greedy: ~1.65 tok/s (24-токенный код-промпт),
-- DSpark `--dspark-batch=0`: ~1.53 tok/s,
-- DSpark `--dspark-batch=1`: ~1.13–1.23 tok/s, acceptance 47.6% (mean
-  accepted 2.29), шумный и не лосслесс. Батч-режим читает веса MoE по
-  top-8 и работает, но draft и verify дорогие; 10 tok/s на текущих
-  низкобитных GEMV не выйдет. Устройство и замеры — в [DSPARK.md](DSPARK.md).
+- plain greedy: 1.61–1.72 tok/s (16-токенный код-промпт),
+- DSpark `--dspark-batch=0`: 0.72 tok/s,
+- DSpark `--dspark-batch=1`: 0.52 tok/s, acceptance 47.6 % (mean accepted
+  2.29). Батч-режим читает веса MoE по top-8 и работает, но draft и verify
+  дорогие. 10 tok/s требует убрать скалярный fallback с горячего пути;
+  это диагноз из [PERF_SESSION3.md](PERF_SESSION3.md), а не замер.
+  Greedy-ids batched DSpark совпали с plain greedy в байт на проверенных
+  промптах: выход lossless. Устройство и замеры — в [DSPARK.md](DSPARK.md).
 
 ```sh
 # Inkling-2-Mini + DSpark, жадный декод
@@ -168,6 +170,33 @@ TOKSHIT_DSPARK_DEBUG=~/models/dspark-Inkling-2-Mini-Q8_0.gguf \
 | `--bench-breakdown` | выкл | разбивка q/k/v/o |
 | `--debug-tok` | выкл | отладка токенизатора |
 | `--seg-debug` | выкл | печать сегментов matvec |
+
+`TOKSHIT_TOKEN_DEBUG=1` печатает на каждый токен строку `[tok N] ... w=...
+fb=... minf=... majf=...`:
+
+- `w` — мегабайты весов, прошедших через matvec за токен (`c_mm_bytes`);
+- `fb` — число вызовов скалярного `dot_fallback` за токен; строка `fbq:`
+  ниже разбивает его по квантам. Один токен normal-режима Inkling2 дал
+  `fb=34944`, `w=2801.5 MB`: это индикатор compute-стоимости fallback,
+  а не I/O;
+- `minf`/`majf` — minor/major page faults за токен; major — реальные
+  чтения с диска;
+- `io` — байты I/O, `hit`/`miss` — кэш экспертов, `rss` — RSS процесса.
+
+### Инструменты в `src/tools`
+
+Собираются с `TOKSHIT_BUILD_TOOLS=1`:
+
+- `deweightbench <gguf> [iters] [tensor...]` — цена декванта и GEMV на
+  регионе эксперта (сэмпл из 8 строк);
+- `gather_bwbench <gguf> [iters] [slots]` — полоса gather-паттерна decode
+  по слотам (по умолчанию 48);
+- `expert_loc <gguf> [n_tokens] [token_id]` — локальность роутинга:
+  пересечение top-k между проходами;
+- `kparity` — сверка 4-строчных ядер (`dot_rows`) с построчным `dot_row`.
+
+`densebench`, `kbench`, `vcheck`, `pbench`, `qstat` и `dumptensor`
+остаются как раньше.
 
 Булевы флаги не съедают следующий аргумент. Выключение — `--hot=0`,
 `--o-direct=0` и т.д. `--` завершает разбор флагов: промпт может начинаться
@@ -274,7 +303,7 @@ TOKSHIT_DSPARK_DEBUG=~/models/dspark-Inkling-2-Mini-Q8_0.gguf \
 | `TOKSHIT_SEG_DEBUG` | выкл | отладка сегментов |
 | `TOKSHIT_SEG_DEBUG_ALL` | выкл | отлаживать все сегменты, не только первые |
 | `TOKSHIT_LAYER_DEBUG` | выкл | тайминги слоя и экспертов |
-| `TOKSHIT_TOKEN_DEBUG` | выкл | `[tok]`-строка: `w` (МБ весов на токен), `minf/majf`, RSS, hit/miss |
+| `TOKSHIT_TOKEN_DEBUG` | выкл | `[tok]`-строка: `w` (МБ весов на токен), `fb` (вызовов `dot_fallback`), `minf/majf`, RSS, hit/miss |
 | `TOKSHIT_DEBUG_NRUN` | выкл | печатать число выполненных слоёв |
 | `TOKSHIT_POOL_WAIT_STATS` | выкл | статистика барьера пула |
 | `TOKSHIT_BENCH_MM` | выкл | matvec-бенчмарк |
@@ -416,7 +445,7 @@ TOKSHIT_MIN_AVAIL_MB=1400 TOKSHIT_EXPERT_CACHE_MB=512 \
 
 | симптом | что смотреть |
 |---|---|
-| медленно | `GGUF_TIME=1`, `TOKSHIT_TOKEN_DEBUG=1` (`w`, `minf/majf`, RSS), `--expert-stats`, температура |
+| медленно | `GGUF_TIME=1`, `TOKSHIT_TOKEN_DEBUG=1` (`w`, `fb`, `minf/majf`, RSS), `--expert-stats`, температура |
 | мало памяти / page cache thrash | prefault WARNING про RSS, `--drop-siblings`, `--kv-ctx 512`, `--prefault=0` |
 | мало памяти | `--cache-mb 256`, `--hot=0`, `TOKSHIT_AHB_DEBUG=1` |
 | AHB не выдаётся | `TOKSHIT_AHB_DEBUG=1`, затем `TOKSHIT_AHB=0` |

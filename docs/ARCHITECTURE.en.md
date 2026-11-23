@@ -30,7 +30,9 @@ and from the loader code.
 The second target is Inkling-2-Mini (`general.architecture = inkling2`):
 24 physical blocks, 48 KV slots, 3 loop passes over core layers 6..17,
 128 experts top-8, hidden 2304, 9.14 GB in UD-Q2_K_XL. It has its own
-backend and loader; the Flint numbers above do not apply to it.
+backend and loader; the Flint numbers above do not apply to it. Attention:
+20 local layers use a 1024 window, and 4 global physical layers
+`[5, 11, 17, 23]` see the full context and are not clipped to 1024.
 Measurements: [PERF_SESSION3.md](PERF_SESSION3.md).
 
 ## modules
@@ -63,7 +65,7 @@ Measurements: [PERF_SESSION3.md](PERF_SESSION3.md).
 - `tokenizer.cpp` — BPE.
 - `spec_loop.cpp` — speculative loop.
 - `main.cpp` — CLI: flags, presets, modes.
-- `src/tools/` — qstat, kbench, vcheck, bwbench, pbench, ahbtest.
+- `src/tools/` — qstat, kbench, vcheck, bwbench, pbench, ahbtest, densebench, deweightbench, gather_bwbench, expert_loc, kparity.
 
 ## load
 
@@ -257,11 +259,11 @@ a 402 MB `dflash` GGUF with block size 8 and target taps `[5,23,41,48]`.
 The draft backbone processes all 8 positions in parallel; only the Markov
 head is chained. Greedy ids match plain greedy on tested prompts. Verify has
 a sequential mode and a batched mode
-(`inkling2_batch.cpp`, default), but only the sequential mode is measured:
-1.23 vs 1.65 tok/s plain greedy on a coding prompt (24 tokens, K=3, chain
-acceptance 30.8%). The batched path has parity checks but no measured win
-yet. It is experimental, not a replacement for `--spec`; details in
-[DSPARK.md](DSPARK.md).
+(`inkling2_batch.cpp`, default). 2026-11-22 measurements: plain 1.61–1.72,
+sequential 0.72, batched 0.52 tok/s (coding prompt, 16 tokens, K=3, chain
+acceptance 47.6 %). The batched path has parity and stays lossless, but
+there is no win over plain yet. It is experimental, not a replacement for
+`--spec`; details in [DSPARK.md](DSPARK.md).
 
 ## errors
 
