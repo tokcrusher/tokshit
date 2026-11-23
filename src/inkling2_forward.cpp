@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <sys/mman.h>
 #include <vector>
 
 #if defined(__aarch64__)
@@ -26,6 +27,65 @@ namespace {
 double g_prof_attn_ns = 0.0;
 double g_prof_attn_local_ns = 0.0;
 double g_prof_attn_global_ns = 0.0;
+
+// F32/BF16 dense rows: raw float dot, no activation quantization. Used by the
+// router, loop controllers and other F32/BF16 weights that used to run scalar.
+inline float dot_f32_neon(const float* w, const float* x, std::size_t n) {
+#if defined(__aarch64__)
+  float32x4_t a0 = vdupq_n_f32(0.0F);
+  float32x4_t a1 = vdupq_n_f32(0.0F);
+  std::size_t i = 0;
+  for (; i + 16 <= n; i += 16) {
+    a0 = vfmaq_f32(a0, vld1q_f32(w + i), vld1q_f32(x + i));
+    a1 = vfmaq_f32(a1, vld1q_f32(w + i + 4), vld1q_f32(x + i + 4));
+    a0 = vfmaq_f32(a0, vld1q_f32(w + i + 8), vld1q_f32(x + i + 8));
+    a1 = vfmaq_f32(a1, vld1q_f32(w + i + 12), vld1q_f32(x + i + 12));
+  }
+  for (; i + 4 <= n; i += 4) {
+    a0 = vfmaq_f32(a0, vld1q_f32(w + i), vld1q_f32(x + i));
+  }
+  float r = vaddvq_f32(vaddq_f32(a0, a1));
+  for (; i < n; ++i) r += w[i] * x[i];
+  return r;
+#else
+  float r = 0.0F;
+  for (std::size_t i = 0; i < n; ++i) r += w[i] * x[i];
+  return r;
+#endif
+}
+
+inline float dot_bf16_neon(const std::uint16_t* w, const float* x,
+                           std::size_t n) {
+#if defined(__aarch64__)
+  float32x4_t a0 = vdupq_n_f32(0.0F);
+  float32x4_t a1 = vdupq_n_f32(0.0F);
+  std::size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    const uint16x8_t h = vld1q_u16(w + i);
+    const uint32x4_t lo = vshlq_n_u32(vmovl_u16(vget_low_u16(h)), 16);
+    const uint32x4_t hi = vshlq_n_u32(vmovl_u16(vget_high_u16(h)), 16);
+    a0 = vfmaq_f32(a0, vreinterpretq_f32_u32(lo), vld1q_f32(x + i));
+    a1 = vfmaq_f32(a1, vreinterpretq_f32_u32(hi), vld1q_f32(x + i + 4));
+  }
+  float r = vaddvq_f32(vaddq_f32(a0, a1));
+  for (; i < n; ++i) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(w[i]) << 16;
+    float f = 0.0F;
+    std::memcpy(&f, &bits, sizeof(f));
+    r += f * x[i];
+  }
+  return r;
+#else
+  float r = 0.0F;
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::uint32_t bits = static_cast<std::uint32_t>(w[i]) << 16;
+    float f = 0.0F;
+    std::memcpy(&f, &bits, sizeof(f));
+    r += f * x[i];
+  }
+  return r;
+#endif
+}
 
 // f16-строка KV → dot(q, k) без промежуточного буфера. На aarch64 конверсия
 // и умножение идут SIMD-парами; суммарный порядок отличается от строго
@@ -120,20 +180,14 @@ void matvec_task(void* ctx, std::size_t chunk) {
   }
   for (uint32_t r = r0; r < r0 + n; ++r) {
     const uint8_t* row = t.data + static_cast<std::size_t>(r) * t.rb;
-    float acc = 0.0F;
     if (t.quant == QuantType::F32) {
-      const float* w = reinterpret_cast<const float*>(row);
-      for (uint32_t i = 0; i < t.in; ++i) acc += w[i] * t.x[i];
+      t.y[r] = dot_f32_neon(reinterpret_cast<const float*>(row), t.x, t.in);
+    } else if (t.quant == QuantType::Bf16) {
+      t.y[r] = dot_bf16_neon(reinterpret_cast<const std::uint16_t*>(row),
+                             t.x, t.in);
     } else {
-      const uint16_t* w = reinterpret_cast<const uint16_t*>(row);
-      for (uint32_t i = 0; i < t.in; ++i) {
-        const uint32_t bits = static_cast<uint32_t>(w[i]) << 16;
-        float f = 0.0F;
-        std::memcpy(&f, &bits, sizeof(f));
-        acc += f * t.x[i];
-      }
+      t.y[r] = 0.0F;
     }
-    t.y[r] = acc;
   }
 }
 
@@ -556,6 +610,24 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
   const std::size_t dn_size =
       static_cast<std::size_t>(L.down_exps.rb) * L.down_exps.rows;
   kernels::quantize_into(std::span<const float>(x, h), act_q8_);
+
+  // Optional readahead of the selected experts. The router already knows the
+  // 8 regions; kicking MADV_WILLNEED lets the kernel fetch them while the
+  // first workers are still computing. Off by default: on a phone it can
+  // overshoot the page cache.
+  static const bool prefetch_experts =
+      std::getenv("TOKSHIT_INK_PREFETCH_EXPERTS") != nullptr;
+  if (prefetch_experts) {
+    for (std::size_t k = 0; k < used; ++k) {
+      const std::size_t e = static_cast<std::size_t>(top_[k]);
+      (void)::madvise(
+          const_cast<uint8_t*>(data_ + L.gate_up_exps.base + e * gu_size),
+          gu_size, MADV_WILLNEED);
+      (void)::madvise(
+          const_cast<uint8_t*>(data_ + L.down_exps.base + e * dn_size),
+          dn_size, MADV_WILLNEED);
+    }
+  }
 
   {
     ExpertJob job;
