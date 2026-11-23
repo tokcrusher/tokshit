@@ -80,6 +80,22 @@ std::vector<std::size_t> cpus_by_freq(std::size_t total) {
   return order;
 }
 
+// explicit CPU mask for experiments: TOKSHIT_POOL_CPUS=2,3,4
+std::vector<std::size_t> parse_cpu_list(const char* s) {
+  std::vector<std::size_t> out;
+  if (s == nullptr) return out;
+  while (*s != '\0') {
+    while (*s == ',' || *s == ' ' || *s == '\t') ++s;
+    if (*s == '\0') break;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(s, &end, 10);
+    if (end == s) break;
+    out.push_back(static_cast<std::size_t>(v));
+    s = end;
+  }
+  return out;
+}
+
 // просим sched_fifo и отрицательный nice, обычно в отказ но попытка не пытка
 // ask for sched_fifo and a negative nice, usually denied but whatever
 void try_realtime() {
@@ -221,19 +237,36 @@ TaskPool::TaskPool() {
   const bool pin = std::getenv("TOKSHIT_POOL_PIN") != nullptr;
   const bool rt = std::getenv("TOKSHIT_POOL_RT") != nullptr;
   const bool stats = std::getenv("TOKSHIT_POOL_STATS") != nullptr;
-  const std::vector<std::size_t> order = cpus_by_freq(total);
+  std::vector<std::size_t> order = cpus_by_freq(total);
+  bool explicit_mask = false;
+  if (const char* cpus = std::getenv("TOKSHIT_POOL_CPUS")) {
+    std::vector<std::size_t> explicit_cpus = parse_cpu_list(cpus);
+    if (!explicit_cpus.empty()) {
+      order = std::move(explicit_cpus);
+      explicit_mask = true;
+    }
+  }
+#if defined(__aarch64__)
+  // The prime X4 is faster per thread but finishes its share early and then
+  // waits on the A720s. Keep the main thread on the fastest core and pin the
+  // workers to the next (more homogeneous) cores.
+  const bool skip_fastest = !explicit_mask && order.size() > 1;
+#else
+  const bool skip_fastest = false;
+#endif
 
   impl_->threads.reserve(impl_->workers);
   for (std::size_t i = 0; i < impl_->workers; ++i) {
     impl_->threads.emplace_back(
-        [this, i, pin, rt, stats, order]() {
+        [this, i, pin, rt, stats, order, skip_fastest]() {
           if (rt) try_realtime();
           const int rc = boost_uclamp();
           if (i == 0 && stats) {
             std::fprintf(stderr, "[pool] uclamp.min=1024 -> %d\n", rc);
           }
           if (pin && !order.empty()) {
-            pin_to_cpu(order[i % order.size()]);
+            const std::size_t slot = skip_fastest ? i + 1 : i;
+            pin_to_cpu(order[slot % order.size()]);
           }
           impl_->worker_loop();
         });
