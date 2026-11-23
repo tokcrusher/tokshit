@@ -112,20 +112,18 @@ Result<Model> Model::load(const std::string& path,
         const uint64_t rss = rss_mb();
         const uint64_t avail = mem_available_mb();
         std::fprintf(stderr,
-                     "[tokshit] prefault: %.2f GB touched, rss=%llu MB, "
+                     "[tokshit] prefault: %.2f GB touched, "
+                     "rss=%llu MB (mmap RSS; page cache is separate), "
                      "MemAvailable=%llu MB\n",
                      static_cast<double>(bytes.size()) / 1e9,
                      static_cast<unsigned long long>(rss),
                      static_cast<unsigned long long>(avail));
-        const uint64_t model_mb = bytes.size() / (1024 * 1024);
-        if (rss + 512 < model_mb) {
+        if (avail < 1024) {
           std::fprintf(stderr,
-                       "[tokshit] WARNING: model is not resident "
-                       "(rss %llu < %llu MB); page cache will thrash. "
-                       "Free memory, use --drop-siblings, or lower "
-                       "TOKSHIT_KV_CTX.\n",
-                       static_cast<unsigned long long>(rss),
-                       static_cast<unsigned long long>(model_mb));
+                       "[tokshit] WARNING: MemAvailable=%llu MB is low; "
+                       "page cache may thrash. Free memory or use "
+                       "--drop-siblings.\n",
+                       static_cast<unsigned long long>(avail));
         }
       }
       model.ink_ = std::move(ink);
