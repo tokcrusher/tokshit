@@ -239,14 +239,13 @@ top-2/2-pass configurations are forbidden for voice and for code.
 
 ## Measurements
 
-Startup is load-only. The old startup prefix is gone; the old 20-30 s
-startup numbers and all prefix-based latency tables are obsolete and were
-removed.
+Startup is load-only. All older latency numbers were measured with the
+removed startup warmup stage and are obsolete; those tables were deleted.
 
 | mode | ready (load-only) | notes |
 |---|---:|---|
-| English default/fast | 7-10 s | no startup prefix |
-| Russian fast | 6.8-9.1 s | no startup prefix |
+| English default/fast | 7-10 s | no warmup stage |
+| Russian fast | 6.8-9.1 s | no warmup stage |
 
 The TUI allows recording during `WARMING`; the turn queues and runs when
 the engine is ready. The first turn waits only for model load.
@@ -408,7 +407,6 @@ and the engine started producing broken answers.
 
 | symptom | cause / fix |
 |---|---|
-| startup takes 20-30 s | current startup is load-only and normally 7-10 s. Check `[engine] waiting for model lock` and thermal throttling; there is no extra warmup stage to wait for. |
 | `[engine] waiting for model lock` | another tokshit process holds the `safe_run` lock. Wait or stop it; this is not model loading. |
 | ASR `small` slows the turn | `base` is the default (3x realtime on 11 s); `small` is ~0.65x and takes the big cores. Use `--asr-model small` only for accuracy. |
 | `termux-microphone-record` hangs | Termux:API APK or RECORD_AUDIO permission is missing. Install the APK and grant Microphone. Test with `termux-microphone-record -f "$TMPDIR/mic-test.m4a" -l 5`. |
@@ -417,7 +415,7 @@ and the engine started producing broken answers.
 | answer cut at `Q:` or a newline marker | a stop marker fired. Tune `VOICE_STOP_AT` / `VOICE_STOP_AT2` / `VOICE_STOP_AT3`; empty disables one. |
 | answer stops after 3-5 tokens | a stop marker matched too early. Check the three stop values; leave the defaults unless you have a measured reason. |
 | answer stops mid-word | `--max-new` is too low; raise it. |
-| English answer drifts to French | use the default English directive; do not put a prefix or a non-English directive into `VOICE_FEWSHOT`. |
+| English answer drifts to French | use the default English directive; leave `VOICE_FEWSHOT` empty and do not inject a non-English directive. |
 | Russian answer drifts or mixes English | start with `scripts/chat --ru` or `--lang ru`; check `ASR_LANG=ru` and `TTS_VOICE=ru_RU-irina-medium`. |
 | Russian fast loops on turn 2 | top-4 is too small for Russian; use `--ru --fast` (top-6) and leave `VOICE_TOPK` unset. |
 | TTS sounds English in Russian mode | `ru_RU-irina-medium` is missing; install it in `~/audio/models`, or set `TTS_VOICE` explicitly. |
