@@ -85,6 +85,20 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   Keep `TOKSHIT_POOL_WORKERS=4` for chat decode (A/B: W=4 4.1–4.2,
   W=5 3.8–3.9, W=6 3.8–3.9); prefill can use 6 workers but decode is the
   long pole.
+- **Speed/quality tiers** (16-token decode, cool phone ~37–40 °C):
+  | mode | tok/s | quality |
+  |---|---:|---|
+  | lossless top-8 / 3 passes | **4.9–5.0** | reference |
+  | 2 passes, top-8 | 6.4 | coherent on QA |
+  | 2 passes, top-4 | 9.2 | degraded coding |
+  | 2 passes, top-3 | 10.5 | visibly garbled coding |
+  | 2 passes, top-2 + Q4 dense | 13.3 | heavy loss |
+  The last three are LOSSY; never default them for code. The lossless voice
+  path uses top-8/3 passes.
+- **Voice latency** (persistent, prefix warmup, base ASR, streaming TTS):
+  first token after the question **2.7 s**, first TTS ~3.2 s; second turn
+  **1.9 s** to first token / **2.45 s** to audio. Engine load 4.4 s + prefix
+  3.4 s happen at script start / while the user speaks.
 - Audio: `~/audio` has whisper.cpp ASR + Piper TTS; `scripts/voice_chat.py`
   and `voice_chat.md` are the bridge. The Termux:API APK is downloaded to
   `~/storage/downloads/termux-api-0.53.0.apk` (checksum verified) and the
