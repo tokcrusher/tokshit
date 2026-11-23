@@ -276,6 +276,13 @@ void multi_task(void* ctx, std::size_t task) {
 
 inline float sigmoidf(float x) { return 1.0F / (1.0F + std::exp(-x)); }
 
+std::uint32_t env_u32(const char* name, std::uint32_t def) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || *v == '\0') return def;
+  const unsigned long n = std::strtoul(v, nullptr, 10);
+  return n == 0 ? def : static_cast<std::uint32_t>(n);
+}
+
 void dump_vec(const char* name, const std::vector<float>& v) {
   const char* dir = std::getenv("TOKSHIT_INK_DUMP_DIR");
   if (dir == nullptr || *dir == '\0') return;
@@ -319,7 +326,7 @@ void Inkling2::matvec(const InkMeta& m, const float* x, float* y,
   }
   static const bool serial = std::getenv("TOKSHIT_INK_SERIAL") != nullptr;
   if (m.rows >= 256 && !serial) {
-    t.rows_per_task = 64;
+    t.rows_per_task = env_u32("TOKSHIT_INK_MV_CHUNK", 64);
     const std::size_t tasks = (m.rows + t.rows_per_task - 1) / t.rows_per_task;
     pool::run_tasks(tasks, matvec_task, &t);
   } else {
@@ -336,6 +343,7 @@ void Inkling2::matvec(const InkMeta& m, const float* x, float* y,
 void Inkling2::matvec_multi(std::span<const MatvecSeg> segs) {
   const auto t0 = std::chrono::steady_clock::now();
   MultiJob job;
+  job.chunk_rows = env_u32("TOKSHIT_INK_MULTI_CHUNK", 64);
   job.segs.reserve(segs.size());
   job.starts.reserve(segs.size() + 1);
   job.starts.push_back(0);
@@ -637,6 +645,7 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     job.rb = L.gate_up_exps.rb;
     job.in = L.gate_up_exps.in_dim;
     job.out_stride = static_cast<std::uint32_t>(2 * nff);
+    job.chunk_rows = env_u32("TOKSHIT_INK_EXPERT_CHUNK", 64);
     job.chunks = (job.rows + job.chunk_rows - 1) / job.chunk_rows;
     job.quant = L.gate_up_exps.quant;
     job.act = &act_q8_;
@@ -673,6 +682,7 @@ void Inkling2::moe(const InkLayer& L, const float* x, float* out) {
     job.rb = L.down_exps.rb;
     job.in = L.down_exps.in_dim;
     job.out_stride = static_cast<std::uint32_t>(h);
+    job.chunk_rows = env_u32("TOKSHIT_INK_EXPERT_CHUNK", 64);
     job.chunks = (job.rows + job.chunk_rows - 1) / job.chunk_rows;
     job.quant = L.down_exps.quant;
     job.act_block = act_all_q8_.data();
