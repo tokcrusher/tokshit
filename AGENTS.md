@@ -62,9 +62,26 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   **10.04–10.56 tok/s** burst/short and **9.2–9.4 tok/s** on a 24-token
   coding prompt. Quality is visibly degraded; never present as lossless.
 - `--passes 2` alone ~2.5; top2+Q4+passes2 is the 9–10.5 configuration.
-  Batched prefill B=32 was slower; keep sequential.
-- Audio: a subagent is downloading tiny ASR/TTS models (whisper.cpp small/base
-  + sherpa-onnx/Piper) into `~/audio/` for future voice integration.
+  Batched prefill is now wired for Inkling2 (`TOKSHIT_INK_PREFILL_BATCH`,
+  default 16, `TOKSHIT_INK_PREFILL_ONLY_LAST`); it is exact but so far only
+  matches sequential speed (~3–4 tok/s), because MoE compute, not dense
+  weight streaming, dominates. Hundreds of tok/s requires faster expert
+  kernels, not just batching.
+- **Voice** (`scripts/voice_chat.py`): one persistent `build/tokshit` chat
+  process per session (no 9–11 s reload per turn), `TOKSHIT_CHAT_PROTOCOL=1`
+  (stdout turn framing with `0x1e`), streaming token output, sentence-level
+  streaming TTS. Verified raw few-shot recipe:
+  `TOKSHIT_RAW_PROMPT=1 TOKSHIT_CHAT_UNESCAPE=1 TOKSHIT_STOP_AT=Q:`
+  with first turn `Q: Capital of Germany?\nA: Berlin.\nQ: <user>\nA:` and later
+  turns `\nQ: <user>\nA:`; answers are ~8–10 tokens and direct, no visible
+  reasoning preamble. `TOKSHIT_STOP_AT2` adds a second stop marker.
+  Keep `TOKSHIT_POOL_WORKERS=4` (A/B: W=4 4.1–4.2, W=5 3.8–3.9, W=6 3.8–3.9).
+- Audio: `~/audio` has whisper.cpp ASR + Piper TTS; `scripts/voice_chat.py`
+  and `voice_chat.md` are the bridge. The Termux:API APK is downloaded to
+  `~/storage/downloads/termux-api-0.53.0.apk` (checksum verified) and the
+  installer was opened; the user must tap Install and grant Microphone.
+  `termux-api` CLI package is installed; the APK was missing, which is why
+  `termux-microphone-record` hung.
 
 ## Goal
 
