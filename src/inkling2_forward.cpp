@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "tokshit/batch.hpp"
 #include "tokshit/dequant.hpp"
 #include "tokshit/kernels.hpp"
@@ -17,6 +21,74 @@
 
 namespace tokshit {
 namespace {
+
+// Временный профилировщик внимания (не трогает общий Inkling2-класс).
+double g_prof_attn_ns = 0.0;
+double g_prof_attn_local_ns = 0.0;
+double g_prof_attn_global_ns = 0.0;
+
+// f16-строка KV → dot(q, k) без промежуточного буфера. На aarch64 конверсия
+// и умножение идут SIMD-парами; суммарный порядок отличается от строго
+// последовательного только группировкой по 4/8 (ошибка ~1e-7).
+inline float dot_f16(const float* a, const uint16_t* b, std::size_t n) {
+#if defined(__aarch64__)
+  const auto* h = reinterpret_cast<const float16_t*>(b);
+  float32x4_t s0 = vdupq_n_f32(0.0F);
+  float32x4_t s1 = vdupq_n_f32(0.0F);
+  std::size_t i = 0;
+  for (; i + 16 <= n; i += 16) {
+    const float16x8_t h0 = vld1q_f16(h + i);
+    const float16x8_t h1 = vld1q_f16(h + i + 8);
+    s0 = vfmaq_f32(s0, vld1q_f32(a + i), vcvt_f32_f16(vget_low_f16(h0)));
+    s1 = vfmaq_f32(s1, vld1q_f32(a + i + 4), vcvt_f32_f16(vget_high_f16(h0)));
+    s0 = vfmaq_f32(s0, vld1q_f32(a + i + 8), vcvt_f32_f16(vget_low_f16(h1)));
+    s1 = vfmaq_f32(s1, vld1q_f32(a + i + 12), vcvt_f32_f16(vget_high_f16(h1)));
+  }
+  for (; i + 8 <= n; i += 8) {
+    const float16x8_t h0 = vld1q_f16(h + i);
+    s0 = vfmaq_f32(s0, vld1q_f32(a + i), vcvt_f32_f16(vget_low_f16(h0)));
+    s1 = vfmaq_f32(s1, vld1q_f32(a + i + 4), vcvt_f32_f16(vget_high_f16(h0)));
+  }
+  float r = vaddvq_f32(vaddq_f32(s0, s1));
+  for (; i < n; ++i) r += a[i] * f16_to_f32(b[i]);
+  return r;
+#else
+  float r = 0.0F;
+  for (std::size_t i = 0; i < n; ++i) r += a[i] * f16_to_f32(b[i]);
+  return r;
+#endif
+}
+
+// acc += w * f16-строка v
+inline void axpy_f16(float* acc, float w, const uint16_t* v, std::size_t n) {
+#if defined(__aarch64__)
+  const auto* h = reinterpret_cast<const float16_t*>(v);
+  const float32x4_t wv = vdupq_n_f32(w);
+  std::size_t i = 0;
+  for (; i + 16 <= n; i += 16) {
+    const float16x8_t h0 = vld1q_f16(h + i);
+    const float16x8_t h1 = vld1q_f16(h + i + 8);
+    vst1q_f32(acc + i,
+              vfmaq_f32(vld1q_f32(acc + i), wv, vcvt_f32_f16(vget_low_f16(h0))));
+    vst1q_f32(acc + i + 4, vfmaq_f32(vld1q_f32(acc + i + 4), wv,
+                                     vcvt_f32_f16(vget_high_f16(h0))));
+    vst1q_f32(acc + i + 8,
+              vfmaq_f32(vld1q_f32(acc + i + 8), wv, vcvt_f32_f16(vget_low_f16(h1))));
+    vst1q_f32(acc + i + 12, vfmaq_f32(vld1q_f32(acc + i + 12), wv,
+                                      vcvt_f32_f16(vget_high_f16(h1))));
+  }
+  for (; i + 8 <= n; i += 8) {
+    const float16x8_t h0 = vld1q_f16(h + i);
+    vst1q_f32(acc + i,
+              vfmaq_f32(vld1q_f32(acc + i), wv, vcvt_f32_f16(vget_low_f16(h0))));
+    vst1q_f32(acc + i + 4, vfmaq_f32(vld1q_f32(acc + i + 4), wv,
+                                     vcvt_f32_f16(vget_high_f16(h0))));
+  }
+  for (; i < n; ++i) acc[i] += w * f16_to_f32(v[i]);
+#else
+  for (std::size_t i = 0; i < n; ++i) acc[i] += w * f16_to_f32(v[i]);
+#endif
+}
 
 struct MvTask {
   const uint8_t* data = nullptr;
@@ -380,9 +452,12 @@ void Inkling2::attention(const InkLayer& L, std::size_t slot, std::size_t pos,
   auto& st = slots_[slot];
 
   // relative bias: table[e][head] = sum_i rel_bias[e][i] * R[i][head]
+  // Скоры используют только d = min(pos - p, extent) <= min(pos, extent),
+  // поэтому более далёкие строки таблицы на этом токене не нужны.
   const std::size_t nr = n_relative_;
   const std::size_t extent = relative_extent_;
-  for (std::size_t e = 0; e <= extent; ++e) {
+  const std::size_t emax = std::min(extent, pos);
+  for (std::size_t e = 0; e <= emax; ++e) {
     const float* row = (e < extent) ? (L.rel_bias.data() + e * nr) : nullptr;
     for (std::size_t hh = 0; hh < nh; ++hh) {
       float acc = 0.0F;
@@ -406,11 +481,8 @@ void Inkling2::attention(const InkLayer& L, std::size_t slot, std::size_t pos,
     std::size_t n = 0;
     for (std::size_t p = p0; p <= pos; ++p) {
       const std::size_t d = pos - p < extent ? pos - p : extent;
-      float dot = 0.0F;
       const uint16_t* krow = st.k.data() + p * kvd + kh * hd;
-      for (std::size_t i = 0; i < hd; ++i) {
-        dot += q[i] * f16_to_f32(krow[i]);
-      }
+      const float dot = dot_f16(q, krow, hd);
       const float s = mlx_attn
                           ? dot * scale + table_[d * nh + hh]
                           : (dot + table_[d * nh + hh] - sink_[hh]) * scale;
@@ -426,9 +498,8 @@ void Inkling2::attention(const InkLayer& L, std::size_t slot, std::size_t pos,
     float* o = out + hh * hd;
     std::fill(o, o + hd, 0.0F);
     for (std::size_t i = 0; i < n; ++i) {
-      const float p = scores_[i] * inv;
       const uint16_t* vrow = st.v.data() + (p0 + i) * kvd + kh * hd;
-      for (std::size_t d = 0; d < hd; ++d) o[d] += p * f16_to_f32(vrow[d]);
+      axpy_f16(o, scores_[i] * inv, vrow, hd);
     }
   }
   (void)in_k;
@@ -857,8 +928,22 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
       if (pos + 1 > st.high) st.high = pos + 1;
     }
 
-    attention(L, slot, pos, swa, tau, q_.data(), k_.data(), v_.data(),
-              attn_.data());
+    {
+      const auto ta0 = std::chrono::steady_clock::now();
+      attention(L, slot, pos, swa, tau, q_.data(), k_.data(), v_.data(),
+                attn_.data());
+      if (std::getenv("TOKSHIT_INK_ATTN_PROF") != nullptr) {
+        const double ns = std::chrono::duration<double, std::nano>(
+                              std::chrono::steady_clock::now() - ta0)
+                              .count();
+        g_prof_attn_ns += ns;
+        if (swa) {
+          g_prof_attn_local_ns += ns;
+        } else {
+          g_prof_attn_global_ns += ns;
+        }
+      }
+    }
 
     // gated attention output
     for (std::size_t i = 0; i < attn_.size(); ++i) {
@@ -1102,6 +1187,16 @@ void Inkling2::token_logits(uint32_t token, std::size_t pos,
                  token, pos, prof_mv_ns_ / 1e6, prof_moe_ns_ / 1e6);
     prof_mv_ns_ = 0.0;
     prof_moe_ns_ = 0.0;
+  }
+  if (std::getenv("TOKSHIT_INK_ATTN_PROF") != nullptr) {
+    std::fprintf(stderr,
+                 "[attn] token=%u pos=%zu total=%.3fms local=%.3fms "
+                 "global=%.3fms\n",
+                 token, pos, g_prof_attn_ns / 1e6, g_prof_attn_local_ns / 1e6,
+                 g_prof_attn_global_ns / 1e6);
+    g_prof_attn_ns = 0.0;
+    g_prof_attn_local_ns = 0.0;
+    g_prof_attn_global_ns = 0.0;
   }
   out.resize(vocab_unpadded_);
   std::copy(logits_.begin(), logits_.begin() + vocab_unpadded_, out.begin());
