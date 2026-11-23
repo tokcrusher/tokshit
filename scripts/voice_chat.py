@@ -552,8 +552,32 @@ def engine_path(args: argparse.Namespace) -> Path:
     return Path(args.engine or os.environ.get("VOICE_ENGINE") or DEFAULT_ENGINE)
 
 
+MODEL_ALIASES = {
+    "inkling": HOME / "Inkling-2-Mini-GGUF" / "Inkling-2-Mini-UD-Q2_K_XL.gguf",
+    "inkling2": HOME / "Inkling-2-Mini-GGUF" / "Inkling-2-Mini-UD-Q2_K_XL.gguf",
+    "inkling-mini": HOME / "Inkling-2-Mini-GGUF" / "Inkling-2-Mini-UD-Q2_K_XL.gguf",
+    "flint": HOME / "models" / "flint-UD-Q3_K_XL.gguf",
+    "dspark": HOME / "Inkling-2-Mini-GGUF" / "dspark-Inkling-2-Mini-Q8_0.gguf",
+    "mmproj": HOME / "Inkling-2-Mini-GGUF" / "mmproj-F16.gguf",
+}
+
+
+def resolve_model_name(name: str) -> Path:
+    p = Path(name)
+    if "/" in name or p.suffix == ".gguf":
+        return p
+    if name in MODEL_ALIASES:
+        return MODEL_ALIASES[name]
+    for d in (HOME / "Inkling-2-Mini-GGUF", HOME / "models", HOME):
+        for cand in (d / name, d / f"{name}.gguf"):
+            if cand.is_file():
+                return cand
+    return p
+
+
 def engine_model() -> Path:
-    return Path(os.environ.get("VOICE_MODEL", DEFAULT_MODEL))
+    raw = os.environ.get("VOICE_MODEL")
+    return resolve_model_name(raw) if raw else DEFAULT_MODEL
 
 
 def check_assets(args: argparse.Namespace) -> dict:
@@ -3619,6 +3643,10 @@ def main() -> int:
                     help="whisper model: small/base/tiny or a .bin path")
     ap.add_argument("--engine", default=os.environ.get("VOICE_ENGINE"),
                     help="toksjit binary for persistent chat (default build/tokshit)")
+    ap.add_argument("--models", action="store_true",
+                    help="list available .gguf models and exit")
+    ap.add_argument("--model",
+                    help="model name/path: inkling, flint, dspark, or a .gguf path")
     ap.add_argument("--chat-template", action="store_true",
                     help="opt-in: native Inkling template instead of raw Q/A few-shot")
     ap.add_argument("--no-play", action="store_true",
@@ -3645,6 +3673,12 @@ def main() -> int:
     ap.add_argument("--lang", choices=("en", "ru"), default=None,
                     help="language: en or ru (default: VOICE_LANG or en)")
     args = ap.parse_args()
+
+    if args.models:
+        subprocess.run([str(engine_path(args)), "--models"], check=False)
+        return 0
+    if args.model:
+        os.environ["VOICE_MODEL"] = str(resolve_model_name(args.model))
 
     if args.clean_text is not None:
         print(clean_for_speech(args.clean_text))

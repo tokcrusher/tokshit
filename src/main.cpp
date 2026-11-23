@@ -58,7 +58,16 @@ void drop_sibling_gguf(const std::string& model_path) {
 int main(int argc, char** argv) {
   cli::apply_env_presets();
   cli::apply_flags(argc, argv);
-  std::string path = argc > 1 ? argv[1] : cli::default_model_path();
+  // --model / TOKSHIT_MODEL: the positional argv[1] is the prompt, not the
+  // model. Without it, argv[1] is the model (legacy form). This keeps
+  // `tokshit --model inkling "hi" 16` and `tokshit model.gguf "hi" 16` both
+  // correct instead of silently treating the prompt as a model path.
+  const char* model_env = std::getenv("TOKSHIT_MODEL");
+  const bool model_from_flag = model_env != nullptr && *model_env != '\0';
+  std::string path = model_from_flag
+                         ? std::string(model_env)
+                         : (argc > 1 ? argv[1] : cli::default_model_path());
+  const int pbase = model_from_flag ? 1 : 2;
 
   const auto t0 = tokshit::Clock::now();
   tokshit::ModelOptions options;
@@ -152,18 +161,20 @@ int main(int argc, char** argv) {
   if (const char* bt = std::getenv("TOKSHIT_INK_BATCH_TEST");
       bt != nullptr && *bt != '\0') {
     const std::size_t group =
-        argc > 3 ? static_cast<std::size_t>(std::strtoull(argv[3], nullptr, 10))
-                 : 3;
-    cli::ink_batch_debug(model, tok, argc > 2 ? argv[2] : "hi", group);
+        argc > pbase + 1
+            ? static_cast<std::size_t>(std::strtoull(argv[pbase + 1], nullptr, 10))
+            : 3;
+    cli::ink_batch_debug(model, tok, argc > pbase ? argv[pbase] : "hi", group);
     return 0;
   }
 
   if (const char* draft_path = std::getenv("TOKSHIT_DSPARK_DEBUG");
       draft_path != nullptr && *draft_path != '\0') {
     const std::size_t steps =
-        argc > 3 ? static_cast<std::size_t>(std::strtoull(argv[3], nullptr, 10))
-                 : 16;
-    cli::dspark_debug(model, tok, argc > 2 ? argv[2] : "hi", steps,
+        argc > pbase + 1
+            ? static_cast<std::size_t>(std::strtoull(argv[pbase + 1], nullptr, 10))
+            : 16;
+    cli::dspark_debug(model, tok, argc > pbase ? argv[pbase] : "hi", steps,
                       draft_path);
     return 0;
   }
@@ -171,21 +182,23 @@ int main(int argc, char** argv) {
   // Teacher-forced verify: сравнить draft с эталонными id и посчитать acceptance.
   if (const char* v = std::getenv("TOKSHIT_VERIFY_IDS");
       v != nullptr && *v != '\0') {
-    cli::verify_ids(model, tok, argc > 2 ? argv[2] : "hi", v,
-                    argc > 3 ? static_cast<std::size_t>(
-                                   std::strtoull(argv[3], nullptr, 10))
-                             : 0);
+    cli::verify_ids(model, tok, argc > pbase ? argv[pbase] : "hi", v,
+                    argc > pbase + 1
+                        ? static_cast<std::size_t>(
+                              std::strtoull(argv[pbase + 1], nullptr, 10))
+                        : 0);
     return 0;
   }
 
   const char* prompt_file = std::getenv("TOKSHIT_PROMPT_FILE");
   const bool has_prompt_file = prompt_file != nullptr && *prompt_file != '\0';
-  bool have_prompt = argc > 2;
+  bool have_prompt = argc > pbase;
   if (have_prompt || has_prompt_file) {
     const std::size_t max_new =
-        argc > 3 ? static_cast<std::size_t>(std::strtoull(argv[3], nullptr, 10))
-                 : 12;
-    std::string prompt = have_prompt ? argv[2] : "";
+        argc > pbase + 1
+            ? static_cast<std::size_t>(std::strtoull(argv[pbase + 1], nullptr, 10))
+            : 12;
+    std::string prompt = have_prompt ? argv[pbase] : "";
     if (has_prompt_file) {
       if (FILE* f = std::fopen(prompt_file, "rb"); f != nullptr) {
         prompt.clear();

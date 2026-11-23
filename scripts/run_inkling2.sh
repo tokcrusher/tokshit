@@ -7,12 +7,19 @@
 set -euo pipefail
 
 ROOT=/data/data/com.termux/files/home/tokshit
-MODEL=/data/data/com.termux/files/home/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf
+MODEL="${TOKSHIT_MODEL:-/data/data/com.termux/files/home/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf}"
 BIN="$ROOT/build/tokshit"
 GUARD="$ROOT/scripts/safe_run.sh"
 
-if [[ ! -f "$MODEL" ]]; then
-  echo "model not found: $MODEL" >&2
+if [ "${1:-}" = "--models" ]; then
+  exec "$BIN" --models
+fi
+if [ "${1:-}" = "--model" ]; then
+  MODEL="${2:?--model needs a name or path}"
+  shift 2
+fi
+if [[ "$MODEL" == */* && ! -f "$MODEL" ]]; then
+  echo "model not found: $MODEL (use --models)" >&2
   exit 1
 fi
 if [[ ! -x "$BIN" ]]; then
@@ -29,4 +36,4 @@ export TOKSHIT_POOL_WORKERS="${TOKSHIT_POOL_WORKERS:-4}"
 export TOKSHIT_POOL_PIN="${TOKSHIT_POOL_PIN:-1}"
 export TOKSHIT_TEMPERATURE="${TOKSHIT_TEMPERATURE:-0}"
 
-exec "$GUARD" "$BIN" --temperature "$TOKSHIT_TEMPERATURE" "$MODEL" "$@"
+exec "$GUARD" "$BIN" --temperature "$TOKSHIT_TEMPERATURE" --model "$MODEL" "$@"

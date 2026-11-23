@@ -20,13 +20,26 @@ bash scripts/check_links.sh
 
 ## Run
 
-Use `scripts/run_inkling2.sh` (robust launcher) or:
+Model selection is explicit:
+
+```sh
+./build/tokshit --models              # list .gguf files and exit
+./build/tokshit --model inkling "hi" 16
+./build/tokshit --model flint  "hi" 16
+scripts/chat --models                 # same list, voice wrapper
+scripts/chat --model inkling          # TUI on Inkling
+```
+
+Without `--model`/`TOKSHIT_MODEL` the default is the Inkling GGUF if it
+exists, otherwise Flint. The old "silently run Flint" fallback is gone.
+
+Direct env form (advanced):
 
 ```sh
 env TOKSHIT_MIN_AVAIL_MB=1200 TOKSHIT_HOT=0 TOKSHIT_EXPERT_CACHE_MB=512 \
   TOKSHIT_PREFAULT=1 TOKSHIT_KV_CTX=512 TOKSHIT_POOL_WORKERS=4 \
   TOKSHIT_POOL_PIN=1 scripts/safe_run.sh build/tokshit --temperature 0 \
-  /data/data/com.termux/files/home/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf "hi" 16
+  --model inkling "hi" 16
 ```
 
 Always one model process at a time; `scripts/safe_run.sh` holds the lock and

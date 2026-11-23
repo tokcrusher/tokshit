@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -105,10 +106,20 @@ std::string default_model_path() {
       v != nullptr && *v != '\0') {
     return v;
   }
-  if (const char* home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-    return std::string(home) + "/models/flint-UD-Q3_K_XL.gguf";
-  }
-  return "/data/data/com.termux/files/home/models/flint-UD-Q3_K_XL.gguf";
+  const char* home = std::getenv("HOME");
+  const std::string h =
+      (home != nullptr && *home != '\0') ? std::string(home)
+                                         : std::string("/data/data/com.termux/files/home");
+  const std::string inkling =
+      h + "/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf";
+  const std::string flint = h + "/models/flint-UD-Q3_K_XL.gguf";
+  std::error_code ec;
+  if (std::filesystem::exists(inkling, ec)) return inkling;
+  ec.clear();
+  if (std::filesystem::exists(flint, ec)) return flint;
+  // Nothing found: return the Inkling path so the error names the model the
+  // user is actually working with, not a silent Flint fallback.
+  return inkling;
 }
 
 // параметры сэмплинга из env: температура, top-k, top-p

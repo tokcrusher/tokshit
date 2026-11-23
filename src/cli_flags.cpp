@@ -1,14 +1,87 @@
 #include "cli.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #include "tokshit/tui.hpp"
 
 namespace tokshit::cli {
+
+namespace {
+
+std::string home_dir() {
+  const char* home = std::getenv("HOME");
+  return (home != nullptr && *home != '\0')
+             ? std::string(home)
+             : std::string("/data/data/com.termux/files/home");
+}
+
+bool file_exists(const std::string& p) {
+  struct stat st {};
+  return ::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::string resolve_model_arg(const std::string& v) {
+  if (v.find('/') != std::string::npos) return v;
+  const std::string h = home_dir();
+  if (v == "inkling" || v == "inkling2" || v == "inkling-mini") {
+    return h + "/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf";
+  }
+  if (v == "flint") return h + "/models/flint-UD-Q3_K_XL.gguf";
+  if (v == "dspark") {
+    return h + "/Inkling-2-Mini-GGUF/dspark-Inkling-2-Mini-Q8_0.gguf";
+  }
+  if (v == "mmproj") return h + "/Inkling-2-Mini-GGUF/mmproj-F16.gguf";
+  const std::string dirs[] = {h + "/Inkling-2-Mini-GGUF", h + "/models", h};
+  for (const std::string& d : dirs) {
+    const std::string direct = d + "/" + v;
+    if (file_exists(direct)) return direct;
+    const std::string gguf = direct + ".gguf";
+    if (file_exists(gguf)) return gguf;
+  }
+  return v;
+}
+
+void print_models() {
+  const std::string h = home_dir();
+  const std::string dirs[] = {h + "/Inkling-2-Mini-GGUF", h + "/models", h};
+  std::printf("available .gguf models:\n");
+  std::size_t n = 0;
+  for (const std::string& d : dirs) {
+    DIR* dir = ::opendir(d.c_str());
+    if (dir == nullptr) continue;
+    while (dirent* e = ::readdir(dir)) {
+      const std::string name = e->d_name;
+      if (name.size() < 6 ||
+          name.compare(name.size() - 5, 5, ".gguf") != 0) {
+        continue;
+      }
+      const std::string full = d + "/" + name;
+      struct stat st {};
+      if (::stat(full.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+      std::printf("  %-46s %7.2f GB  %s\n", name.c_str(),
+                  static_cast<double>(st.st_size) / 1e9, full.c_str());
+      ++n;
+    }
+    ::closedir(dir);
+  }
+  if (n == 0) {
+    std::printf("  (none found in %s/Inkling-2-Mini-GGUF, %s/models)\n",
+                h.c_str(), h.c_str());
+  }
+  std::printf(
+      "\nuse:  tokshit --model <name|path> [prompt] [max_new]\n"
+      "      names: inkling, flint, dspark, mmproj, or a .gguf basename\n");
+}
+
+}  // namespace
 
 // единственный источник правды о флагах — tokshit::tui::flag_docs(): по нему
 // печатается --help и разбираются аргументы, так что новый флаг нельзя
@@ -100,6 +173,10 @@ void apply_flags(int& argc, char** argv) {
       print_help();
       std::exit(0);
     }
+    if (a == "--models") {
+      print_models();
+      std::exit(0);
+    }
     // "--" дальше не флаги: промпт может начинаться с дефиса
     if (a == "--") {
       for (++i; i < argc; ++i) pos.emplace_back(argv[i]);
@@ -129,6 +206,7 @@ void apply_flags(int& argc, char** argv) {
       }
     }
     if (!has_val) val = "1";
+    if (name == "model") val = resolve_model_arg(val);
     if (apply_preset(name)) continue;
     const char* env = env_for_flag(name);
     if (env == nullptr) {

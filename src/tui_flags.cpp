@@ -20,7 +20,8 @@ namespace {
 constexpr FlagDoc kFlags[] = {
     // Запуск и модель
     {"model", "TOKSHIT_MODEL", "FILE", FlagGroup::Run,
-     "путь к .gguf-модели; иначе TOKSHIT_MODEL или вшитый", "встроенный"},
+     "путь или имя: inkling, flint, dspark, mmproj; иначе TOKSHIT_MODEL",
+     "Inkling, если найден"},
     {"prompt-file", "TOKSHIT_PROMPT_FILE", "FILE", FlagGroup::Run,
      "читать промпт из файла, а не из argv", "нет"},
     {"layers", "GGUF_NLAYERS", "N", FlagGroup::Run,
@@ -198,15 +199,18 @@ std::string_view group_title(FlagGroup group) noexcept {
 std::string help_text(std::string_view default_model) {
   std::string out;
   append_line(out,
-              "токшит — MoE-рантайм для Flint-40B-A2.5B на C++20 (Termux).");
+              "токшит — MoE-рантайм для Flint / Inkling-2-Mini на C++20 (Termux).");
   out.push_back('\n');
   append_line(out, "использование:");
-  append_line(out, "  tokshit [флаги] <model.gguf> [промпт] [max_new]");
-  append_line(out, "  tokshit [флаги] <model.gguf> --prompt-file <файл> [max_new]");
-  append_line(out, "  tokshit [флаги]                 # интерактивный чат");
+  append_line(out, "  tokshit --model <имя|путь> [промпт] [max_new]");
+  append_line(out, "  tokshit <model.gguf> [промпт] [max_new]");
+  append_line(out, "  tokshit [флаги]                # интерактивный чат");
+  append_line(out, "  tokshit --models               # список .gguf и выход");
   out.push_back('\n');
-  append_line(out, "без промпта запускается чат; модель по умолчанию:");
+  append_line(out, "без --model берётся TOKSHIT_MODEL, иначе модель по умолчанию:");
   append_line(out, "  " + std::string(default_model));
+  out.push_back('\n');
+  append_line(out, "имена: inkling, flint, dspark, mmproj или basename .gguf.");
   out.push_back('\n');
   append_line(out,
               "флаги: --имя значение или --имя=значение. У каждого флага есть");

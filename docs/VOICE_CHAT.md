@@ -32,6 +32,9 @@ All arguments after the script name reach the backend unchanged.
 cd ~/tokshit
 
 scripts/chat --check          # dependencies, engine, models, player; no TUI
+scripts/chat --models         # list .gguf files and exit
+scripts/chat --model inkling  # select by name: inkling, flint, dspark, path
+scripts/chat --model ~/models/MiniCPM5-2B-Q4_K_M.gguf --no-tui --text "hi"
 scripts/chat                  # interactive TUI, English
 scripts/chat --ru             # Russian ASR + Russian TTS + RU fast experts
 scripts/chat --lang ru        # same language switch
@@ -330,7 +333,8 @@ the TUI reports that engine clearing failed.
 | variable | default | meaning |
 |---|---|---|
 | `VOICE_ENGINE` / `--engine` | `~/tokshit/build/tokshit` | persistent chat binary (not the launcher) |
-| `VOICE_MODEL` | `~/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf` | GGUF |
+| `VOICE_MODEL` / `--model` | `~/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q2_K_XL.gguf` | GGUF; accepts `inkling`, `flint`, `dspark`, basename, or path |
+| `--models` | - | list available `.gguf` and exit |
 | `VOICE_MAX_NEW` | `64` | tokens per turn |
 | `VOICE_LANG` | `en` | `en` or `ru`; `--ru` wins, then `--lang` |
 | `VOICE_ASR_MODEL` | auto: base -> tiny; small only if explicit | whisper model; small is slow |
