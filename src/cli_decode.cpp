@@ -1,5 +1,6 @@
 #include "cli.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -25,6 +26,36 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
   Utf8Buffer utf8;
   ReasoningBudget reasoning(reasoning_budget);
   const auto t0 = Clock::now();
+
+  // Стриминговый стоп-фильтр: TOKSHIT_STOP_AT / TOKSHIT_STOP_AT2 (например
+  // "\n" и "Q:") обрывают ход, не выводя сам маркер. Хвост длиной maxlen-1
+  // держим, чтобы маркер не протёк в stdout по частям.
+  std::vector<std::string> stops;
+  auto add_stop = [&](const char* sv) {
+    if (sv == nullptr || *sv == '\0') return;
+    std::string s;
+    for (std::size_t i = 0; sv[i] != '\0'; ++i) {
+      if (sv[i] == '\\' && sv[i + 1] == 'n') {
+        s.push_back('\n');
+        ++i;
+      } else {
+        s.push_back(sv[i]);
+      }
+    }
+    if (!s.empty()) stops.push_back(std::move(s));
+  };
+  add_stop(std::getenv("TOKSHIT_STOP_AT"));
+  add_stop(std::getenv("TOKSHIT_STOP_AT2"));
+  std::size_t max_stop = 0;
+  for (const auto& s : stops) max_stop = std::max(max_stop, s.size());
+  std::string held;
+  bool stopped = false;
+  auto emit = [&](std::string_view s) {
+    if (s.empty()) return;
+    std::fwrite(s.data(), 1, s.size(), stdout);
+    std::fflush(stdout);
+    result.text.append(s);
+  };
 
   for (;;) {
     if (options.check_interrupt && g_interrupt != 0) {
@@ -53,14 +84,47 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
     } else {
       chunk = utf8.push(tok.token_bytes(next));
     }
-    if (!control || !chunk.empty()) {
-      if (!chunk.empty()) {
-        std::fwrite(chunk.data(), 1, chunk.size(), stdout);
-        std::fflush(stdout);
-        result.text.append(chunk);
+    if (!chunk.empty()) {
+      if (stops.empty()) {
+        emit(chunk);
+      } else {
+        held.append(chunk);
+        bool stop_now = false;
+        for (;;) {
+          std::size_t best = std::string::npos;
+          std::size_t best_len = 0;
+          for (const auto& s : stops) {
+            const std::size_t p = held.find(s);
+            if (p != std::string::npos && p < best) {
+              best = p;
+              best_len = s.size();
+            }
+          }
+          if (best == std::string::npos) break;
+          if (best == 0 && result.text.empty()) {
+            // ведущий маркер (обычно \n) не должен давать пустой ответ
+            held.erase(0, best_len);
+            continue;
+          }
+          emit(std::string_view(held).substr(0, best));
+          held.clear();
+          stop_now = true;
+          break;
+        }
+        if (stop_now) {
+          stopped = true;
+        } else {
+          const std::size_t keep = max_stop > 0 ? max_stop - 1 : 0;
+          if (held.size() > keep) {
+            const std::size_t n = held.size() - keep;
+            emit(std::string_view(held).substr(0, n));
+            held.erase(0, n);
+          }
+        }
       }
     }
     ++result.generated;
+    if (stopped) break;
     if (result.generated >= options.max_new) break;
 
     if (options.pin_every) {
@@ -141,7 +205,8 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
     }
   }
 
-  const std::string tail = reasoning.in_think() ? std::string{} : utf8.flush();
+  std::string tail = reasoning.in_think() ? std::string{} : utf8.flush();
+  if (!stopped) tail += held;
   if (!tail.empty()) {
     std::fwrite(tail.data(), 1, tail.size(), stdout);
     result.text.append(tail);

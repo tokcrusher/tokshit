@@ -6,12 +6,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <string>
 #include <vector>
 
 #include <unistd.h>
 
 #include "env.hpp"
+#include "tokshit/inkling2.hpp"
 #include "tokshit/metrics.hpp"
 #include "tokshit/model.hpp"
 #include "tokshit/pool.hpp"
@@ -109,6 +111,10 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   ChatSession s;
   s.kv.assign(model.n_layers(), std::vector<float>{});
   s.params = sample_params_from_env();
+  if (const char* sp = std::getenv("TOKSHIT_SYSTEM_PROMPT");
+      sp != nullptr) {
+    s.system_prompt = sp;
+  }
   s.cache_budget_mb = tokshit::env_u64("TOKSHIT_EXPERT_CACHE_MB", 1024);
   s.reasoning_budget = reasoning_budget_from_env();
   tokshit::Rng rng;
@@ -118,6 +124,16 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
   if (const char* v = std::getenv("TOKSHIT_DUMP_LOGITS");
       v != nullptr && *v != '\0') {
     dump = std::fopen(v, "wb");
+  }
+  // Машинный протокол для внешних клиентов (voice_chat): каждый ответ
+  // завершается байтом 0x1e (RS) без перевода строки, а логи остаются в
+  // stderr. Позволяет читать stdout потоком и точно знать конец хода.
+  const bool chat_protocol = std::getenv("TOKSHIT_CHAT_PROTOCOL") != nullptr;
+  std::size_t chat_max_new = static_cast<std::size_t>(-1);
+  if (const char* v = std::getenv("TOKSHIT_CHAT_MAX_NEW");
+      v != nullptr && *v != '\0') {
+    const unsigned long long n = std::strtoull(v, nullptr, 10);
+    if (n != 0) chat_max_new = static_cast<std::size_t>(n);
   }
 
   if (tty) {
@@ -299,27 +315,85 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
         break;
     }
 
-    const std::string text = cmd.arg;
+    // Для внешних клиентов: одна строка = один ход, переводы строк можно
+    // передавать как литеральные \n, чтобы few-shot промпт влезал в строку.
+    std::string text = cmd.arg;
+    if (const char* ue = std::getenv("TOKSHIT_CHAT_UNESCAPE");
+        ue != nullptr && *ue != '\0' && *ue != '0') {
+      std::string un;
+      un.reserve(text.size());
+      for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] == '\\' && i + 1 < text.size() && text[i + 1] == 'n') {
+          un.push_back('\n');
+          ++i;
+        } else {
+          un.push_back(text[i]);
+        }
+      }
+      text.swap(un);
+    }
     if (text.empty()) continue;
 
     tokshit::pool::set_active(true);
     std::vector<uint32_t> turn =
         tokshit::cli::build_turn(model, tok, text, s.system_prompt);
+    // Многоходовой чат: предыдущий ответ сгенерирован, но его EOG
+    // (<|end_message|>) не прогонялся через модель — decode обрывается до
+    // форварда. Закрываем сообщение при следующем префилле, иначе шаблон
+    // ломается: user идёт сразу после текста ассистента. В raw-режиме
+    // разметки нет, вставлять спецтокен нельзя.
+    const bool raw_prompt = std::getenv("TOKSHIT_RAW_PROMPT") != nullptr;
+    if (!raw_prompt && model.is_inkling2() && s.pos > 0) {
+      if (const auto eom = tok.token_id("<|end_message|>");
+          eom.has_value()) {
+        turn.insert(turn.begin(), *eom);
+      }
+    }
 
     const auto tp = tokshit::Clock::now();
+    model.set_prefilling(true);
     {
       PrefillBar bar;
       bar.start();
       std::size_t done = 0;
-      for (uint32_t id : turn) {
-        model.token_logits(id, s.kv, s.pos, logits);
-        dump_logits(dump, logits);
-        ++s.pos;
-        ++done;
-        bar.tick(done, turn.size(), width, err_tty);
+      std::size_t chunk = 0;
+      if (model.is_inkling2() && dump == nullptr) {
+        const char* v = std::getenv("TOKSHIT_INK_PREFILL_BATCH");
+        chunk = (v != nullptr && *v != '\0')
+                    ? static_cast<std::size_t>(std::strtoull(v, nullptr, 10))
+                    : 16;
+        if (chunk < 2) chunk = 0;
+      }
+      if (chunk != 0 && turn.size() > 1) {
+        ::setenv("TOKSHIT_INK_PREFILL_ONLY_LAST", "1", 0);
+        auto* ink = model.inkling2();
+        const std::size_t v = ink->vocab();
+        std::vector<float> outs(chunk * v, 0.0F);
+        for (std::size_t i = 0; i < turn.size(); i += chunk) {
+          const std::size_t nb = std::min(chunk, turn.size() - i);
+          ink->token_logits_batch(
+              std::span<const uint32_t>(turn.data() + i, nb), s.pos + i,
+              std::span<float>(outs.data(), nb * v));
+          std::copy(outs.begin() +
+                        static_cast<std::ptrdiff_t>((nb - 1) * v),
+                    outs.begin() + static_cast<std::ptrdiff_t>(nb * v),
+                    logits.begin());
+          done += nb;
+          bar.tick(done, turn.size(), width, err_tty);
+        }
+        s.pos += turn.size();
+      } else {
+        for (uint32_t id : turn) {
+          model.token_logits(id, s.kv, s.pos, logits);
+          dump_logits(dump, logits);
+          ++s.pos;
+          ++done;
+          bar.tick(done, turn.size(), width, err_tty);
+        }
       }
       bar.finish(err_tty);
     }
+    model.set_prefilling(false);
     const double prefill =
         std::chrono::duration<double>(tokshit::Clock::now() - tp).count();
     if (tokshit::prefetch_enabled()) model.pin_hot_experts(64);
@@ -336,6 +410,7 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     }
     DecodeOptions dopt;
     dopt.check_interrupt = true;
+    dopt.max_new = chat_max_new;
     const DecodeResult dec =
         decode(model, tok, s.kv, s.pos, logits, s.params, rng,
                s.reasoning_budget, dump, dopt);
@@ -349,6 +424,10 @@ void chat_loop(tokshit::Model& model, const tokshit::BpeTokenizer& tok,
     }
     std::fputc('\n', stdout);
     std::fflush(stdout);
+    if (chat_protocol) {
+      std::fputc('\x1e', stdout);
+      std::fflush(stdout);
+    }
 
     s.last_tokens = n_gen;
     s.total_tokens += n_gen;

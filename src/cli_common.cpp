@@ -34,7 +34,14 @@ std::vector<uint32_t> build_turn(const Model& model, const BpeTokenizer& tok,
     };
     push_special("<|message_system|>");
     push_special("<|content_text|>");
-    for (uint32_t id : tok.encode("Thinking effort level: 0.9")) {
+    // Effort управляет длиной reasoning: для голоса/быстрых ответов 0.0–0.3
+    // заметно короче, чем дефолтные 0.9. Значение — как в обучении.
+    const char* eff = std::getenv("TOKSHIT_THINK_EFFORT");
+    const std::string effort_text =
+        (eff != nullptr && *eff != '\0')
+            ? std::string("Thinking effort level: ") + eff
+            : std::string("Thinking effort level: 0.9");
+    for (uint32_t id : tok.encode(effort_text)) {
       turn.push_back(id);
     }
     push_special("<|end_message|>");
