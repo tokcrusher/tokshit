@@ -18,6 +18,9 @@ mic -> whisper.cpp ASR -> tokshit persistent chat -> Piper TTS -> speaker
   scripts/voice_chat.py --tui --text "..."    # TUI + готовый ход
   scripts/voice_chat.py --fast                # lossy top-4 turbo
   scripts/voice_chat.py --one-sentence        # ровно одно предложение
+  scripts/voice_chat.py --ru                  # ASR/TTS по-русски
+  scripts/voice_chat.py --lang ru             # то же через --lang
+  scripts/voice_chat.py                       # запись разрешена уже во время WARMING
   scripts/voice_chat.py --seconds 5           # запись ровно 5 с
   scripts/voice_chat.py --hands-free --seconds 5
   scripts/voice_chat.py --wav in.wav          # без микрофона
@@ -194,6 +197,7 @@ class Console:
         self._status_open = False
 
     def answer(self, text: str) -> None:
+        text = strip_invisible(text)
         if not text:
             return
         with self._lock:
@@ -266,7 +270,7 @@ def strip_ansi(text: str) -> str:
 
 def clean_for_speech(text: str) -> str:
     """Markdown/code -> текст, который не стыдно отдать Piper."""
-    s = text
+    s = strip_invisible(text)
     parts = s.split("```")
     out = []
     for i, part in enumerate(parts):
@@ -336,6 +340,13 @@ def split_for_tts(text: str, max_len: int = 320) -> list[str]:
     if cur:
         chunks.append(cur)
     return [c for c in chunks if c]
+
+
+def normalize_sentence(text: str) -> str:
+    """Для TTS-dedupe: lowercase, без пунктуации/zero-width, один пробел."""
+    s = text.casefold()
+    s = re.sub(r"[^\w\s]+", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def is_blank_transcript(text: str) -> bool:
@@ -1204,6 +1215,9 @@ class SpeechPipeline:
         self.play_thread = threading.Thread(target=self._play_loop, daemon=True)
         self._closed = False
         self._errors_lock = threading.Lock()
+        self._last_spoken_norm: str | None = None
+        self._dup_run = 0
+        self._tts_dup_stop = False
 
     def start(self) -> None:
         self.tts_thread.start()
@@ -1213,10 +1227,37 @@ class SpeechPipeline:
         return self.abort_event is not None and self.abort_event.is_set()
 
     def push(self, sentence: str) -> None:
-        if self.stop_event.is_set() or self._closed or self._aborted():
+        if (
+            self.stop_event.is_set() or self._closed
+            or self._aborted() or self._tts_dup_stop
+        ):
             return
         if not sentence.strip():
             return
+        norm = normalize_sentence(sentence)
+        if not norm:
+            return
+        if norm == self._last_spoken_norm:
+            self._dup_run += 1
+            if self.console.verbose:
+                self.console.log(
+                    f"[tts] duplicate sentence dropped: {sentence[:70]!r}",
+                    defer=True,
+                )
+            if self._dup_run >= 2:
+                self._tts_dup_stop = True
+                self.console.log(
+                    "[tts] duplicate guard: repeated sentence twice in a row; "
+                    "TTS stopped for this turn",
+                    defer=True,
+                )
+                try:
+                    self.text_q.put_nowait(None)
+                except queue.Full:
+                    pass
+            return
+        self._last_spoken_norm = norm
+        self._dup_run = 0
         self.text_q.put(sentence)
         if self.console.verbose:
             self.console.log(f"[stream] {sentence!r}", defer=True)
@@ -1231,7 +1272,7 @@ class SpeechPipeline:
         # Ждём загрузку Piper в процессе (или warmup tts.sh в script-режиме).
         if self.piper is not None:
             while not self.piper.ready_event.wait(0.2):
-                if self.stop_event.is_set():
+                if self.stop_event.is_set() or self._tts_dup_stop:
                     self.audio_q.put(None)
                     return
             use_piper = self.piper.sess is not None
@@ -1239,14 +1280,18 @@ class SpeechPipeline:
                 self.console.log("[tts] Piper unavailable; using tts.sh", defer=True)
         elif self.warm_event is not None:
             while not self.warm_event.wait(0.2):
-                if self.stop_event.is_set():
+                if self.stop_event.is_set() or self._tts_dup_stop:
                     self.audio_q.put(None)
                     return
             use_piper = False
         else:
             use_piper = False
         try:
-            while not self.stop_event.is_set() and not self._aborted():
+            while (
+                not self.stop_event.is_set()
+                and not self._aborted()
+                and not self._tts_dup_stop
+            ):
                 sentence = self.text_q.get()
                 if sentence is None:
                     break
@@ -1254,7 +1299,10 @@ class SpeechPipeline:
                 if not spoken:
                     continue
                 for part in split_for_tts(spoken):
-                    if self.stop_event.is_set() or self._aborted():
+                    if (
+                        self.stop_event.is_set() or self._aborted()
+                        or self._tts_dup_stop
+                    ):
                         break
                     chunk_no += 1
                     out = self.workdir / f"tts-{chunk_no}.wav"
@@ -1372,14 +1420,16 @@ class EngineSession:
         self.ready_at: float | None = None
         self.prefix_s = 0.0
         self.prefix_done = False
-        self.fewshot = os.environ.get(
-            "VOICE_FEWSHOT",
-            "Q: Hello\\nA: Hi! How can I help you today?\\n"
-            "Q: Tell me about Paris.\\nA: Paris is the capital of France. "
-            "It is known for the Eiffel Tower and the Louvre.",
-        )
+        # No default few-shot: the model answers better without a prefix.
+        # VOICE_FEWSHOT stays as an explicit power-user override only.
+        self.fewshot = os.environ.get("VOICE_FEWSHOT", "")
+        if not self.fewshot.strip():
+            self.fewshot = ""
         self._expect_prefix = bool(self.fewshot) and not args.chat_template
         self.ready_event = threading.Event()
+        self.started_event = threading.Event()
+        self.stopped_event = threading.Event()
+        self.start_error: str | None = None
         self.loaded = False
         self.prefix_tokens = 0
         self.lock_wait = False
@@ -1411,6 +1461,11 @@ class EngineSession:
             "--temperature", temp, str(engine_model()),
         ]
 
+    def fail(self, message: str) -> None:
+        """Старт не состоится: разбудить queued-turn с внятной ошибкой."""
+        self.start_error = message
+        self.started_event.set()
+
     def start(self) -> None:
         env = os.environ.copy()
         env.pop("TOKSHIT_PROMPT_FILE", None)
@@ -1426,29 +1481,37 @@ class EngineSession:
         env.setdefault("TOKSHIT_POOL_PIN", "1")
         env.setdefault("TOKSHIT_TEMPERATURE", env.get("VOICE_TEMPERATURE", "0"))
 
-        # VOICE_FAST=1: top-4 experts, still 3 passes, original dense weights.
-        # This is the only lossy tier that kept voice text readable in tests;
-        # top-2 and/or 2 passes looped ("Capital capital capital...").
+        # VOICE_FAST=1: top-4 (EN) / top-6 (RU) experts, still 3 passes,
+        # original dense weights. RU has no prefix and top-4 looped on the
+        # second turn; top-6 stays readable.
         if os.environ.get("VOICE_FAST", "").strip() not in ("", "0"):
-            env["TOKSHIT_DRAFT_TOPK"] = os.environ.get("VOICE_TOPK", "4")
+            lang = getattr(self.args, "lang", "en")
+            env["TOKSHIT_DRAFT_TOPK"] = (
+                os.environ.get("VOICE_TOPK")
+                or os.environ.get("TOKSHIT_DRAFT_TOPK")
+                or ("6" if lang == "ru" else "4")
+            )
             env.pop("TOKSHIT_HOT_Q4", None)
             env.pop("TOKSHIT_INK_PASSES", None)  # keep the trained 3 passes
             env["TOKSHIT_POOL_WORKERS"] = os.environ.get(
                 "VOICE_FAST_WORKERS", "6"
             )
 
-        # Default: полный ответ до EOG/--max-new. Единственный штатный
-        # маркер — "Q:" (защита от эха few-shot). Раньше здесь стоял
-        # TOKSHIT_STOP_AT2=\n, который резал ответ на первой строке/первом
-        # предложении; это ломало многофразные ответы.
-        stop_at = os.environ.get("VOICE_STOP_AT", "Q:")
-        env.pop("TOKSHIT_STOP_AT", None)
-        if stop_at:
-            env["TOKSHIT_STOP_AT"] = stop_at
-        stop_at2 = os.environ.get("VOICE_STOP_AT2", "")
-        env.pop("TOKSHIT_STOP_AT2", None)
-        if stop_at2:
-            env["TOKSHIT_STOP_AT2"] = stop_at2
+        # Default: полный ответ до EOG/--max-new. Три маркера режут эхо
+        # few-shot, не трогая обычные слова:
+        #   "Q:"      — начало следующего вопроса;
+        #   "\nQ"     — bare Q-строка после ответа;
+        #   "\nA"     — bare A-строка после ответа.
+        # Важно: НЕ "Q"/"A" без newline — иначе режутся слова.
+        for env_name, voice_name, default in (
+            ("TOKSHIT_STOP_AT", "VOICE_STOP_AT", "Q:"),
+            ("TOKSHIT_STOP_AT2", "VOICE_STOP_AT2", r"\nQ"),
+            ("TOKSHIT_STOP_AT3", "VOICE_STOP_AT3", r"\nA"),
+        ):
+            value = os.environ.get(voice_name, default)
+            env.pop(env_name, None)
+            if value:
+                env[env_name] = value
 
         one_sentence = bool(
             getattr(self.args, "one_sentence", False)
@@ -1462,7 +1525,6 @@ class EngineSession:
             # Opt-in: нативный шаблон Inkling (видимый reasoning — на любителя).
             env.pop("TOKSHIT_RAW_PROMPT", None)
             env.pop("TOKSHIT_CHAT_UNESCAPE", None)
-            env.pop("TOKSHIT_STOP_AT", None)
             env.setdefault(
                 "TOKSHIT_SYSTEM_PROMPT",
                 "You are a helpful voice assistant. Answer in English, briefly "
@@ -1496,7 +1558,9 @@ class EngineSession:
                 bufsize=0,
             )
         except OSError as exc:
+            self.fail(f"cannot start engine: {exc}")
             raise VoiceError(f"cannot start engine: {exc}")
+        self.started_event.set()
         _register(self.proc)
         self.started_at = time.monotonic()
         self._stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
@@ -1581,14 +1645,30 @@ class EngineSession:
             return "\n".join(self._stderr[-n:])
 
     def wait_ready(self, timeout: float = 240.0) -> None:
+        """Дождаться engine.start()/load/prefix.
+
+        Может вызываться до engine.start(): TUI ставит placeholder и даёт
+        записать/распознать ход, пока идёт quality guard и загрузка модели.
+        """
         deadline = time.monotonic() + timeout
         while not self.ready_event.is_set():
-            if self.proc is None or self.proc.poll() is not None:
-                tail = self.stderr_tail()
-                raise VoiceError(
-                    f"engine exited during load (rc={self.proc.returncode if self.proc else '?'}):\n{tail}"
-                )
+            if self.stopped_event.is_set():
+                raise VoiceError("engine stopped before it became ready")
+            if self.start_error:
+                raise VoiceError(self.start_error)
+            if self.started_event.is_set():
+                if self.proc is None or self.proc.poll() is not None:
+                    tail = self.stderr_tail()
+                    rc = self.proc.returncode if self.proc else "?"
+                    raise VoiceError(
+                        f"engine exited during load (rc={rc}):\n{tail}"
+                    )
             if time.monotonic() > deadline:
+                if not self.started_event.is_set():
+                    raise VoiceError(
+                        f"engine did not start in {timeout:.0f}s "
+                        "(quality guard/model lock?)"
+                    )
                 raise VoiceError(f"engine did not load in {timeout:.0f}s")
             time.sleep(0.1)
 
@@ -1597,11 +1677,19 @@ class EngineSession:
         text = " ".join(text.splitlines()).strip().replace("\\", " ")
         if self.args.chat_template:
             return text
-        if not self.fewshot:
-            if self.turn_no == 1:
-                return f"Q: {text}\\nA:"
-            return f"\\nQ: {text}\\nA:"
-        return f"\\nQ: {text}\\nA:"
+        # No startup prefix: language is anchored inside the user turn.
+        # The transcript already shows the original ASR text (console.user),
+        # only the engine payload gets this directive.
+        lang = getattr(self.args, "lang", "en")
+        directive = "Отвечай по-русски. " if lang == "ru" else "Answer in English. "
+        # Engine-side terminal punctuation (transcript keeps the original ASR
+        # text). Without it EN top-4 echoed the directive and RU looped.
+        if text and text[-1] not in ".!?…":
+            text += "."
+        # Leading newline is required on EVERY turn, including the first:
+        # with a bare first "Q:" and no prefix the model drifts to Chinese.
+        # "\nQ: ...\nA:" matches the tested engine protocol.
+        return f"\\nQ: {directive}{text}\\nA:"
 
     def _wait_metric(self, start: int, timeout: float = 3.0) -> None:
         deadline = time.monotonic() + timeout
@@ -1709,6 +1797,49 @@ class EngineSession:
                     kill_proc(self.proc)
                     raise VoiceError("engine turn timed out")
 
+    def clear_context(self, timeout: float = 1.0) -> bool:
+        """`/clear` движку: стереть KV/позицию, turn_no=0.
+
+        Вызывать только когда ход не идёт. Ответ /clear идёт в stdout без RS,
+        поэтому вычитываем до паузы, чтобы он не попал в следующий ask.
+        """
+        if not self.ready_event.is_set():
+            return False
+        if self.proc is None or self.proc.poll() is not None:
+            return False
+        if self._outbuf or self.proc.stdin is None or self.proc.stdout is None:
+            return False
+        try:
+            self.proc.stdin.write(b"/clear\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return False
+        fd = self.proc.stdout.fileno()
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        data = ""
+        quiet_at: float | None = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                r, _, _ = select.select([fd], [], [], 0.05)
+            except InterruptedError:
+                continue
+            if r:
+                try:
+                    raw = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not raw:
+                    break
+                data += dec.decode(raw)
+                quiet_at = time.monotonic() + 0.12
+            elif quiet_at is not None and time.monotonic() >= quiet_at:
+                break
+        self.turn_no = 0
+        if self.console.verbose and data:
+            self.console.log(f"[engine] /clear: {strip_ansi(data).strip()[:120]}")
+        return True
+
     def query_stats(self, timeout: float = 0.8) -> dict:
         """Спросить движок `/stats` между ходами (TUI: cache/rss/ctx).
 
@@ -1791,6 +1922,7 @@ class EngineSession:
         return out
 
     def stop(self) -> None:
+        self.stopped_event.set()
         self._status_stop.set()
         if self.proc is not None:
             try:
@@ -1889,6 +2021,9 @@ def one_turn(
     console.user(transcript)
     if text is not None:
         stats.asr_model = ""
+    # ASR уже сделан; движок может ещё грузиться/прогревать prefix.
+    # turn worker висит здесь, а не шлёт Q: в полуготовый движок.
+    engine.wait_ready()
     pipeline = SpeechPipeline(
         turn_dir, console, stats, args.no_play, warm_event, piper,
         abort_event=abort_event,
@@ -1960,6 +2095,13 @@ def session_summary(turns: list[TurnStats], load_s: float, prefix_s: float) -> N
 
 # ────────────────────────────── TUI ──────────────────────────────
 
+INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2060\ufeff\u00ad]")
+
+
+def strip_invisible(text: str) -> str:
+    return INVISIBLE_RE.sub("", text)
+
+
 EMOJI_ASCII = {
     "\U0001f3a4": "mic",
     "\U0001f5e3": "user",
@@ -1975,7 +2117,7 @@ EMOJI_ASCII = {
 
 
 def sanitize_ui_text(text: str) -> str:
-    s = strip_ansi(text)
+    s = strip_invisible(strip_ansi(text))
     for src, dst in EMOJI_ASCII.items():
         s = s.replace(src, dst)
     return s
@@ -2056,11 +2198,16 @@ def env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip() not in ("", "0")
 
 
-def apply_mode_env(fast: bool) -> None:
-    """FAST/LOSSLESS переключают только env движка; перезапуск делает TUI."""
+def apply_mode_env(fast: bool, lang: str = "en") -> None:
+    """FAST/LOSSLESS переключают только env движка; перезапуск делает TUI.
+
+    RU fast uses top-6: no-prefix top-4 looped on the second Russian turn.
+    EN fast keeps top-4.
+    """
     if fast:
+        topk = os.environ.get("VOICE_TOPK") or ("6" if lang == "ru" else "4")
         os.environ["VOICE_FAST"] = "1"
-        os.environ["TOKSHIT_DRAFT_TOPK"] = os.environ.get("VOICE_TOPK", "4")
+        os.environ["TOKSHIT_DRAFT_TOPK"] = topk
         os.environ.pop("TOKSHIT_HOT_Q4", None)
         os.environ.pop("TOKSHIT_INK_PASSES", None)
         os.environ["TOKSHIT_POOL_WORKERS"] = "6"
@@ -2076,19 +2223,53 @@ def apply_mode_env(fast: bool) -> None:
         os.environ["VOICE_POOL_WORKERS"] = "4"
 
 
+def tts_voice_name() -> str:
+    return os.environ.get("TTS_VOICE", "en_US-lessac-medium")
+
+
+def apply_language(args: argparse.Namespace) -> None:
+    """--ru/--lang/VOICE_LANG -> ASR_LANG, few-shot lang, TTS voice."""
+    warnings: list[str] = []
+    env_lang = os.environ.get("VOICE_LANG", "").strip().lower()
+    lang = (getattr(args, "lang", None) or env_lang or "en").strip().lower()
+    if getattr(args, "ru", False):
+        lang = "ru"
+    if lang not in ("en", "ru"):
+        warnings.append(f"[lang] unknown language {lang!r}; using en")
+        lang = "en"
+    args.lang = lang
+    args.ru = lang == "ru"
+    os.environ["ASR_LANG"] = lang
+    if lang == "ru" and not os.environ.get("TTS_VOICE"):
+        ru_voice = MODELS_DIR / "ru_RU-irina-medium.onnx"
+        if ru_voice.is_file():
+            os.environ["TTS_VOICE"] = "ru_RU-irina-medium"
+        else:
+            warnings.append(
+                f"[tts] Russian voice missing: {ru_voice}; "
+                f"keeping {tts_voice_name()}"
+            )
+    args.lang_warning = "; ".join(warnings)
+
+
 def stop_label(args: argparse.Namespace) -> str:
     stop = os.environ.get("VOICE_STOP_AT", "Q:")
     parts = [stop if stop else "off"]
-    stop2 = os.environ.get("VOICE_STOP_AT2", "")
-    if stop2:
-        shown = stop2.replace("\\", "/").replace("\n", "\\n")
-        parts.append(f"stop2={shown}")
+    for name, default in (
+        ("VOICE_STOP_AT2", r"\nQ"),
+        ("VOICE_STOP_AT3", r"\nA"),
+    ):
+        value = os.environ.get(name, default)
+        if value:
+            shown = value.replace("\n", "\\n")
+            parts.append(shown)
     one = bool(
         getattr(args, "one_sentence", False)
         or env_truthy("VOICE_ONE_SENTENCE")
     )
-    parts.append(f"one-sentence {'on' if one else 'off'}")
-    return " | ".join(parts)
+    if one:
+        parts.append("one-sentence")
+    return " / ".join(parts)
 
 
 def wrap_ui_line(text: str, width: int) -> list[str]:
@@ -2147,8 +2328,6 @@ class UiState:
         self.restarting = False
         self.fast = False
         self.load_s = 0.0
-        self.prefix_s = 0.0
-        self.prefix_tokens = 0
         self.turn_no = 0
         self.scroll = 0
         self.last_stats: dict = {}
@@ -2175,8 +2354,6 @@ class UiState:
                 "restarting": self.restarting,
                 "fast": self.fast,
                 "load_s": self.load_s,
-                "prefix_s": self.prefix_s,
-                "prefix_tokens": self.prefix_tokens,
                 "turn_no": self.turn_no,
                 "scroll": self.scroll,
                 "last_stats": dict(self.last_stats),
@@ -2197,6 +2374,7 @@ class UiState:
             self.notice = ""
 
     def answer(self, text: str) -> None:
+        text = strip_invisible(text)
         if not text:
             return
         with self.lock:
@@ -2358,10 +2536,10 @@ class TuiApp:
 
     HELP_LINES = [
         "KEYS",
-        "  Enter / Space   start recording",
+        "  Enter / Space   start recording (also while engine warms up)",
         "  s               stop recording / stop audio",
         "  f               toggle FAST / LOSSLESS (engine restart)",
-        "  c               clear transcript",
+        "  c               clear transcript + engine KV context",
         "  q / Ctrl-C      quit",
         "  PgUp / PgDn     scroll transcript",
         "  ?               this help",
@@ -2393,6 +2571,8 @@ class TuiApp:
             getattr(args, "fast", False) or env_truthy("VOICE_FAST")
         )
         self.state.fast = self.fast
+        if getattr(args, "lang_warning", ""):
+            self.state.log(args.lang_warning)
         self.running = True
         self.help = False
         self.color = False
@@ -2412,6 +2592,7 @@ class TuiApp:
         self._sys: dict = {}
         self._sys_at = 0.0
         self._auto_at = 0.0
+        self.started_at = time.monotonic()
         self.startup_thread: threading.Thread | None = None
         self.restart_thread: threading.Thread | None = None
 
@@ -2499,19 +2680,36 @@ class TuiApp:
             self._handle_key(key)
 
     def _startup(self) -> None:
+        # Placeholder EngineSession публикуется ДО quality guard/load: TUI
+        # сразу разрешает запись, ASR делает ход, а ask ждёт started/ready.
+        try:
+            engine = EngineSession(self.args, self.console)
+            tts_mode = os.environ.get("VOICE_TTS", "inproc").lower()
+            if tts_mode != "script":
+                # Объект нужен queued-turn'у до старта; загрузка ниже.
+                self.piper = PiperTTS(self.console)
+        except Exception as exc:  # noqa: BLE001
+            self.console.log(f"ERROR: {exc}")
+            with self.state.lock:
+                self.state.phase = "ERROR"
+                self.state.ready = False
+            self.events.put(("startup_error", str(exc)))
+            return
+        self.holder.set(engine)
+        if self.stop_flag.is_set():
+            engine.stop()
+            return
         try:
             quality_guard(self.args, self.console)
             if self.stop_flag.is_set():
+                engine.stop()
                 return
-            apply_mode_env(self.fast)
-            tts_mode = os.environ.get("VOICE_TTS", "inproc").lower()
-            if tts_mode != "script":
-                self.piper = PiperTTS(self.console)
+            apply_mode_env(self.fast, getattr(self.args, "lang", "en"))
+            if self.piper is not None:
                 self.piper.start()
             if self.stop_flag.is_set():
+                engine.stop()
                 return
-            engine = EngineSession(self.args, self.console)
-            self.holder.set(engine)
             with self.state.lock:
                 self.state.phase = "LOADING"
             self.console.log("[engine] starting persistent chat")
@@ -2528,6 +2726,8 @@ class TuiApp:
             self.events.put(("startup_ok", None))
         except Exception as exc:  # noqa: BLE001 - поток не должен падать
             self.console.log(f"ERROR: {exc}")
+            engine.fail(str(exc))
+            engine.stop()
             with self.state.lock:
                 self.state.phase = "ERROR"
                 self.state.ready = False
@@ -2548,14 +2748,13 @@ class TuiApp:
                     self.console.log(
                         f"ERROR: engine exited (rc={proc.returncode})"
                     )
+                    self.state.notice_msg("Engine exited - see log", ttl=0)
             return
         if engine.ready_event.is_set():
             with self.state.lock:
                 self.state.ready = True
                 self.state.phase = "READY"
                 self.state.load_s = engine.child_load_s or engine.load_s
-                self.state.prefix_s = engine.prefix_s
-                self.state.prefix_tokens = engine.prefix_tokens
         else:
             with self.state.lock:
                 self.state.ready = False
@@ -2653,11 +2852,10 @@ class TuiApp:
         if not self.args.hands_free:
             return
         with self.state.lock:
-            ready = self.state.ready
+            phase = self.state.phase
             busy = self.state.busy
             recording = self.state.recording
-            restarting = self.state.restarting
-        if not ready or busy or recording or restarting or not self.initial_done:
+        if phase == "ERROR" or busy or recording or not self.initial_done:
             return
         if time.monotonic() < self._auto_at:
             return
@@ -2671,9 +2869,12 @@ class TuiApp:
             ready = self.state.ready
             busy = self.state.busy
             recording = self.state.recording
-            restarting = self.state.restarting
-        if not ready or busy or recording or restarting:
-            self.state.notice_msg("Engine is not ready for recording", ttl=3)
+            phase = self.state.phase
+        if busy or recording:
+            self.state.notice_msg("Finish the current turn before recording", ttl=3)
+            return
+        if phase == "ERROR":
+            self.state.notice_msg("Engine failed to load - see log", ttl=0)
             return
         ev = threading.Event()
         self.rec_stop_event = ev
@@ -2682,7 +2883,9 @@ class TuiApp:
             self.state.rec_elapsed = 0.0
             self.state.notice = ""
             self.state.notice_until = 0.0
-            self.state.status = "SPEAK NOW"
+            self.state.status = (
+                "WARMING - speak now" if not ready else "SPEAK NOW"
+            )
 
         def work() -> None:
             try:
@@ -2720,23 +2923,39 @@ class TuiApp:
             return
         self._start_turn(wav=wav)
 
+    def _wait_for_engine(self) -> "EngineSession":
+        while True:
+            engine = self.holder.get()
+            if engine is not None:
+                if engine.start_error:
+                    raise VoiceError(engine.start_error)
+                return engine
+            with self.state.lock:
+                if self.state.phase == "ERROR":
+                    raise VoiceError("engine failed to start")
+            if self.stop_flag.is_set():
+                raise VoiceError("stopped before the engine became ready")
+            time.sleep(0.05)
+
     def _start_turn(
         self, *, text: str | None = None, wav: Path | None = None
     ) -> None:
-        engine = self.holder.get()
         with self.state.lock:
-            ready = self.state.ready
+            phase = self.state.phase
             busy = self.state.busy
             recording = self.state.recording
-            restarting = self.state.restarting
-        if engine is None or not ready or busy or recording or restarting:
-            self.state.notice_msg("Engine is busy - wait for the turn to finish", ttl=3)
+        if busy or recording:
+            self.state.notice_msg("Finish the current turn before recording", ttl=3)
+            return
+        if phase == "ERROR":
+            self.state.notice_msg("Engine failed to load - see log", ttl=0)
             return
         abort = threading.Event()
         self.abort_event = abort
         self.turn_no += 1
-        self.state.turn_no = self.turn_no
+        turn_no = self.turn_no
         with self.state.lock:
+            self.state.turn_no = turn_no
             self.state.busy = True
             self.state.abort_event = abort
             self.state.scroll = 0
@@ -2745,13 +2964,14 @@ class TuiApp:
 
         def work() -> None:
             try:
+                engine = self._wait_for_engine()
                 stats = one_turn(
                     self.args,
                     engine,
                     self.console,
                     self.model_name,
                     self.workdir,
-                    self.turn_no,
+                    turn_no,
                     warm_event=self.warm_event,
                     piper=self.piper,
                     wav=wav,
@@ -2813,7 +3033,7 @@ class TuiApp:
                 old.stop()
             if self.stop_flag.is_set():
                 return
-            apply_mode_env(fast)
+            apply_mode_env(fast, getattr(self.args, "lang", "en"))
             engine = EngineSession(self.args, self.console)
             self.holder.set(engine)
             engine.start()
@@ -2825,8 +3045,30 @@ class TuiApp:
             self.events.put(("restart_error", str(exc)))
 
     def _clear(self) -> None:
+        with self.state.lock:
+            busy = self.state.busy
+            recording = self.state.recording
+            ready = self.state.ready
+            phase = self.state.phase
+        if busy or recording:
+            self.state.notice_msg(
+                "Cannot clear context during a turn or recording", ttl=4
+            )
+            return
+        engine = self.holder.get()
+        ok = True
+        if ready and phase != "ERROR" and engine is not None:
+            ok = engine.clear_context()
         self.state.clear()
-        self.state.notice_msg("Transcript cleared", ttl=2)
+        if ok:
+            self.turn_no = 0
+            self.state.turn_no = 0
+            self.state.notice_msg("Transcript + engine context cleared", ttl=3)
+        else:
+            self.console.log("ERROR: engine /clear failed")
+            self.state.notice_msg(
+                "Transcript cleared; engine /clear failed - see log", ttl=5
+            )
 
     def _quit(self) -> None:
         self.running = False
@@ -2969,10 +3211,10 @@ class TuiApp:
     def _engine_state(self, snap: dict) -> str:
         if snap["phase"] == "ERROR":
             return "ERROR"
+        if not snap["ready"]:
+            return "WARMING"
         if snap["busy"]:
             return "BUSY"
-        if snap["restarting"] or not snap["ready"]:
-            return "LOADING"
         return "READY"
 
     def _metric_lines(self, snap: dict) -> list[str]:
@@ -3052,10 +3294,15 @@ class TuiApp:
         gen_total = e.get("total_tokens")
         gen_s = str(gen_total) if gen_total is not None else "-"
         line5 = f"CACHE {cache} | ctx {ctx_s} | session gen {gen_s}"
-        line6 = (
-            f"CFG stop {stop_label(self.args)} | max_new {self.args.max_new}"
+        line_lang = (
+            f"LANG {getattr(self.args, 'lang', 'en')} | TTS {tts_voice_name()}"
         )
-        return [line1, line2, line3, line4, line5, line6]
+        line_cfg = (
+            f"CFG max_new {self.args.max_new} | stop {stop_label(self.args)}"
+        )
+        return [
+            line1, line2, line3, line4, line5, line_lang, line_cfg
+        ]
 
     def _draw(self, scr) -> None:
         snap = self.state.snapshot()
@@ -3084,11 +3331,11 @@ class TuiApp:
         button_rows = self._build_button_rows(w)
         b_h = len(button_rows)
         if h >= 24:
-            desired_d = 9
+            desired_d = 10
         elif h >= 20:
-            desired_d = 6
+            desired_d = 7
         elif h >= 16:
-            desired_d = 4
+            desired_d = 5
         else:
             desired_d = 2
         d_h = min(desired_d, max(1, h - header_h - b_h - 4 - 2))
@@ -3102,9 +3349,13 @@ class TuiApp:
         estate = self._engine_state(snap)
         mode = "FAST" if snap["fast"] else "LOSSLESS"
         load_s = snap["load_s"]
-        if not snap["ready"] and engine is not None and engine.started_at:
-            load_s = time.monotonic() - engine.started_at
-        prefix_s = fmt_sec(snap["prefix_s"]) if snap["prefix_tokens"] else "n/a"
+        if not snap["ready"]:
+            base = (
+                engine.started_at
+                if engine is not None and engine.started_at
+                else self.started_at
+            )
+            load_s = time.monotonic() - base
         workers = "6" if snap["fast"] else "4"
         batch = os.environ.get("VOICE_PREFILL_BATCH", "16")
         thermal = self._sys.get("thermal")
@@ -3128,8 +3379,9 @@ class TuiApp:
         )
         self._line(scr, 0, line0, curses.A_REVERSE | curses.A_BOLD)
         line1 = (
-            f"load {fmt_sec(load_s)} | prefix {snap['prefix_tokens']}t/{prefix_s}"
-            f" | workers {workers} | batch {batch} | therm {thermal_s}"
+            f"lang {getattr(self.args, 'lang', 'en')} | "
+            f"load {fmt_sec(load_s)} | workers {workers} | batch {batch}"
+            f" | therm {thermal_s}"
         )
         self._line(scr, 1, line1, self._attr(bold=True))
         if header_h >= 3:
@@ -3228,11 +3480,11 @@ class TuiApp:
             if budget >= len(metrics):
                 out = metrics[:]
             else:
-                order = [0, 1, 5, 2, 3, 4]
+                order = [0, 1, 6, 5, 2, 3, 4]
                 out = [metrics[i] for i in order[:budget]]
             out.extend(f"LOG {line}" for line in logs[-n_logs:])
         else:
-            order = [1, 5, 0, 2, 3, 4]
+            order = [1, 6, 5, 0, 2, 3, 4]
             out = [metrics[i] for i in order[:height]]
         for i in range(height):
             y = top + i
@@ -3244,13 +3496,21 @@ class TuiApp:
             text = snap["notice"]
             attr = self._attr(3, bold=True)
         elif snap["recording"]:
+            lead = "WARMING - speak now" if not snap["ready"] else "SPEAK NOW"
             text = (
-                f"SPEAK NOW  {snap['rec_elapsed']:.1f}s  |  "
+                f"{lead}  {snap['rec_elapsed']:.1f}s  |  "
                 f"auto-stop {self.args.max_seconds:.0f}s  |  STOP / s"
             )
             attr = curses.A_REVERSE | self._attr(3, bold=True)
         elif snap["busy"]:
-            text = "BUSY: streaming answer and speech..."
+            if not snap["ready"]:
+                text = "WARMING - turn queued; waiting for engine..."
+            else:
+                text = "BUSY: streaming answer and speech..."
+            attr = self._attr(3, bold=True)
+        elif not snap["ready"]:
+            extra = snap["status"] or "engine starting"
+            text = f"WARMING - speak now | {extra}"
             attr = self._attr(3, bold=True)
         elif snap["restarting"]:
             text = "Restarting engine..."
@@ -3258,9 +3518,6 @@ class TuiApp:
         elif snap["status"]:
             text = snap["status"]
             attr = self._attr(bold=True)
-        elif not snap["ready"]:
-            text = f"Loading engine... {fmt_sec(snap['load_s'])}"
-            attr = self._attr(3, bold=True)
         else:
             text = "READY - press Enter/Space or tap RECORD"
             attr = self._attr(2, bold=True)
@@ -3294,8 +3551,8 @@ class TuiApp:
                 enabled = True
                 if action == "record":
                     enabled = (
-                        snap["ready"] and not snap["busy"]
-                        and not snap["recording"] and not snap["restarting"]
+                        snap["phase"] != "ERROR" and not snap["busy"]
+                        and not snap["recording"]
                     )
                 elif action == "stop":
                     enabled = snap["recording"] or snap["busy"]
@@ -3383,6 +3640,10 @@ def main() -> int:
                     help="FAST mode: top-4 draft experts, 6 workers (lossy)")
     ap.add_argument("--one-sentence", action="store_true",
                     help="stop the answer after one sentence (TOKSHIT_STOP_SENTENCE=1)")
+    ap.add_argument("--ru", action="store_true",
+                    help="Russian mode: ASR_LANG=ru, ru TTS voice")
+    ap.add_argument("--lang", choices=("en", "ru"), default=None,
+                    help="language: en or ru (default: VOICE_LANG or en)")
     args = ap.parse_args()
 
     if args.clean_text is not None:
@@ -3402,9 +3663,12 @@ def main() -> int:
     args.one_sentence = bool(
         args.one_sentence or env_truthy("VOICE_ONE_SENTENCE")
     )
+    apply_language(args)
 
     deps = check_assets(args)
     if args.check:
+        if args.lang_warning:
+            print(f"  WARN {args.lang_warning}")
         print_check(deps)
         return 2 if deps["problems"] else 0
     if deps["problems"]:
@@ -3457,11 +3721,13 @@ def main() -> int:
         return 0
 
     console = Console(verbose=args.verbose)
+    if getattr(args, "lang_warning", ""):
+        console.log(args.lang_warning)
     engine: EngineSession | None = None
     turns: list[TurnStats] = []
     try:
         quality_guard(args, console)
-        apply_mode_env(args.fast)
+        apply_mode_env(args.fast, getattr(args, "lang", "en"))
         tts_mode = os.environ.get("VOICE_TTS", "inproc").lower()
         piper: PiperTTS | None = None
         warm_event = threading.Event()
