@@ -87,16 +87,32 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
 
 The current lossy 10.5 profile is NOT the goal. The order is **15 tok/s
 lossless**: keep top-8 experts, 3 passes, Q2_K_XL weights and greedy output.
+
+**Physics check (measured, 2026-11-23):** 15 tok/s at 2801.5 MB/token needs
+**42 GB/s**. `bwbench` on this phone reaches 32–42 GB/s with 8 threads (peak
+41.9), and less with 5 decode threads. So 15 tok/s lossless is not reachable
+without a quality loss. Realistic lossless ceiling is ~10–13 tok/s if
+everything becomes clean streaming; the current wall is expert GEMV
+(instruction-bound): 3.06 Gweight/token at 16–18 Gweight/s on 5 threads,
+~170 ms of ~255 ms per token, while DRAM is only ~5 GB/s busy. Dense is
+~75 ms (1.78 GB, 23 GB/s), already near its limit. `kbench` hot numbers:
+Iq1S 34.4, Iq2S 22.3, Iq2Xxs 17.2 (2-row, was 14.5), Nvfp4 34.7–38.2
+(was 14.0), Q2_0 33.7, Q4K 35.9, Q8_0 22.5 (i8mm 26.6), Q6K 7.8
+single-thread (4-row exists, parity 0, not enabled; 5 MB/token).
+
 Remaining non-lossy levers, in order:
 
-1. Fix/benchmark 4-row IQ2_XXS; optimize IQ1_S/Q2_0/NVFP4 table kernels.
-2. i8mm for dense Q6K/Q4K/Q8_0 (measure cold; `TOKSHIT_I8MM=1` was slower in
-   one noisy run).
+1. Repack+SMMLA for dense Q8_0/Q4K and (if it fits) IQ2_XXS; expectation
+   ~5–8 ms/token, not a path to 15.
+2. i8mm for dense Q6K/Q4K/Q8_0 (Q8_0 +15–18 %, not default).
 3. LTO / inlining of `dot_row` in the pool tasks.
-4. Previous-token/next-layer expert prefetch (`TOKSHIT_INK_PREFETCH_PREV`)
-   was inconclusive; re-test with the new A720 pinning.
+4. Previous-token/next-layer expert prefetch was neutral; do not spend more.
 5. Keep the lossy 10 tok/s profile clearly marked; never call it lossless.
-6. Audio: `~/audio` + `scripts/voice_chat.*`; do not use llama.cpp as the engine.
+6. Audio: `~/audio` + `scripts/voice_chat.*`; do not use llama.cpp.
+7. Hundreds of prefill tok/s is also compute-bound (same 3.06 Gweight/token);
+   batching is exact but does not reduce MACs. Prefill hundreds would need
+   ~20× the current expert GEMV throughput; the practical target is the same
+   kernel ceiling as decode.
 
 ## Rules
 
