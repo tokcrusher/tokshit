@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "tokshit/metrics.hpp"
@@ -27,9 +30,24 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
   ReasoningBudget reasoning(reasoning_budget);
   const auto t0 = Clock::now();
 
-  // Стриминговый стоп-фильтр: TOKSHIT_STOP_AT / TOKSHIT_STOP_AT2 (например
-  // "\n" и "Q:") обрывают ход, не выводя сам маркер. Хвост длиной maxlen-1
-  // держим, чтобы маркер не протёк в stdout по частям.
+  // Стриминговый стоп-фильтр: TOKSHIT_STOP_AT / _AT2 / _AT3 (например "\n",
+  // "Q:") обрывают ход, не выводя сам маркер. Хвост длиной maxlen-1 держим,
+  // чтобы маркер не протёк в stdout по частям. Ведущий маркер игнорируется,
+  // иначе ответ был бы пустым.
+  //
+  // TOKSHIT_STOP_SENTENCE=1 — стоп на первом конце предложения ('.', '!', '?'),
+  // когда к этому моменту готово к выводу >= 8 непустых символов; терминатор
+  // не выводим. Упрощения, чтобы не тащить полноценный sentence splitter:
+  //   * '.' после цифры или перед цифрой не считается концом (1., 3.14, .5);
+  //   * '.' в сокращении/инициале не считается: одиночная буква (J.) или
+  //     слово из короткого списка ниже (Mr., Dr., e.g., i.e., etc.);
+  //   * '!' и '?' считаются концом без доп. проверок.
+  // Хвост в 1 байт держим, чтобы видеть символ после терминатора (для цифр).
+  // Порядок не меняем: сначала стоп-маркеры, потом конец предложения, так что
+  // уже целиком лежащий в буфере маркер по-прежнему срабатывает первым.
+  // ВАЖНО: это строго opt-in. Переменная не задана (или =0) — фильтр выключен,
+  // ответ идёт до EOG / max_new / стоп-маркеров, как и раньше. Включает его
+  // только явный TOKSHIT_STOP_SENTENCE=1 (voice script выставляет сам).
   std::vector<std::string> stops;
   auto add_stop = [&](const char* sv) {
     if (sv == nullptr || *sv == '\0') return;
@@ -46,15 +64,26 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
   };
   add_stop(std::getenv("TOKSHIT_STOP_AT"));
   add_stop(std::getenv("TOKSHIT_STOP_AT2"));
+  add_stop(std::getenv("TOKSHIT_STOP_AT3"));
+  const bool stop_sentence = [] {
+    const char* v = std::getenv("TOKSHIT_STOP_SENTENCE");
+    return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+  }();
   std::size_t max_stop = 0;
   for (const auto& s : stops) max_stop = std::max(max_stop, s.size());
+  std::size_t keep = max_stop > 0 ? max_stop - 1 : 0;
+  if (stop_sentence) keep = std::max<std::size_t>(keep, 1);
   std::string held;
+  std::size_t non_space = 0;  // непустых символов уже выведено
   bool stopped = false;
   auto emit = [&](std::string_view s) {
     if (s.empty()) return;
     std::fwrite(s.data(), 1, s.size(), stdout);
     std::fflush(stdout);
     result.text.append(s);
+    for (char c : s) {
+      if (!std::isspace(static_cast<unsigned char>(c))) ++non_space;
+    }
   };
 
   for (;;) {
@@ -85,7 +114,7 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
       chunk = utf8.push(tok.token_bytes(next));
     }
     if (!chunk.empty()) {
-      if (stops.empty()) {
+      if (stops.empty() && !stop_sentence) {
         emit(chunk);
       } else {
         held.append(chunk);
@@ -111,15 +140,68 @@ DecodeResult decode(Model& model, const BpeTokenizer& tok, KVCache& kv,
           stop_now = true;
           break;
         }
+        // Конец предложения ищем только в той части held, что уже готова к
+        // выводу (p < n); символ после терминатора ещё лежит в хвосте keep.
+        if (!stop_now && stop_sentence) {
+          const std::size_t n = held.size() > keep ? held.size() - keep : 0;
+          for (std::size_t p = 0; p < n; ++p) {
+            const char c = held[p];
+            if (c != '.' && c != '!' && c != '?') continue;
+            std::size_t ns = non_space;
+            for (std::size_t k = 0; k < p; ++k) {
+              if (!std::isspace(static_cast<unsigned char>(held[k]))) ++ns;
+            }
+            if (ns < 8) continue;  // слишком коротко: ждём следующий термин.
+            if (c == '.') {
+              // Контекст для точки: последние 64 байта выведенного + held[:p+2].
+              std::string ctx;
+              if (result.text.size() > 64) {
+                ctx.assign(result.text, result.text.size() - 64, 64);
+              } else {
+                ctx = result.text;
+              }
+              const std::size_t q = ctx.size() + p;
+              ctx.append(held, 0, std::min(p + 2, held.size()));
+              const char prev = q > 0 ? ctx[q - 1] : '\0';
+              const char next = q + 1 < ctx.size() ? ctx[q + 1] : '\0';
+              const auto digit = [](char ch) {
+                return ch >= '0' && ch <= '9';
+              };
+              if (digit(prev) || digit(next)) continue;  // 1. / 3.14 / .5
+              std::size_t b = q;
+              while (b > 0 &&
+                     std::isalpha(static_cast<unsigned char>(ctx[b - 1]))) {
+                --b;
+              }
+              std::string word = ctx.substr(b, q - b);
+              std::transform(word.begin(), word.end(), word.begin(),
+                             [](unsigned char ch) {
+                               return static_cast<char>(std::tolower(ch));
+                             });
+              static constexpr const char* kAbbrev[] = {
+                  "mr",  "mrs", "ms",   "dr", "prof", "sr", "jr", "st",
+                  "vs",  "etc", "fig",  "no", "vol",  "inc", "ltd", "dept"};
+              bool abbrev = word.size() == 1;  // инициал: J.
+              for (const char* a : kAbbrev) {
+                if (word == a) {
+                  abbrev = true;
+                  break;
+                }
+              }
+              if (abbrev) continue;  // Mr. / e.g. / i.e. / U.S.
+            }
+            emit(std::string_view(held).substr(0, p));
+            held.clear();
+            stop_now = true;
+            break;
+          }
+        }
         if (stop_now) {
           stopped = true;
-        } else {
-          const std::size_t keep = max_stop > 0 ? max_stop - 1 : 0;
-          if (held.size() > keep) {
-            const std::size_t n = held.size() - keep;
-            emit(std::string_view(held).substr(0, n));
-            held.erase(0, n);
-          }
+        } else if (held.size() > keep) {
+          const std::size_t n = held.size() - keep;
+          emit(std::string_view(held).substr(0, n));
+          held.erase(0, n);
         }
       }
     }
