@@ -79,7 +79,12 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   with first turn `Q: Capital of Germany?\nA: Berlin.\nQ: <user>\nA:` and later
   turns `\nQ: <user>\nA:`; answers are ~8–10 tokens and direct, no visible
   reasoning preamble. `TOKSHIT_STOP_AT2` adds a second stop marker.
-  Keep `TOKSHIT_POOL_WORKERS=4` (A/B: W=4 4.1–4.2, W=5 3.8–3.9, W=6 3.8–3.9).
+  `TOKSHIT_CHAT_PREFIX` prefills the few-shot at engine startup (12 tok in
+  3.3 s, overlapped with mic/ASR), so the first turn only prefills the
+  question (13 tok / 2.7 s in the test; answers `Paris.` / `Rome.`).
+  Keep `TOKSHIT_POOL_WORKERS=4` for chat decode (A/B: W=4 4.1–4.2,
+  W=5 3.8–3.9, W=6 3.8–3.9); prefill can use 6 workers but decode is the
+  long pole.
 - Audio: `~/audio` has whisper.cpp ASR + Piper TTS; `scripts/voice_chat.py`
   and `voice_chat.md` are the bridge. The Termux:API APK is downloaded to
   `~/storage/downloads/termux-api-0.53.0.apk` (checksum verified) and the
