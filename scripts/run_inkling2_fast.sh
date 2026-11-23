@@ -1,7 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # LOSSY speed profile for Inkling-2-Mini.
 # top-2 experts + 2 core passes + Q4_0 dense + 6 workers.
-# Measured ~10.5 tok/s burst / 9.2-10.5 short runs; quality is degraded.
+# Cold burst ~10.5 tok/s; at 46-48 C phone throttles to ~4-5.
+# Quality is degraded. Override TOKSHIT_POOL_WORKERS=4/5 for less heat.
 set -euo pipefail
 
 ROOT=/data/data/com.termux/files/home/tokshit
@@ -17,7 +18,7 @@ export TOKSHIT_HOT=0
 export TOKSHIT_EXPERT_CACHE_MB="${TOKSHIT_EXPERT_CACHE_MB:-512}"
 export TOKSHIT_PREFAULT=1
 export TOKSHIT_KV_CTX="${TOKSHIT_KV_CTX:-512}"
-export TOKSHIT_POOL_WORKERS=6
+export TOKSHIT_POOL_WORKERS="${TOKSHIT_POOL_WORKERS:-6}"
 export TOKSHIT_POOL_PIN=1
 export TOKSHIT_DRAFT_TOPK=2
 export TOKSHIT_INK_PASSES=2
