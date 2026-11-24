@@ -16,6 +16,8 @@ dot-product и стримит экспертов с флеша через пос
 
 - [VOICE_CHAT.md](VOICE_CHAT.md) — `scripts/chat`: TUI, микрофон,
   streaming TTS, lossless и fast tier.
+- [WEB.md](WEB.md) — `scripts/web`: локальный веб-чат, микрофон, TTS,
+  настройки модели.
 
 ## Архитектура
 
