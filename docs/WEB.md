@@ -62,21 +62,23 @@ mic or fix the permission.
 
 ## Answer length
 
-The site stops at the first sentence by default (`TOKSHIT_STOP_SENTENCE=1`).
-This is deliberate: without it the model repeats the same sentence until
-`max_new` on weak prompts. The settings drawer has **stop at first sentence**;
-disable it for full text answers. The language anchor
-(`Отвечай по-русски.` / `Answer in English.`) is a two-token prefix, not the
-old few-shot persona. Without it the model drifts to French for Paris.
+By default the site asks for a full 2-3 sentence answer; the settings drawer
+has **stop at first sentence** (default off). The engine uses a minimal
+language anchor (`Q: Отвечай по-русски. A: Хорошо.`, not the old persona
+few-shot) plus a per-turn "2-3 sentences" instruction. Without the anchor the
+model drifts to French for Paris; without the length instruction it answers
+in 3-5 words. Turn on **stop at first sentence** if a weak prompt starts to
+loop.
 
 ## Speed
 
-The web server starts in the coherent fast tier: top-6 experts for Russian,
-top-4 for English, 3 passes, 6 workers. The settings drawer exposes every
-knob. 2 passes is the quality cliff and loops; it is available for
-experiments but is not a usable default. Measured on this phone: 4-7 tok/s
-depending on temperature and tier; 10 tok/s is not reachable without dropping
-passes/experts until output breaks.
+The web server starts in the **quality** tier: top-8 experts, 3 passes,
+4 workers, full answers, whisper `small` for Russian. The settings drawer
+exposes every knob. `fast` is top-6 RU / top-4 EN with 6 workers; `turbo`
+(4 experts, 2 passes) reaches ~12 tok/s but loops and is not usable.
+Measured on this phone: 3-7 tok/s depending on temperature and tier; 10 tok/s
+is not reachable without dropping passes until output breaks. On a 90+ C
+phone even the quality tier falls toward 3-4 tok/s; cool it before judging.
 
 
 ## Notes

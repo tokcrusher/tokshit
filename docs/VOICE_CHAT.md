@@ -8,7 +8,9 @@ between turns. Tokens appear as they are generated. TTS starts at the first
 completed clause or sentence, not after the whole answer.
 
 There is no startup prefix. The engine loads the model and is ready; the
-first turn is load-bound only. `VOICE_FEWSHOT` defaults to empty and exists
+first turn is load-bound only. The engine injects a minimal language anchor
+(`Q: Отвечай по-русски. A: Хорошо.`) and a 2-3 sentence quality instruction;
+`VOICE_FEWSHOT` can override it and exists
 only as a power-user override.
 
 ```
@@ -330,7 +332,8 @@ loads the model, then reports ready:
 [engine] ready in 7.3s
 ```
 
-`VOICE_FEWSHOT` defaults to empty and is a power-user override only. If set,
+`VOICE_FEWSHOT` defaults to empty but the engine adds a minimal language
+anchor and per-turn quality instruction. Set `VOICE_FEWSHOT` to replace it. If set,
 the old few-shot path and its startup stage return, but that is not the
 default or recommended voice setup.
 

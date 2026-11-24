@@ -1449,6 +1449,14 @@ class EngineSession:
         self.fewshot = os.environ.get("VOICE_FEWSHOT", "")
         if not self.fewshot.strip():
             self.fewshot = ""
+        # Minimal language anchor: without it the model drifts to French
+        # for Paris and to English for short questions. Not a persona example.
+        if not self.fewshot and not args.chat_template:
+            self.fewshot = (
+                "Q: Отвечай по-русски.\\nA: Хорошо."
+                if getattr(args, "lang", "en") == "ru"
+                else "Q: Answer in English.\\nA: Okay."
+            )
         self._expect_prefix = bool(self.fewshot) and not args.chat_template
         self.ready_event = threading.Event()
         self.started_event = threading.Event()
@@ -1718,19 +1726,18 @@ class EngineSession:
         text = " ".join(text.splitlines()).strip().replace("\\", " ")
         if self.args.chat_template:
             return text
-        # No startup prefix: language is anchored inside the user turn.
-        # The transcript already shows the original ASR text (console.user),
-        # only the engine payload gets this directive.
+        # Language is anchored by the startup prefix; the payload adds a
+        # compact quality instruction (detail + length), not a persona.
         lang = getattr(self.args, "lang", "en")
-        directive = "Отвечай по-русски. " if lang == "ru" else "Answer in English. "
-        # Engine-side terminal punctuation (transcript keeps the original ASR
-        # text). Without it EN top-4 echoed the directive and RU looped.
+        quality = (
+            " Ответь по-русски, подробно и по делу, 2-3 предложения."
+            if lang == "ru"
+            else " Answer in English, detailed and to the point, 2-3 sentences."
+        )
         if text and text[-1] not in ".!?…":
             text += "."
-        # Leading newline is required on EVERY turn, including the first:
-        # with a bare first "Q:" and no prefix the model drifts to Chinese.
-        # "\nQ: ...\nA:" matches the tested engine protocol.
-        return f"\\nQ: {directive}{text}\\nA:"
+        # Leading newline on every turn; tested engine protocol.
+        return f"\\nQ: {text}{quality}\\nA:"
 
     def _wait_metric(self, start: int, timeout: float = 3.0) -> None:
         deadline = time.monotonic() + timeout

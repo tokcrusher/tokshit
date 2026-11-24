@@ -69,16 +69,16 @@ class App:
             # Coherent fast tier by default: top-6 RU / top-4 EN, 3 passes.
             # Clear the field or set 8 for lossless. 2 passes loops; never
             # make it the default.
-            "experts": env_int("VOICE_EXPERTS", 6 if self.lang == "ru" else 4),
+            "experts": env_int("VOICE_EXPERTS", 8),
             "passes": env_int("VOICE_PASSES", 3),
-            "workers": env_int("VOICE_WORKERS", 6),
+            "workers": env_int("VOICE_WORKERS", 4),
             "cache_mb": env_int("VOICE_CACHE_MB", 512),
             "kv_ctx": env_int("VOICE_KV_CTX", None),
             "layers": env_int("VOICE_LAYERS", None),
             "hot": env_int("VOICE_HOT", None),
             "q4": os.environ.get("VOICE_Q4", "0") not in ("", "0"),
-            "one_sentence": os.environ.get("VOICE_ONE_SENTENCE", "1") not in ("", "0"),
-            "asr_model": os.environ.get("VOICE_ASR_MODEL", "base"),
+            "one_sentence": os.environ.get("VOICE_ONE_SENTENCE", "0") not in ("", "0"),
+            "asr_model": os.environ.get("VOICE_ASR_MODEL", "small" if self.lang == "ru" else "base"),
         }
         self.engine_args = SimpleNamespace(
             max_new=args.max_new,
@@ -122,7 +122,7 @@ class App:
             os.environ["TOKSHIT_HOT_Q4"] = "1"
         else:
             os.environ.pop("TOKSHIT_HOT_Q4", None)
-        if s.get("one_sentence", True):
+        if s.get("one_sentence", False):
             os.environ["VOICE_ONE_SENTENCE"] = "1"
             os.environ["TOKSHIT_STOP_SENTENCE"] = "1"
         else:
@@ -464,7 +464,12 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
                         pass
-                rc, err_lines = eng.ask(text, on_text, stats)
+                quality = (
+                    " Ответь по-русски, подробно и по делу, 2-3 предложения."
+                    if lang == "ru" else
+                    " Answer in English, detailed and to the point, 2-3 sentences."
+                )
+                rc, err_lines = eng.ask(text + quality, on_text, stats)
                 with self.app.lock:
                     self.app.last_stats = vc.parse_engine_stats(
                         "\n".join(err_lines)
