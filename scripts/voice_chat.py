@@ -1567,6 +1567,23 @@ class EngineSession:
         if os.environ.get("VOICE_REASONING_BUDGET"):
             env["TOKSHIT_REASONING_BUDGET"] = os.environ["VOICE_REASONING_BUDGET"]
 
+        # Explicit model tuning wins over FAST/LOSSLESS presets.
+        for attr, key in (
+            ("experts", "TOKSHIT_DRAFT_TOPK"),
+            ("passes", "TOKSHIT_INK_PASSES"),
+            ("workers", "TOKSHIT_POOL_WORKERS"),
+            ("cache_mb", "TOKSHIT_EXPERT_CACHE_MB"),
+            ("kv_ctx", "TOKSHIT_KV_CTX"),
+            ("layers", "GGUF_NLAYERS"),
+            ("prefill_batch", "TOKSHIT_INK_PREFILL_BATCH"),
+            ("hot", "TOKSHIT_HOT"),
+        ):
+            value = getattr(self.args, attr, None)
+            if value is not None:
+                env[key] = str(value)
+        if getattr(self.args, "q4", False):
+            env["TOKSHIT_HOT_Q4"] = "1"
+
         cmd = self._cmd()
         if self.console.verbose:
             self.console.log(f"[engine] exec: {' '.join(cmd)}")
@@ -2274,6 +2291,27 @@ def apply_language(args: argparse.Namespace) -> None:
                 f"keeping {tts_voice_name()}"
             )
     args.lang_warning = "; ".join(warnings)
+
+
+def cfg_label(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+    for attr, label in (
+        ("experts", "top"),
+        ("passes", "passes"),
+        ("workers", "w"),
+        ("cache_mb", "cache"),
+        ("kv_ctx", "kv"),
+        ("layers", "layers"),
+        ("prefill_batch", "pf"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            parts.append(f"{label} {value}")
+    if getattr(args, "hot", None) is not None:
+        parts.append(f"hot {args.hot}")
+    if getattr(args, "q4", False):
+        parts.append("q4")
+    return " ".join(parts) if parts else "auto"
 
 
 def stop_label(args: argparse.Namespace) -> str:
@@ -3322,7 +3360,8 @@ class TuiApp:
             f"LANG {getattr(self.args, 'lang', 'en')} | TTS {tts_voice_name()}"
         )
         line_cfg = (
-            f"CFG max_new {self.args.max_new} | stop {stop_label(self.args)}"
+            f"CFG max_new {self.args.max_new} | {cfg_label(self.args)}"
+            f" | stop {stop_label(self.args)}"
         )
         return [
             line1, line2, line3, line4, line5, line_lang, line_cfg
@@ -3647,6 +3686,26 @@ def main() -> int:
                     help="list available .gguf models and exit")
     ap.add_argument("--model",
                     help="model name/path: inkling, flint, dspark, or a .gguf path")
+    ap.add_argument("--experts", type=int,
+                    help="experts per token (TOKSHIT_DRAFT_TOPK); default 8 / fast 4-6")
+    ap.add_argument("--passes", type=int,
+                    help="Inkling2 core passes 1..3; default 3 (2 is LOSSY)")
+    ap.add_argument("--workers", type=int,
+                    help="compute pool workers; default 4")
+    ap.add_argument("--cache-mb", type=int,
+                    help="expert cache MB; default 512")
+    ap.add_argument("--kv-ctx", type=int,
+                    help="KV positions; default engine value (2048)")
+    ap.add_argument("--layers", type=int,
+                    help="limit model layers (debug/tuning)")
+    ap.add_argument("--hot", type=int, choices=(0, 1),
+                    help="1 = copy dense weights to RAM, 0 = mmap; default 0")
+    ap.add_argument("--q4", action="store_true",
+                    help="LOSSY: Q4_0 dense weights")
+    ap.add_argument("--prefill-batch", type=int,
+                    help="prefill batch size; default 16")
+    ap.add_argument("--settings", action="store_true",
+                    help="print model/runtime settings and exit")
     ap.add_argument("--chat-template", action="store_true",
                     help="opt-in: native Inkling template instead of raw Q/A few-shot")
     ap.add_argument("--no-play", action="store_true",
@@ -3679,6 +3738,24 @@ def main() -> int:
         return 0
     if args.model:
         os.environ["VOICE_MODEL"] = str(resolve_model_name(args.model))
+    if args.settings:
+        def show(name: str, value: object) -> None:
+            print(f"{name:16s} {value}")
+        show("model", engine_model())
+        show("fast", "yes" if (args.fast or os.environ.get("VOICE_FAST", "0") not in ("", "0")) else "no")
+        show("lang", args.lang or os.environ.get("VOICE_LANG") or "en")
+        show("experts", args.experts if args.experts is not None else "auto (8 / fast 4 EN, 6 RU)")
+        show("passes", args.passes if args.passes is not None else 3)
+        show("workers", args.workers if args.workers is not None else 4)
+        show("cache_mb", args.cache_mb if args.cache_mb is not None else 512)
+        show("kv_ctx", args.kv_ctx if args.kv_ctx is not None else "engine default (2048)")
+        show("layers", args.layers if args.layers is not None else "all")
+        show("hot", args.hot if args.hot is not None else 0)
+        show("q4", "yes (LOSSY)" if args.q4 else "no")
+        show("prefill_batch", args.prefill_batch if args.prefill_batch is not None else 16)
+        show("max_new", args.max_new)
+        show("temperature", os.environ.get("VOICE_TEMPERATURE", "0"))
+        return 0
 
     if args.clean_text is not None:
         print(clean_for_speech(args.clean_text))

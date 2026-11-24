@@ -26,6 +26,38 @@ exec python3 "$(dirname "$0")/voice_chat.py" --tui "$@"
 
 All arguments after the script name reach the backend unchanged.
 
+## Model and runtime tuning
+
+`scripts/chat --settings` prints the resolved model and runtime config without
+loading the model. Every setting has a CLI flag; the voice wrapper passes them
+to the engine child:
+
+| flag | engine knob | default | notes |
+|---|---|---|---|
+| `--model NAME\|PATH` | `TOKSHIT_MODEL` | Inkling | `inkling`, `flint`, `dspark`, basename, or path |
+| `--experts K` | `TOKSHIT_DRAFT_TOPK` | 8 / fast 4 EN, 6 RU | lower = faster, LOSSY |
+| `--passes N` | `TOKSHIT_INK_PASSES` | 3 | 2 is LOSSY and loops |
+| `--workers N` | `TOKSHIT_POOL_WORKERS` | 4 | 4 is the stable voice value |
+| `--cache-mb MB` | `TOKSHIT_EXPERT_CACHE_MB` | 512 | expert cache |
+| `--kv-ctx N` | `TOKSHIT_KV_CTX` | engine 2048 | context positions |
+| `--layers N` | `GGUF_NLAYERS` | all | debug/limit layers |
+| `--hot 0\|1` | `TOKSHIT_HOT` | 0 | 1 = dense weights in RAM |
+| `--q4` | `TOKSHIT_HOT_Q4` | off | **LOSSY** dense Q4_0 |
+| `--prefill-batch N` | `TOKSHIT_INK_PREFILL_BATCH` | 16 | prompt batch |
+| `--max-new N` | `TOKSHIT_CHAT_MAX_NEW` | 64 | tokens per turn |
+| `--temperature X` | `TOKSHIT_TEMPERATURE` | 0 | sampling |
+
+Example:
+
+```sh
+scripts/chat --model inkling --experts 8 --passes 3 --kv-ctx 1024 \
+  --cache-mb 512 --workers 4 --settings
+scripts/chat --model inkling --experts 8 --passes 3 --kv-ctx 1024
+```
+
+Explicit flags win over `--fast` presets. The TUI header shows the active
+`CFG top/passes/w/cache/kv` values.
+
 ## Quick start
 
 ```bash

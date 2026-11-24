@@ -199,7 +199,7 @@ std::string_view group_title(FlagGroup group) noexcept {
 std::string help_text(std::string_view default_model) {
   std::string out;
   append_line(out,
-              "токшит — MoE-рантайм для Flint / Inkling-2-Mini на C++20 (Termux).");
+              "токшит — MoE-рантайм на C++20 (Termux).");
   out.push_back('\n');
   append_line(out, "использование:");
   append_line(out, "  tokshit --model <имя|путь> [промпт] [max_new]");
