@@ -16,6 +16,11 @@ option(TOKSHIT_I8MM "Compile i8mm (SMMLA) variants" ON)
 option(TOKSHIT_BUILD_TOOLS "Build benchmark tools" ON)
 option(TOKSHIT_BUILD_TESTS "Build unit tests" ON)
 option(TOKSHIT_NO_EXCEPTIONS "Build with -fno-exceptions -fno-rtti" ON)
+option(TOKSHIT_LTO "Link-time optimization for the engine and tools" OFF)
+
+if(TOKSHIT_LTO)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+endif()
 
 include(cmake/CompilerWarnings.cmake)
 
@@ -74,7 +79,7 @@ target_include_directories(tokshit_core PUBLIC
 )
 target_compile_features(tokshit_core PUBLIC cxx_std_20)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-  target_compile_options(tokshit_core PRIVATE -march=armv8.2-a+dotprod+fp16+lse)
+  target_compile_options(tokshit_core PRIVATE -march=armv8.2-a+dotprod+fp16+lse -mtune=native)
 endif()
 
 tokshit_set_warnings(tokshit_core)
