@@ -88,5 +88,11 @@ phone even the quality tier falls toward 3-4 tok/s; cool it before judging.
   server, or `safe_run` will make it wait for the model lock.
 - The first load is ~7-15 s. The page shows `loading` and enables chat when
   ready.
+- `cpu temp` uses CPU/SoC thermal zones only. Battery/charger/camera zones can
+  read 90+ C while the phone is cool; the old gauge used the global maximum.
+- `ram free` is `MemAvailable`. The Inkling GGUF is ~8.7 GiB; if free RAM is
+  below that, part of the experts is read from flash every token and speed
+  drops to 2-3 tok/s. Close other apps or use a smaller model; code cannot
+  cache weights that do not fit.
 - `scripts/web` is a thin wrapper around `scripts/voice_web.py`; `--models`,
   `--model`, `--lang`, `--port`, `--max-new` are supported by the backend.

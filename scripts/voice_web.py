@@ -171,6 +171,19 @@ class App:
             thermal = vc.thermal_max_c()
         except Exception:
             thermal = None
+        mem_avail = None
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    mem_avail = int(line.split()[1]) // 1024
+                    break
+        except OSError:
+            pass
+        model_mb = None
+        try:
+            model_mb = vc.resolve_model_name(str(self.settings.get("model") or DEFAULT_MODEL)).stat().st_size // (1024 * 1024)
+        except OSError:
+            pass
         return {
             "ready": ready,
             "loading": not ready and not err,
@@ -183,6 +196,8 @@ class App:
             "last": self.last_stats,
             "engine": engine_stats,
             "thermal": thermal,
+            "mem_available_mb": mem_avail,
+            "model_mb": model_mb,
         }
 
     def clear(self) -> None:

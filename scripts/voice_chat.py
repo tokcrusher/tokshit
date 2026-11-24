@@ -2224,22 +2224,26 @@ def proc_tree_rss_mb(root_pid: int | None) -> float:
 
 
 def thermal_max_c() -> float | None:
-    best: float | None = None
-    try:
-        zones = Path("/sys/class/thermal").glob("thermal_zone*/temp")
-    except OSError:
-        return None
-    for z in zones:
+    """Max CPU/SoC zone. Other zones (battery, charger, camera) can read
+    90+ C on a cold phone and made the old gauge lie."""
+    best_cpu: float | None = None
+    best_any: float | None = None
+    hints = ("cpu", "cpuss", "soc", "aoss")
+    for temp_path in Path("/sys/class/thermal").glob("thermal_zone*/temp"):
         try:
-            raw = z.read_text().strip()
+            raw = temp_path.read_text().strip()
             value = float(raw)
+            ztype = (temp_path.parent / "type").read_text().strip().lower()
         except (OSError, ValueError):
             continue
         if abs(value) > 200:
             value /= 1000.0
-        if -40.0 <= value <= 150.0:
-            best = value if best is None else max(best, value)
-    return best
+        if not (-40.0 <= value <= 150.0):
+            continue
+        best_any = value if best_any is None else max(best_any, value)
+        if any(h in ztype for h in hints):
+            best_cpu = value if best_cpu is None else max(best_cpu, value)
+    return best_cpu if best_cpu is not None else best_any
 
 
 def env_truthy(name: str) -> bool:

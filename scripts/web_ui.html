@@ -300,8 +300,8 @@ dialog::backdrop{background:rgba(0,0,0,.62)}
 <div class="gauges" aria-label="engine metrics">
   <div class="gauge"><span>tok/s</span><b id="g_tok">—</b></div>
   <div class="gauge"><span>context</span><b id="g_ctx">—</b></div>
-  <div class="gauge"><span>thermal</span><b id="g_thermal">—</b></div>
-  <div class="gauge"><span>cache</span><b id="g_cache">—</b></div>
+  <div class="gauge"><span>cpu temp</span><b id="g_thermal">—</b></div>
+  <div class="gauge"><span>ram free</span><b id="g_ram">—</b></div>
 </div>
 
 <main id="chat"><div class="thread" id="thread">
@@ -442,9 +442,13 @@ dialog::backdrop{background:rgba(0,0,0,.62)}
     $("#g_tok").textContent = last.tok_s ? last.tok_s.toFixed(1) : "—";
     $("#g_ctx").textContent = s.engine?.ctx_pos ?? last.ctx_pos ?? "—";
     $("#g_thermal").textContent = s.thermal ? s.thermal.toFixed(0) + "°C" : "—";
-    const hit = s.engine?.cache_hit, miss = s.engine?.cache_miss;
-    $("#g_cache").textContent = (hit !== undefined && miss !== undefined && hit + miss > 0)
-      ? Math.round(100 * hit / (hit + miss)) + "%" : "—";
+    const mem = s.mem_available_mb;
+    const model = s.model_mb;
+    $("#g_ram").textContent = mem ? (mem / 1024).toFixed(1) + "G" : "—";
+    if (mem && model) {
+      $("#g_ram").title = "MemAvailable " + (mem / 1024).toFixed(1) +
+        " GB / model " + (model / 1024).toFixed(1) + " GB";
+    }
     if (s.error) toast("engine: " + s.error, 5000);
   }
 
