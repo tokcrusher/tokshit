@@ -54,21 +54,30 @@ class App:
         (self.workdir / "tts").mkdir(exist_ok=True)
         self.lock = threading.RLock()
         self.chat_lock = threading.Lock()
+        self.stats_lock = threading.Lock()
         self.tts_lock = threading.Lock()
         self.tts_models: dict[str, vc.PiperTTS] = {}
+        self.rec_lock = threading.Lock()
+        self.rec_active = False
+        self.rec_path = self.workdir / "phone-rec.m4a"
         self.model = args.model or DEFAULT_MODEL
         self.engine: vc.EngineSession | None = None
+        self.last_stats: dict = {}
         self.lang = args.lang or os.environ.get("VOICE_LANG", "ru")
         self.settings = {
             "model": self.model,
-            "experts": env_int("VOICE_EXPERTS", None),
-            "passes": env_int("VOICE_PASSES", None),
-            "workers": env_int("VOICE_WORKERS", None),
-            "cache_mb": env_int("VOICE_CACHE_MB", None),
+            # Coherent fast tier by default: top-6 RU / top-4 EN, 3 passes.
+            # Clear the field or set 8 for lossless. 2 passes loops; never
+            # make it the default.
+            "experts": env_int("VOICE_EXPERTS", 6 if self.lang == "ru" else 4),
+            "passes": env_int("VOICE_PASSES", 3),
+            "workers": env_int("VOICE_WORKERS", 6),
+            "cache_mb": env_int("VOICE_CACHE_MB", 512),
             "kv_ctx": env_int("VOICE_KV_CTX", None),
             "layers": env_int("VOICE_LAYERS", None),
             "hot": env_int("VOICE_HOT", None),
             "q4": os.environ.get("VOICE_Q4", "0") not in ("", "0"),
+            "one_sentence": os.environ.get("VOICE_ONE_SENTENCE", "1") not in ("", "0"),
         }
         self.engine_args = SimpleNamespace(
             max_new=args.max_new,
@@ -112,10 +121,23 @@ class App:
             os.environ["TOKSHIT_HOT_Q4"] = "1"
         else:
             os.environ.pop("TOKSHIT_HOT_Q4", None)
+        if s.get("one_sentence", True):
+            os.environ["VOICE_ONE_SENTENCE"] = "1"
+            os.environ["TOKSHIT_STOP_SENTENCE"] = "1"
+        else:
+            os.environ["VOICE_ONE_SENTENCE"] = "0"
+            os.environ.pop("TOKSHIT_STOP_SENTENCE", None)
         model = vc.resolve_model_name(str(s.get("model") or DEFAULT_MODEL))
         os.environ["VOICE_MODEL"] = str(model)
         os.environ["VOICE_LANG"] = self.lang
         os.environ["TOKSHIT_CHAT_MAX_NEW"] = str(self.engine_args.max_new)
+        # Minimal language anchor, not a persona few-shot. Without it the
+        # model drifts to French for "Paris"; with the old canned prefix it
+        # parrots the assistant persona. One instruction is enough.
+        if self.lang == "ru":
+            os.environ["VOICE_FEWSHOT"] = r"Q: Отвечай по-русски.\nA: Хорошо."
+        else:
+            os.environ["VOICE_FEWSHOT"] = r"Q: Answer in English.\nA: Okay."
 
     def start_engine(self) -> None:
         with self.lock:
@@ -136,6 +158,18 @@ class App:
         ready = bool(eng and eng.ready_event.is_set())
         load = eng.child_load_s if eng and eng.child_load_s else (eng.load_s if eng else 0.0)
         err = eng.start_error if eng else None
+        engine_stats: dict = {}
+        if eng is not None and ready and not self.chat_lock.locked():
+            try:
+                with self.stats_lock:
+                    engine_stats = eng.query_stats(timeout=0.15) or {}
+            except Exception:
+                engine_stats = {}
+        thermal = None
+        try:
+            thermal = vc.thermal_max_c()
+        except Exception:
+            thermal = None
         return {
             "ready": ready,
             "loading": not ready and not err,
@@ -145,12 +179,18 @@ class App:
             "lang": self.lang,
             "settings": self.settings,
             "max_new": self.engine_args.max_new,
+            "last": self.last_stats,
+            "engine": engine_stats,
+            "thermal": thermal,
         }
 
     def clear(self) -> None:
-        with self.lock:
-            if self.engine is not None:
-                self.engine.clear_context()
+        # /clear wipes the prefix too; a restart re-prefills the language
+        # anchor. The model reload is ~8-10 s, shown as loading in the UI.
+        with self.chat_lock:
+            with self.lock:
+                self.last_stats = {}
+            self.start_engine()
 
     # ---- TTS --------------------------------------------------------
     def tts(self, text: str, lang: str) -> bytes:
@@ -182,33 +222,105 @@ class App:
             piper.synth(text, out)
         return out.read_bytes()
 
+    # ---- recording (phone mic via Termux:API) -----------------------
+    def start_rec(self) -> dict:
+        with self.rec_lock:
+            if self.rec_active:
+                return {"ok": True, "already": True}
+            # clear a stale recorder from an earlier crashed session
+            subprocess.run(["termux-microphone-record", "-q"],
+                           capture_output=True, text=True, timeout=4)
+            try:
+                self.rec_path.unlink()
+            except OSError:
+                pass
+            p = subprocess.run(
+                ["termux-microphone-record", "-f", str(self.rec_path),
+                 "-e", "aac", "-r", "16000", "-c", "1", "-b", "48", "-l", "0"],
+                capture_output=True, text=True, timeout=12,
+            )
+            output = (p.stdout or "") + (p.stderr or "")
+            if p.returncode != 0 or "Please grant" in output or '"error"' in output:
+                raise RuntimeError(output.strip() or "termux-microphone-record failed")
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not self.rec_path.is_file():
+                time.sleep(0.05)
+            if not self.rec_path.is_file():
+                raise RuntimeError("microphone did not create a file")
+            self.rec_active = True
+            return {"ok": True, "path": str(self.rec_path)}
+
+    def stop_rec(self, lang: str) -> str:
+        with self.rec_lock:
+            p = subprocess.run(["termux-microphone-record", "-q"],
+                               capture_output=True, text=True, timeout=8)
+            self.rec_active = False
+            path = self.rec_path
+            if not path.is_file() or path.stat().st_size == 0:
+                raise RuntimeError(
+                    (p.stderr or p.stdout or "empty recording").strip()
+                )
+            # wait for the m4a to finalize
+            last = -1
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                size = path.stat().st_size if path.is_file() else 0
+                if size == last and size > 0:
+                    break
+                last = size
+                time.sleep(0.15)
+            return self.asr_file(path, lang)
+
     # ---- ASR --------------------------------------------------------
+    def asr_file(self, src: Path, lang: str) -> str:
+        wav = src.with_suffix(".conv.wav")
+        try:
+            conv = subprocess.run(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                 "-y", "-i", str(src), "-ar", "16000", "-ac", "1",
+                 "-c:a", "pcm_s16le", str(wav)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if conv.returncode != 0 or not wav.is_file():
+                raise RuntimeError((conv.stderr or "ffmpeg failed")[-500:])
+            env = os.environ.copy()
+            env["ASR_LANG"] = "ru" if lang == "ru" else "en"
+            p = subprocess.run(
+                [str(vc.ASR_SH), str(wav), "base"],
+                env=env, capture_output=True, text=True, timeout=180,
+            )
+            text = (p.stdout or "").strip()
+            if text in ("[BLANK_AUDIO]", "[NO SPEECH]"):
+                text = ""
+            if not text and p.returncode != 0:
+                raise RuntimeError((p.stderr or p.stdout or "ASR failed")[-500:])
+            return text
+        finally:
+            for path in (wav, src):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
     def asr(self, raw: bytes, suffix: str, lang: str) -> str:
         src = self.workdir / f"asr-{int(time.time() * 1000)}{suffix or '.webm'}"
         src.write_bytes(raw)
-        env = os.environ.copy()
-        env["ASR_LANG"] = "ru" if lang == "ru" else "en"
-        try:
-            p = subprocess.run(
-                [str(vc.ASR_SH), str(src), "base"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=180,
-            )
-        finally:
-            try:
-                src.unlink()
-            except OSError:
-                pass
-        text = (p.stdout or "").strip()
-        if not text and p.returncode != 0:
-            raise RuntimeError((p.stderr or p.stdout or "ASR failed")[-500:])
-        return text
+        return self.asr_file(src, lang)
 
 
 def json_bytes(obj: object) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
+CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+
+
+def clean_model_text(text: str, lang: str) -> str:
+    s = vc.strip_invisible(text)
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", s)
+    if lang != "zh":
+        s = CJK_RE.sub("", s)
+    return s
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -243,7 +355,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         url = urllib.parse.urlparse(self.path)
         if url.path in ("/", "/index.html"):
-            self._send(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
+            try:
+                page = WEB_UI.read_bytes()
+            except OSError:
+                self._json(500, {"error": f"missing {WEB_UI}"})
+                return
+            self._send(200, page, "text/html; charset=utf-8")
             return
         if url.path == "/api/status":
             self._json(200, self.app.status())
@@ -273,12 +390,21 @@ class Handler(BaseHTTPRequestHandler):
                 lang = (qs.get("lang") or [self.app.lang])[0]
                 text = self.app.asr(self._body(), ".webm", lang)
                 self._json(200, {"text": text})
+            elif url.path == "/api/rec/start":
+                self._json(200, self.app.start_rec())
+            elif url.path == "/api/rec/stop":
+                qs = urllib.parse.parse_qs(url.query)
+                lang = (qs.get("lang") or [self.app.lang])[0]
+                text = self.app.stop_rec(lang)
+                self._json(200, {"text": text})
             elif url.path == "/api/clear":
                 self.app.clear()
                 self._json(200, {"ok": True})
             elif url.path == "/api/settings":
                 data = json.loads(self._body() or b"{}")
                 with self.app.lock:
+                    if data.get("max_new") not in (None, "", "auto"):
+                        self.app.engine_args.max_new = int(data["max_new"])
                     for key in ("model", "experts", "passes", "workers",
                                 "cache_mb", "kv_ctx", "layers", "hot"):
                         if key in data:
@@ -289,6 +415,8 @@ class Handler(BaseHTTPRequestHandler):
                             )
                     if "q4" in data:
                         self.app.settings["q4"] = bool(data["q4"])
+                    if "one_sentence" in data:
+                        self.app.settings["one_sentence"] = bool(data["one_sentence"])
                     if "lang" in data:
                         self.app.lang = "ru" if data["lang"] == "ru" else "en"
                 self.app.start_engine()
@@ -317,7 +445,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
-        directive = "Отвечай по-русски. " if lang == "ru" else "Answer in English. "
         try:
             with self.app.chat_lock:
                 eng = self.app.engine
@@ -326,6 +453,7 @@ class Handler(BaseHTTPRequestHandler):
                 eng.wait_ready(timeout=180)
                 stats = vc.TurnStats()
                 def on_text(chunk: str) -> None:
+                    chunk = clean_model_text(chunk, lang)
                     if not chunk:
                         return
                     try:
@@ -333,7 +461,11 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
                         pass
-                eng.ask(directive + text, on_text, stats)
+                rc, err_lines = eng.ask(text, on_text, stats)
+                with self.app.lock:
+                    self.app.last_stats = vc.parse_engine_stats(
+                        "\n".join(err_lines)
+                    )
         except Exception as exc:
             try:
                 self.wfile.write(f"\n[error] {exc}\n".encode("utf-8"))
@@ -348,241 +480,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, wav, "audio/wav")
 
 
-HTML = r"""<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>tokshit</title>
-<style>
-:root{color-scheme:dark;--bg:#0b0e13;--panel:#131820;--panel2:#0f141b;--line:#243040;--text:#e8edf5;--muted:#8b98a9;--accent:#5eead4;--accent2:#38bdf8;--warn:#fbbf24;--user:#1b2a3a;--bot:#131a24;--danger:#fb7185}
-*{box-sizing:border-box}
-html,body{height:100%;margin:0}
-body{background:radial-gradient(1200px 600px at 50% -20%,#14202b 0%,var(--bg) 60%);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;overflow:hidden}
-header{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);background:rgba(11,14,19,.9);backdrop-filter:blur(12px);position:sticky;top:0;z-index:5}
-.logo{font-weight:750;letter-spacing:-.02em;font-size:16px}
-.logo span{color:var(--accent)}
-#status{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:12px;min-width:0}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--warn);box-shadow:0 0 0 3px rgba(251,191,36,.12)}
-.dot.ok{background:var(--accent);box-shadow:0 0 0 3px rgba(94,234,212,.12)}
-.dot.err{background:var(--danger)}
-#model{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:38vw}
-.spacer{flex:1}
-button,select,input,textarea{font:inherit;color:inherit}
-button{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px;cursor:pointer;transition:border-color .15s,background .15s}
-button:hover{border-color:#3b4d63;background:#18212c}
-button.primary{background:var(--accent);color:#04211d;border-color:var(--accent);font-weight:700}
-button.primary:disabled{opacity:.5;cursor:default}
-button.ghost{background:transparent}
-#settingsBtn{font-size:12px;padding:7px 10px}
-#chat{flex:1;overflow-y:auto;padding:18px 14px 8px;scroll-behavior:smooth}
-.wrap{max-width:980px;margin:0 auto}
-.msg{display:flex;gap:10px;margin:0 0 14px;align-items:flex-start}
-.msg .who{flex:0 0 38px;height:38px;border-radius:11px;display:grid;place-items:center;font-size:11px;font-weight:750;border:1px solid var(--line)}
-.msg.user .who{background:var(--user);color:var(--accent2)}
-.msg.bot .who{background:var(--bot);color:var(--accent)}
-.bubble{padding:11px 14px;border-radius:14px;border:1px solid var(--line);background:var(--panel2);max-width:min(760px,86vw);white-space:pre-wrap;overflow-wrap:anywhere}
-.msg.user .bubble{background:var(--user);border-color:#24384d}
-.bubble.streaming:after{content:"";display:inline-block;width:7px;height:15px;background:var(--accent);margin-left:3px;vertical-align:-2px;animation:blink 1s steps(1) infinite}
-@keyframes blink{50%{opacity:0}}
-.hint{color:var(--muted);font-size:12px;text-align:center;padding:10px 0 16px}
-#bar{position:sticky;bottom:0;border-top:1px solid var(--line);background:rgba(11,14,19,.94);backdrop-filter:blur(12px);padding:10px 12px calc(10px + env(safe-area-inset-bottom))}
-.bar-inner{max-width:980px;margin:0 auto;display:flex;gap:8px;align-items:flex-end}
-#text{flex:1;min-height:44px;max-height:140px;resize:none;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:11px 13px;outline:none}
-#text:focus{border-color:#3b556e}
-.iconbtn{width:46px;height:46px;padding:0;display:grid;place-items:center;border-radius:14px;flex:0 0 auto}
-.iconbtn.rec{background:var(--danger);border-color:var(--danger);color:#2a0710;animation:pulse 1.2s infinite}
-@keyframes pulse{50%{box-shadow:0 0 0 8px rgba(251,113,133,.12)}}
-#send{width:auto;height:46px;padding:0 18px;border-radius:14px}
-#meta{max-width:980px;margin:6px auto 0;display:flex;gap:10px;align-items:center;color:var(--muted);font-size:11px;flex-wrap:wrap}
-#meta label{display:flex;gap:5px;align-items:center;cursor:pointer}
-#drawer{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;z-index:20;align-items:center;justify-content:center;padding:14px}
-#drawer.open{display:flex}
-.card{width:min(560px,100%);max-height:90vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 30px 80px rgba(0,0,0,.5)}
-.card h2{margin:0 0 4px;font-size:18px}
-.card p{margin:0 0 14px;color:var(--muted);font-size:12px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.grid .full{grid-column:1/-1}
-label.f{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--muted)}
-label.f input,label.f select{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 10px;color:var(--text)}
-.checks{display:flex;gap:16px;margin:12px 0;color:var(--text);font-size:13px}
-.checks label{display:flex;gap:7px;align-items:center}
-.actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
-#toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:#1f2937;border:1px solid var(--line);border-radius:12px;padding:10px 14px;font-size:13px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:30;max-width:90vw}
-#toast.show{opacity:1}
-@media(max-width:600px){.msg .who{display:none}.bubble{max-width:100%}#model{max-width:30vw}#send{padding:0 14px}}
-</style>
-</head>
-<body>
-<header>
-  <div class="logo">tok<span>shit</span></div>
-  <div id="status"><span class="dot" id="dot"></span><span id="statustext">loading</span></div>
-  <div id="model"></div>
-  <div class="spacer"></div>
-  <select id="lang" title="language" style="background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:7px 9px">
-    <option value="ru">RU</option><option value="en">EN</option>
-  </select>
-  <button id="settingsBtn" class="ghost">settings</button>
-</header>
+WEB_UI = Path(__file__).with_name("web_ui.html")
 
-<main id="chat"><div class="wrap" id="messages">
-  <div class="hint">Text chat works immediately. Mic needs browser permission.<br>Engine loads once; answers stream token by token.</div>
-</div></main>
-
-<div id="bar"><div class="bar-inner">
-  <button id="mic" class="iconbtn" title="record">
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8"/></svg>
-  </button>
-  <textarea id="text" rows="1" placeholder="Type a message..."></textarea>
-  <button id="send" class="primary">Send</button>
-</div>
-<div id="meta">
-  <label><input type="checkbox" id="tts" checked> speak answers</label>
-  <label><input type="checkbox" id="autosend" checked> auto-send transcript</label>
-  <span id="cfg"></span>
-</div></div>
-
-<div id="drawer"><div class="card">
-  <h2>Model / runtime</h2>
-  <p>Applying restarts the engine and reloads the model (~8-15 s). Explicit values win over presets.</p>
-  <div class="grid">
-    <label class="f full">model<input id="s_model" placeholder="inkling"></label>
-    <label class="f">experts<input id="s_experts" type="number" min="1" max="8" placeholder="auto"></label>
-    <label class="f">passes<input id="s_passes" type="number" min="1" max="3" placeholder="3"></label>
-    <label class="f">workers<input id="s_workers" type="number" min="1" max="8" placeholder="4"></label>
-    <label class="f">cache MB<input id="s_cache" type="number" min="0" placeholder="512"></label>
-    <label class="f">kv ctx<input id="s_kv" type="number" min="128" placeholder="2048"></label>
-    <label class="f">layers<input id="s_layers" type="number" min="1" placeholder="all"></label>
-    <label class="f">hot dense<input id="s_hot" type="number" min="0" max="1" placeholder="0"></label>
-  </div>
-  <div class="checks">
-    <label><input type="checkbox" id="s_q4"> Q4 dense (LOSSY)</label>
-  </div>
-  <div class="actions">
-    <button id="modelsBtn" class="ghost">list models</button>
-    <button id="applyBtn" class="primary">Apply + restart</button>
-    <button id="closeBtn">Close</button>
-  </div>
-  <pre id="modelsOut" style="white-space:pre-wrap;color:var(--muted);font-size:11px;max-height:180px;overflow:auto"></pre>
-</div></div>
-<div id="toast"></div>
-
-<script>
-const $ = (s) => document.querySelector(s);
-const messages = $("#messages");
-const chat = $("#chat");
-let lang = "ru";
-let busy = false;
-let ttsQueue = Promise.resolve();
-let rec = null, chunks = [], recording = false;
-
-function toast(text, ms=2600){ const t=$("#toast"); t.textContent=text; t.classList.add("show"); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),ms); }
-function scroll(){ chat.scrollTop = chat.scrollHeight; }
-function add(role, text=""){
-  const wrap=document.createElement("div"); wrap.className="msg "+role;
-  const who=document.createElement("div"); who.className="who"; who.textContent= role==="user"?"YOU":"INK";
-  const b=document.createElement("div"); b.className="bubble"; b.textContent=text;
-  wrap.appendChild(who); wrap.appendChild(b); messages.appendChild(wrap); scroll(); return b;
-}
-function setStatus(st){
-  const dot=$("#dot"), tx=$("#statustext"), m=$("#model");
-  dot.className="dot"+(st.ready?" ok":st.error?" err":"");
-  tx.textContent=st.error?"error":st.ready?"ready":"loading";
-  if(st.error) tx.title=st.error;
-  m.textContent=(st.model||"").split("/").pop()+" · "+(st.settings?.experts??"auto")+" exp · "+(st.settings?.passes??3)+" pass";
-  $("#cfg").textContent = "kv "+(st.settings?.kv_ctx??"auto")+" · cache "+(st.settings?.cache_mb??"auto")+"MB · w "+(st.settings?.workers??4);
-}
-async function statusLoop(){
-  try{ const r=await fetch("/api/status"); setStatus(await r.json()); }catch(e){}
-  setTimeout(statusLoop, 2000);
-}
-async function synth(text){
-  if(!$("#tts").checked || !text.trim()) return;
-  ttsQueue = ttsQueue.then(async()=>{
-    try{
-      const r=await fetch("/api/tts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text,lang})});
-      if(!r.ok) return;
-      const blob=await r.blob(); const url=URL.createObjectURL(blob);
-      await new Promise(res=>{ const a=new Audio(url); a.onended=()=>{URL.revokeObjectURL(url);res()}; a.onerror=()=>{URL.revokeObjectURL(url);res()}; a.play().catch(()=>res()); });
-    }catch(e){}
-  });
-}
-function feedTts(buf, final=false){
-  // split on sentence ends and clauses; keep a small tail
-  let out=[];
-  const re=/([^.!?\n]{12,}[.!?]+|[^,;:\n]{28,}[,;:])/g;
-  let last=0,m;
-  while((m=re.exec(buf))){ out.push(m[0]); last=re.lastIndex; }
-  if(final && buf.slice(last).trim()) out.push(buf.slice(last).trim());
-  for(const s of out) synth(s);
-  return out.length?buf.slice(last):buf;
-}
-async function send(){
-  const ta=$("#text"); const text=ta.value.trim(); if(!text||busy) return;
-  ta.value=""; ta.style.height="auto"; add("user",text);
-  const bubble=add("bot",""); bubble.classList.add("streaming"); busy=true; $("#send").disabled=true;
-  let ttsBuf="";
-  try{
-    const r=await fetch("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text,lang})});
-    if(!r.ok || !r.body) throw new Error("HTTP "+r.status);
-    const rd=r.body.getReader(); const dec=new TextDecoder();
-    while(true){ const {done,value}=await rd.read(); if(done) break; const s=dec.decode(value,{stream:true}); bubble.textContent+=s; scroll(); ttsBuf=feedTts(ttsBuf+s); }
-    ttsBuf=feedTts(ttsBuf,true); if(ttsBuf.trim()) synth(ttsBuf);
-  }catch(e){ bubble.textContent+="\n[error] "+e; }
-  bubble.classList.remove("streaming"); busy=false; $("#send").disabled=false; ta.focus();
-}
-async function toggleMic(){
-  if(recording){ rec.stop(); return; }
-  try{
-    const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
-    rec=new MediaRecorder(stream,{mimeType:MediaRecorder.isTypeSupported("audio/webm;codecs=opus")?"audio/webm;codecs=opus":""});
-    chunks=[];
-    rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
-    rec.onstop=async()=>{
-      recording=false; $("#mic").classList.remove("rec"); stream.getTracks().forEach(t=>t.stop());
-      const blob=new Blob(chunks,{type:rec.mimeType||"audio/webm"});
-      if(blob.size<800){ toast("recording too short"); return; }
-      toast("transcribing...");
-      try{
-        const r=await fetch("/api/asr?lang="+lang,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:blob});
-        const j=await r.json(); if(j.error) throw new Error(j.error);
-        if(!j.text){ toast("silence / not recognized"); return; }
-        $("#text").value=j.text; if($("#autosend").checked) send();
-      }catch(e){ toast("ASR: "+e); }
-    };
-    rec.start(); recording=true; $("#mic").classList.add("rec"); toast("recording — tap mic to stop");
-  }catch(e){ toast("mic: "+e); }
-}
-function openSettings(){
-  const s=window._status?.settings||{};
-  $("#s_model").value=s.model||"inkling"; $("#s_experts").value=s.experts??"";
-  $("#s_passes").value=s.passes??""; $("#s_workers").value=s.workers??"";
-  $("#s_cache").value=s.cache_mb??""; $("#s_kv").value=s.kv_ctx??"";
-  $("#s_layers").value=s.layers??""; $("#s_hot").value=s.hot??"";
-  $("#s_q4").checked=!!s.q4; $("#drawer").classList.add("open");
-}
-async function applySettings(){
-  const val=id=>{ const v=$(id).value.trim(); return v===""?null:(id==="#s_model"?v:Number(v)); };
-  const body={model:val("#s_model"),experts:val("#s_experts"),passes:val("#s_passes"),workers:val("#s_workers"),cache_mb:val("#s_cache"),kv_ctx:val("#s_kv"),layers:val("#s_layers"),hot:val("#s_hot"),q4:$("#s_q4").checked,lang};
-  $("#applyBtn").disabled=true; toast("restarting engine...",5000);
-  try{ const r=await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}); const j=await r.json(); window._status=j; setStatus(j); toast("settings applied"); }
-  catch(e){ toast("settings: "+e); }
-  finally{ $("#applyBtn").disabled=false; }
-}
-$("#send").onclick=send;
-$("#text").addEventListener("keydown",e=>{ if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();} });
-$("#text").addEventListener("input",e=>{ e.target.style.height="auto"; e.target.style.height=Math.min(140,e.target.scrollHeight)+"px"; });
-$("#mic").onclick=toggleMic;
-$("#lang").onchange=e=>{ lang=e.target.value; toast("language: "+lang.toUpperCase()); };
-$("#settingsBtn").onclick=openSettings; $("#closeBtn").onclick=()=>$("#drawer").classList.remove("open");
-$("#applyBtn").onclick=applySettings;
-$("#modelsBtn").onclick=async()=>{ $("#modelsOut").textContent="loading..."; try{ const r=await fetch("/api/models"); $("#modelsOut").textContent=await r.text(); }catch(e){ $("#modelsOut").textContent=String(e); } };
-$("#drawer").addEventListener("click",e=>{ if(e.target.id==="drawer") $("#drawer").classList.remove("open"); });
-statusLoop();
-fetch("/api/status").then(r=>r.json()).then(j=>{window._status=j;setStatus(j);});
-</script>
-</body></html>
-"""
 
 
 def main() -> int:
