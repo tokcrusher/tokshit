@@ -143,6 +143,11 @@ hidden 2304, 128 experts top-8, vocab 200058/201024.
   `termux-microphone-record -f "$TMPDIR/mic-test.m4a" -l 5`, then wait for
   the recorder to finalize the file before ASR.
 
+- `TOKSHIT_INK_COPY=1` (anonymous full-model copy) was tried twice: the copy
+  reached 7.58/9.14 GB, then Android killed the process and restarted the
+  OpenCode server. The 9.14 GB model exceeds the app's anon-memory budget
+  (~8 GB); page cache/mmap is the only fit. Do not enable it on this phone.
+
 ## Goal
 
 The current lossy 10.5 profile is NOT the goal. The order is **15 tok/s

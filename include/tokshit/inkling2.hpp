@@ -168,6 +168,8 @@ class Inkling2 {
   const Gguf* gguf_ = nullptr;
   const uint8_t* data_ = nullptr;
   uint64_t data_len_ = 0;
+  uint8_t* ram_copy_ = nullptr;
+  std::size_t ram_copy_len_ = 0;
 
   std::vector<InkLayer> layers_;
   std::vector<std::size_t> slot_phys_;

@@ -1,10 +1,12 @@
 #include "tokshit/inkling2.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <sys/mman.h>
 #include <vector>
 
 #include "tokshit/dequant.hpp"
@@ -48,7 +50,11 @@ uint64_t dim_product(const GgufTensor& t, std::size_t start) {
 }  // namespace
 
 Inkling2::Inkling2() = default;
-Inkling2::~Inkling2() = default;
+Inkling2::~Inkling2() {
+  if (ram_copy_ != nullptr) {
+    ::munmap(ram_copy_, ram_copy_len_);
+  }
+}
 
 const InkLayer& Inkling2::phys(std::size_t slot) const {
   return layers_[slot_phys_[slot]];
@@ -61,6 +67,44 @@ Result<std::unique_ptr<Inkling2>> Inkling2::load(const Gguf& gguf,
   m->gguf_ = &gguf;
   m->data_ = reinterpret_cast<const uint8_t*>(mm.bytes().data());
   m->data_len_ = mm.bytes().size();
+
+  // TOKSHIT_INK_COPY=1: copy the whole weight file into anonymous memory and
+  // drop the file-mapping pages as we go. mlock is useless here: Termux has
+  // RLIMIT_MEMLOCK=64 KB. Anonymous pages can still be zram-swapped, but they
+  // no longer compete with the page cache and do not refault from the fs on
+  // every expert read. Off by default; it needs roughly the file size free.
+  if (const char* cv = std::getenv("TOKSHIT_INK_COPY");
+      cv != nullptr && *cv != '\0' && *cv != '0') {
+    const std::size_t n = m->data_len_;
+    void* raw = ::mmap(nullptr, n, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) {
+      std::fprintf(stderr, "[copy] mmap %.2f GB failed: %s; keeping mmap\n",
+                   static_cast<double>(n) / 1e9, std::strerror(errno));
+    } else {
+      auto* dst = static_cast<uint8_t*>(raw);
+      const uint8_t* src = m->data_;
+      constexpr std::size_t kChunk = 64ULL << 20;
+      for (std::size_t off = 0; off < n; off += kChunk) {
+        const std::size_t len = std::min(kChunk, n - off);
+        std::memcpy(dst + off, src + off, len);
+        // Clean file pages can be dropped immediately; the anonymous copy now
+        // owns the bytes and the page cache pressure goes down as we copy.
+        (void)::madvise(const_cast<uint8_t*>(src + off), len, MADV_DONTNEED);
+        if ((off & ((1ULL << 30) - 1)) == 0) {
+          std::fprintf(stderr, "[copy] %.2f / %.2f GB\n",
+                       static_cast<double>(off + len) / 1e9,
+                       static_cast<double>(n) / 1e9);
+          std::fflush(stderr);
+        }
+      }
+      m->ram_copy_ = dst;
+      m->ram_copy_len_ = n;
+      m->data_ = dst;
+      std::fprintf(stderr, "[copy] model in anonymous RAM: %.2f GB\n",
+                   static_cast<double>(n) / 1e9);
+    }
+  }
 
   // Ask for 2 MB pages on the weight mapping. Harmless when the kernel or the
   // filesystem refuses it; measurable only if THP applies to file mappings.
