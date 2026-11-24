@@ -78,6 +78,7 @@ class App:
             "hot": env_int("VOICE_HOT", None),
             "q4": os.environ.get("VOICE_Q4", "0") not in ("", "0"),
             "one_sentence": os.environ.get("VOICE_ONE_SENTENCE", "1") not in ("", "0"),
+            "asr_model": os.environ.get("VOICE_ASR_MODEL", "base"),
         }
         self.engine_args = SimpleNamespace(
             max_new=args.max_new,
@@ -286,7 +287,7 @@ class App:
             env = os.environ.copy()
             env["ASR_LANG"] = "ru" if lang == "ru" else "en"
             p = subprocess.run(
-                [str(vc.ASR_SH), str(wav), "base"],
+                [str(vc.ASR_SH), str(wav), str(self.settings.get("asr_model", "base"))],
                 env=env, capture_output=True, text=True, timeout=180,
             )
             text = (p.stdout or "").strip()
@@ -417,6 +418,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.app.settings["q4"] = bool(data["q4"])
                     if "one_sentence" in data:
                         self.app.settings["one_sentence"] = bool(data["one_sentence"])
+                    if data.get("asr_model") in ("tiny", "base", "small"):
+                        self.app.settings["asr_model"] = data["asr_model"]
                     if "lang" in data:
                         self.app.lang = "ru" if data["lang"] == "ru" else "en"
                 self.app.start_engine()

@@ -368,6 +368,7 @@ dialog::backdrop{background:rgba(0,0,0,.62)}
         <div class="field"><label for="s_layers">layers</label><input id="s_layers" type="number" min="1" placeholder="all"></div>
         <div class="field"><label for="s_hot">hot dense 0/1</label><input id="s_hot" type="number" min="0" max="1" placeholder="0"></div>
         <div class="field"><label for="s_maxnew">max new</label><input id="s_maxnew" type="number" min="1" placeholder="64"></div>
+        <div class="field"><label for="s_asr">ASR model</label><select id="s_asr"><option value="base">base (fast)</option><option value="small">small (accurate, slow)</option><option value="tiny">tiny</option></select></div>
       </div>
       <label class="check"><input type="checkbox" id="s_one" checked> stop at first sentence <span style="color:var(--muted)">clean voice</span></label>
       <label class="check"><input type="checkbox" id="s_q4"> Q4 dense <span style="color:var(--danger)">lossy</span></label>
@@ -689,6 +690,7 @@ dialog::backdrop{background:rgba(0,0,0,.62)}
     $("#s_q4").checked = !!s.q4;
     $("#s_one").checked = s.one_sentence !== false;
     $("#s_maxnew").value = status.max_new ?? 64;
+    $("#s_asr").value = s.asr_model || "base";
     $("#modelsOut").hidden = true;
     $("#settingsDlg").showModal();
   }
@@ -712,6 +714,7 @@ dialog::backdrop{background:rgba(0,0,0,.62)}
       max_new: valueOf("#s_maxnew"),
       q4: $("#s_q4").checked,
       one_sentence: $("#s_one").checked,
+      asr_model: $("#s_asr").value,
       lang,
     };
     $("#applyBtn").disabled = true;
